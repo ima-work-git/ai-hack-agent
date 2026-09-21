@@ -1,0 +1,21 @@
+name: 不具合・復旧
+description: 期待結果、実際の結果、再現方法を記録する
+title: "[Bug] "
+body:
+  - type: textarea
+    id: result
+    attributes:
+      label: 期待結果と実際の結果
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 再現手順・環境・影響範囲
+      description: キーや個人情報を貼り付けない。
+    validations:
+      required: true
+  - type: textarea
+    id: recovery
+    attributes:
+      label: 暫定復旧・再発防止の検証・関連要件ID

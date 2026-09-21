@@ -1,0 +1,31 @@
+name: 仕様・実装のUnit
+description: 受入条件と担当を決めて小さく進める
+title: "[Unit] "
+body:
+  - type: textarea
+    id: intent
+    attributes:
+      label: 解決する課題・仕様リンク・要件ID
+      placeholder: 誰が、何に困っていて、どう変わるか
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 受入条件
+      placeholder: Given / When / Then。正常系と失敗時の期待動作。
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 作業範囲・非対象・依存Issue・対象ファイル
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: 検証方法・担当・目標時刻
+      description: 承認、費用上限、復旧に影響する場合は確認内容を書く。
+    validations:
+      required: true

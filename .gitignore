@@ -1,0 +1,30 @@
+# Local credentials and private configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+*.tfstate
+*.tfstate.*
+.aws/
+
+# Dependencies and build products (adapt after choosing a stack)
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+.next/
+dist/
+coverage/
+.terraform/
+cdk.out/
+
+# Machine-local and raw runtime output
+.DS_Store
+*.log
+work/
+.private/
+
+# Do not blanket-ignore official AI-DLC output.
+# Let the installed official tooling manage its own ignore block.
