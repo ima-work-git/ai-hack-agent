@@ -1,8 +1,9 @@
 # AI HACK team instructions
 
-Use AWS AI-DLC with Codex. Read docs/AI_DLC_SETUP.md and docs/event/ before starting.
-Run sh scripts/setup-aidlc.sh once on each member's machine to install the official pinned workflow.
-The setup preserves this team block and adds the official instructions below it.
+Use the pinned AWS development workflow with Codex. Read README.md,
+docs/AI_DLC_SETUP.md and docs/event/ before starting.
+Follow the setup instructions in README.md once on each member's machine.
+The setup preserves this team block and adds the official workflow instructions.
 
 The product theme is undecided. Treat docs/specs/ as draft templates, not approved requirements.
 Use GitHub Issues and pull requests to connect requirements, implementation, and verification.
