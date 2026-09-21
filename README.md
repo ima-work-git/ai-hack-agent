@@ -3,16 +3,18 @@
 テーマが決まってから、すぐにチームで仕様を固めて開発を始めるためのひな形です。
 対象テーマは「業務を自律化するAIエージェント」。約2人でCodexを使います。個別の業務、技術スタック、チーム名は未定です。
 
-**現在の状態：Publicリポジトリ作成済み。プロダクト未実装、AWS公式AI-DLCの導入は未完了、2人目の招待はユーザー名待ち。**
+**現在の状態：Publicリポジトリ・初期Issue・main保護・資料チェックCIを作成済み。公式AI-DLC 2.9.0をCodex向けに導入するスクリプトを同梱。プロダクトは未実装、2人目の招待はユーザー名待ち。**
 このキットの独自テンプレートと、公式AI-DLCが生成する状態・監査情報は別物です。
+
+初回利用時は各自の `aidlc` コマンドの利用準備、Codexのhooks承認、ツール内の診断を行ってください。業務テーマのワークフローはまだ開始していません。
 
 リポジトリ：[ima-work-git/ai-hack-agent](https://github.com/ima-work-git/ai-hack-agent)
 
 ## 最初にすること
 
 1. [準備チェックリスト](docs/PREPARATION.md)で担当者と未決定事項を埋める。
-2. [GitHub・チーム運用](docs/TEAM_AND_GITHUB.md)に沿ってPublicリポジトリを作り、招待の受諾まで確認する。
-3. [AI-DLC導入](docs/AI_DLC_SETUP.md)で全員のバージョンと利用AIツールを合わせる。
+2. [GitHub・チーム運用](docs/TEAM_AND_GITHUB.md)に沿ってこのリポジトリへ参加し、招待受諾・clone・練習PRを確認する。
+3. [AI-DLC導入](docs/AI_DLC_SETUP.md)を読み、`sh scripts/setup-aidlc.sh` で各自の端末へ公式2.9.0を導入する。
 4. チームで30分集まり、[課題・要件](docs/specs/01_INTENT_AND_REQUIREMENTS.md)のMVPと受入条件を決める。
 5. [エージェント設計](docs/specs/02_AGENT_DESIGN.md)で自律実行・人の承認・失敗時の動きを決め、1本の業務を最後まで通す。
 

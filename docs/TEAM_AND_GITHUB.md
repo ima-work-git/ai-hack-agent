@@ -1,5 +1,15 @@
 # GitHubとチーム運用
 
+## 現在の設定（2026-09-21）
+
+- `ima-work-git/ai-hack-agent` をPublicで作成済み。
+- mainの保護を設定済み：PR、承認1名、変更時の古い承認の無効化、会話の解決、最新mainへの追従、`preparation-checks` の成功を必須にした。
+- force pushとmain削除は許可していない。
+- 2人目の招待前のため、管理者にも例外なく適用する設定はまだ有効にしていない。所有者は例外操作が可能。2人が参加したら例外の扱いを見直す。
+- Secret Protectionとpush protectionが有効なことを画面で確認済み。
+- 準備・仕様・実装・検証・提出物・提出の[6件のIssue](https://github.com/ima-work-git/ai-hack-agent/issues)を作成済み。招待は2人目のユーザー名待ち。
+- CIは資料リンクと追跡ファイル名の確認だけ。プロダクトの安全性・品質の合格を意味しない。
+
 ## 作成と招待
 
 1. 所有者（個人またはOrganization）とリポジトリ名を確定する。少人数なら既存個人アカウントでも開始できる。
