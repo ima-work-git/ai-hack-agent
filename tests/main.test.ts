@@ -222,6 +222,31 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(JSON.parse(String(requests('/api/cancel').at(-1)!.body))).toMatchObject({ conversationId: input.conversationId });
   });
 
+  it('shows live ASR status on G2 while preserving four cards and clears it on stop', async () => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    const lastView = () => devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(lastView().footer).toContain('G2 聞取中');
+    expect(lastView().footer).toContain('発話待ち');
+    stream.options.onDelta('first', '架空検証社の');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(lastView().footer).toContain('架空検証社の');
+    stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
+    await vi.advanceTimersByTimeAsync(500);
+    const board = lastView().content;
+    expect(board.split('\n')).toHaveLength(4);
+    stream.options.onDelta('next', 'こんにちは');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(lastView().content).toBe(board);
+    expect(lastView().footer).toContain('こんにちは');
+    click('record'); await flush();
+    expect(lastView().footer).toBe('音声停止');
+    stream.options.onDelta('late', '遅れた音声');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(lastView().footer).toBe('音声停止');
+    expect(lastView().footer).not.toContain('こんにちは');
+  });
+
   it('pauses capture for ambiguous candidates and selects within the original conversation budget', async () => {
     routes.set('/api/research', async init => {
       const input = JSON.parse(String(init.body)) as ResearchInput;

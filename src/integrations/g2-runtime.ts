@@ -107,6 +107,8 @@ export class G2Runtime {
   private pending: ViewJob | null = null
   private flushing = false
   private imageMode = false
+  private lastImageContent: string | null = null
+  private lastText: Partial<GlassesView> = {}
 
   constructor(private readonly options: G2RuntimeOptions = {}) {
     this.timeoutMs = Number.isFinite(options.timeoutMs)
@@ -222,6 +224,7 @@ export class G2Runtime {
     if (this.disposed) return
     this.disposed = true
     this.connected = false
+    this.clearDisplayCache()
     this.connectionVersion += 1
     this.cancelViews()
     this.removeSubscriptions()
@@ -231,6 +234,7 @@ export class G2Runtime {
   }
 
   private async connectBridge(initialView: GlassesView | undefined, token: string): Promise<boolean> {
+    this.clearDisplayCache()
     const injected = Boolean(this.options.bridge || this.options.getBridge)
     if (!(this.options.isHostAvailable?.() ?? (injected || nativeHostAvailable()))) {
       this.notify('unavailable', 'no_native_host')
@@ -320,6 +324,7 @@ export class G2Runtime {
   }
 
   private suspend(state: 'background' | 'disconnected', reason: string): void {
+    this.clearDisplayCache()
     if (state === 'background') this.foreground = false
     else this.connected = false
     this.cancelViews()
@@ -335,21 +340,24 @@ export class G2Runtime {
         const job = this.pending
         this.pending = null
         let success = true
-        if (this.imageMode && this.current(job)) {
+        if (this.imageMode && this.current(job) && this.lastImageContent !== job.view.content) {
           try {
+            // A partly written pair must never be mistaken for the previous complete pair.
+            this.lastImageContent = null
             const images = (this.options.renderBitmap ?? renderGlassesBitmap)(job.view.content)
             let accepted = images !== null
             if (images) for (const [index, imageData] of images.entries()) {
-              if (!this.current(job)) { accepted = false; break }
+              if (!this.currentImage(job)) { accepted = false; break }
               const result = await this.deadline(invoke(() => this.bridge!.updateImageRawData!(new ImageRawDataUpdate({
                 containerID: index + 4, containerName: `small-text-${index}`, imageData,
               }))))
               if (!ImageRawDataUpdateResult.isSuccess(result)) { accepted = false; break }
             }
-            if (!accepted && this.current(job)) await this.fallbackToText()
+            if (accepted && this.currentImage(job)) this.lastImageContent = job.view.content
+            else if (!accepted && this.currentImage(job)) await this.fallbackToText()
           } catch (error) {
             try {
-              if (error instanceof BridgeTimeout || !this.current(job)) throw error
+              if (error instanceof BridgeTimeout || !this.currentImage(job)) throw error
               await this.fallbackToText()
             } catch {
               success = false; this.fatal = true; this.cancelViews(); void this.stopAudio()
@@ -360,11 +368,14 @@ export class G2Runtime {
         for (const [index, name] of (['header', 'content', 'footer'] as const).entries()) {
           if (!this.current(job)) { success = false; break }
           if (this.imageMode && name === 'content') continue
+          if (this.lastText[name] === job.view[name]) continue
           try {
+            delete this.lastText[name]
             const accepted = await this.deadline(invoke(() => this.bridge!.textContainerUpgrade(
               new TextContainerUpgrade({ containerID: index + 1, containerName: name, content: job.view[name] }),
             )))
             if (!accepted) throw new Error('display_rejected')
+            if (this.current(job)) this.lastText[name] = job.view[name]
           } catch (error) {
             success = false
             // Native calls cannot be cancelled. Do not start another write after timeout.
@@ -384,6 +395,12 @@ export class G2Runtime {
 
   private current(job: ViewJob): boolean {
     return this.usable() && job.epoch === this.viewEpoch && job.token === this.token && job.sequence === this.viewSequence
+  }
+
+  private currentImage(job: ViewJob): boolean {
+    // New speech status must not starve an in-flight pair of unchanged topic images.
+    return this.usable() && job.epoch === this.viewEpoch && job.token === this.token &&
+      (job.sequence === this.viewSequence || this.pending?.view.content === job.view.content)
   }
 
   private usable(): boolean { return this.connected && this.foreground && !this.disposed && !this.fatal && this.bridge !== null }
@@ -424,6 +441,7 @@ export class G2Runtime {
   }
 
   private async fallbackToText(): Promise<void> {
+    this.clearDisplayCache()
     this.imageMode = false
     const page = this.startupPage()
     const accepted = await this.deadline(invoke(() => this.bridge!.rebuildPageContainer!(new RebuildPageContainer({
@@ -431,6 +449,8 @@ export class G2Runtime {
     }))))
     if (!accepted) throw new Error('text_fallback_failed')
   }
+
+  private clearDisplayCache(): void { this.lastImageContent = null; this.lastText = {} }
 
   private startupPage(): CreateStartUpPageContainer {
     const geometry = [{ y: 0, height: 48 }, { y: 52, height: 184 }, { y: 240, height: 48 }]
