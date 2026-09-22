@@ -150,6 +150,53 @@ describe('bounded evidence research', () => {
     expect(provider.search).not.toHaveBeenCalled();
   });
 
+  it('stops before searching when an explicitly supplied account conflicts with a verified alias', async () => {
+    const provider = createFixtureProvider('normal');
+    provider.plan = async () => ({ value: { target: { personName: '千代田まどか', companyName: 'Microsoft' }, needsConfirmation: false, candidates: [], query: '', reason: '確認済み別名' } });
+    provider.search = vi.fn(provider.search);
+    const result = await runAgent(input({ text: 'マイクロソフトのちょまどさん @another_user' }), provider);
+    expect(result.reasonCode).toBe('ACCOUNT_IDENTITY_CONFLICT');
+    expect(result.cards).toEqual([]);
+    expect(provider.search).not.toHaveBeenCalled();
+  });
+
+  it('resolves a verified spoken pair to one X lookup and retains four literal profile cards with zero posts', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agent-verified-alias-'));
+    try {
+      const budget = new BudgetLedger({ directory, currency: 'USD', runLimitUsd: 1, dayLimitUsd: 2, eventLimitUsd: 3 });
+      // Deliberately synthetic source claims; this test asserts copying/bounds,
+      // never the real person's biography or a live API result.
+      const facts = ['模擬の第一活動です。', '模擬の第二活動です。', '模擬の第三活動です。', '模擬の第四活動です。'];
+      let completions = 0;
+      const api = vi.fn<typeof fetch>(async (url, init) => {
+        let value: unknown;
+        if (String(url).includes('/users/by/username/chomado')) value = { data: { id: '123', username: 'chomado', name: 'Madoka Chiyoda (Chomado)', description: `Microsoft. ${facts.join('')}`, protected: false } };
+        else if (String(url).includes('/users/123/tweets')) value = { meta: { result_count: 0, next_token: 'must-not-follow' } };
+        else if (url === 'https://api.orcarouter.ai/v1/chat/completions') {
+          const data = JSON.parse(JSON.parse(String(init!.body)).messages[1].content);
+          const content = ++completions === 1
+            ? { target: { personName: 'ちょまど', companyName: 'マイクロソフト' }, needsConfirmation: false, candidates: [], query: '公式 プロフィール', reason: '発話を抽出' }
+            : { identityVerified: true, needsConfirmation: false, candidates: [], cards: facts.map(fact => ({
+              factId: data.sources[0].excerpts.flatMap((excerpt: { facts: { factId: string; text: string }[] }) => excerpt.facts).find((candidate: { text: string }) => candidate.text === fact).factId,
+              suggestedQuestion: 'この模擬活動について教えてください。',
+            })), followUpQuery: null, reason: '模擬プロフィールの選択結果' };
+          value = { choices: [{ message: { content: JSON.stringify(content) } }] };
+        } else throw new Error('Unexpected mocked endpoint');
+        return new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
+      });
+      const provider = createLiveProvider({ orcaApiKey: 'fixture', orcaModel: 'fixture', tavilyApiKey: 'fixture', xEnabled: true, xBearerToken: 'fixture' }, { fetch: api });
+      const result = await runAgent(input({ text: 'マイクロソフトのちょまどさんです。', mode: 'live' }), provider,
+        { budget, maximumCosts: { llm: 0.01, search: 0.05, page: 0 } });
+      expect(result.status).toBe('ready');
+      expect(result.target).toEqual({ personName: '千代田まどか', companyName: 'Microsoft' });
+      expect(result.cards.map(card => card.fact)).toEqual(facts);
+      expect(result.sources).toHaveLength(1);
+      expect(result.sources[0]!.url).toBe('https://x.com/chomado');
+      expect(result.usage).toMatchObject({ llm: 2, searches: 1, pages: 1 });
+      expect(api).toHaveBeenCalledTimes(4); // plan + lookup + bounded timeline + assessment
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
   it.each([0, 1, 5])('routes a synthetic profile URL with %i X posts through Tavily and retrieves its web evidence', async postCount => {
     const directory = await mkdtemp(join(tmpdir(), 'agent-x-routing-'));
     try {
@@ -162,7 +209,7 @@ describe('bounded evidence research', () => {
           const data = JSON.parse(JSON.parse(String(init!.body)).messages[1].content);
           let content: unknown;
           if (++completions === 1) content = { target: DEMO_TARGET, needsConfirmation: false, candidates: [], query: '@fixture_user', reason: '入力の氏名・会社を使用' };
-          else if (completions === 2 && postCount > 0) content = { identityVerified: false, needsConfirmation: false, candidates: [], cards: [], followUpQuery: '公式 登壇 @fixture_user', reason: '公式の根拠が不足' };
+          else if (completions === 2) content = { identityVerified: false, needsConfirmation: false, candidates: [], cards: [], followUpQuery: '公式 登壇 @fixture_user', reason: '公式の根拠が不足' };
           else content = { identityVerified: true, needsConfirmation: false, candidates: [], cards: [{ suggestedQuestion: '勉強会では何を紹介しましたか。', factId: data.sources.find((s: { kind: string }) => s.kind === 'web').excerpts.flatMap((excerpt: { facts: { factId: string; text: string }[] }) => excerpt.facts).find((candidate: { text: string }) => candidate.text === fact).factId }], followUpQuery: null, reason: '公式本文で確認' };
           value = { choices: [{ message: { content: JSON.stringify(content) } }] };
         } else if (String(url).includes('/users/by/username/fixture_user')) {
@@ -184,8 +231,8 @@ describe('bounded evidence research', () => {
         { budget, maximumCosts: { llm: 0.01, search: 0.05, page: 0 } });
       expect(result.status).toBe('ready');
       expect(result.cards).toHaveLength(1);
-      expect(result.usage).toMatchObject({ llm: postCount ? 3 : 2, searches: 2, pages: Math.min(postCount, 2) + 1, costKnown: false });
-      expect(result.sources.filter(source => source.kind === 'x')).toHaveLength(Math.min(postCount, 2));
+      expect(result.usage).toMatchObject({ llm: 3, searches: 2, pages: Math.min(postCount + 1, 2) + 1, costKnown: false });
+      expect(result.sources.filter(source => source.kind === 'x')).toHaveLength(Math.min(postCount + 1, 2));
       expect(result.sources.filter(source => source.kind === 'web')).toHaveLength(1);
       expect(fetchPage).toHaveBeenCalledTimes(1);
       expect(fetchPage.mock.calls[0]![0]).toBe('https://company.example.org/event');

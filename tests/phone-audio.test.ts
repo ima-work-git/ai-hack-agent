@@ -156,6 +156,35 @@ describe('PhoneAudio — explicit memory-only phone capture (REQ-001, REQ-008; m
     expect(f.onStopped).toHaveBeenCalledExactlyOnceWith('limit');
   });
 
+  it('keeps explicit continuous capture past one minute with only frame-sized PCM until stopped', async () => {
+    const f = fixture();
+    expect(await f.audio.start({ continuous: true })).toBe(true);
+    const frame = new Float32Array(4096).fill(0.5);
+    for (let index = 0; index < 240; index++) {
+      f.emit(frame);
+      await vi.advanceTimersByTimeAsync(256);
+    }
+    // 61.44 seconds of actual PCM exceeds both ordinary duration and sample caps.
+    expect(f.audio.recording).toBe(true);
+    expect(f.onStopped).not.toHaveBeenCalled();
+    expect(f.stream.track.stop).not.toHaveBeenCalled();
+    expect(f.onAudio).toHaveBeenCalledTimes(240);
+    expect(f.onAudio.mock.calls.every(([chunk]) => chunk.byteLength === 8192 && chunk.buffer.byteLength === 8192)).toBe(true);
+    expect(f.pcm().byteLength).toBe(1_966_080);
+    const queued = f.ctx.processor.onaudioprocess!;
+    await f.audio.stop();
+    queued({ inputBuffer: { getChannelData: () => frame } } as unknown as AudioProcessingEvent);
+    expect(f.onAudio).toHaveBeenCalledTimes(240);
+    expect(f.stream.track.stop).toHaveBeenCalledOnce();
+    expect(f.ctx.context.close).toHaveBeenCalledOnce();
+    expect(f.onStopped).toHaveBeenCalledExactlyOnceWith('user');
+    // Continuous permission is per start and does not silently persist.
+    expect(await f.audio.start()).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(f.audio.recording).toBe(false);
+    expect(f.onStopped).toHaveBeenLastCalledWith('limit');
+  });
+
   it('rejects frames after the deadline even if the timer callback was suspended', async () => {
     const f = fixture();
     await f.audio.start();
@@ -254,9 +283,9 @@ describe('PhoneAudio — explicit memory-only phone capture (REQ-001, REQ-008; m
     expect(ctx.context.close).toHaveBeenCalledOnce();
   });
 
-  it('does not resume automatically after context suspension, and requires a new explicit start', async () => {
+  it.each([false, true])('does not resume automatically after context suspension (continuous=%s)', async continuous => {
     const f = fixture();
-    await f.audio.start();
+    await f.audio.start({ continuous });
     f.ctx.context.state = 'suspended';
     f.ctx.context.onstatechange?.();
     await Promise.resolve();
@@ -269,9 +298,9 @@ describe('PhoneAudio — explicit memory-only phone capture (REQ-001, REQ-008; m
     await f.audio.stop();
   });
 
-  it('ends capture if the microphone disconnects', async () => {
+  it.each([false, true])('ends capture if the microphone disconnects (continuous=%s)', async continuous => {
     const f = fixture();
-    await f.audio.start();
+    await f.audio.start({ continuous });
     f.stream.track.dispatchEvent(new Event('ended'));
     expect(f.audio.recording).toBe(false);
     expect(f.stream.track.stop).toHaveBeenCalledOnce();

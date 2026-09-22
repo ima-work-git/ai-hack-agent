@@ -17,6 +17,16 @@ const liveEnv = (): NodeJS.ProcessEnv => ({
 });
 
 describe('live configuration gates (REQ-007, REQ-008, REQ-009)', () => {
+  it('enables streaming ASR only with a separate server key and explicit per-minute reservation', () => {
+    const env = { ...liveEnv(), OPENAI_API_KEY: 'fixture-openai-key', STREAMING_ASR_MAX_USD_PER_MINUTE: '0.04' };
+    expect(readConfig(env).status.streamingEnabled).toBe(true);
+    expect(readConfig(env).streamingModel).toBe('gpt-live-transcribe');
+    expect(readConfig({ ...env, OPENAI_API_KEY: '' }).status.streamingEnabled).toBe(false);
+    expect(readConfig({ ...env, STREAMING_ASR_MAX_USD_PER_MINUTE: '' }).status.streamingEnabled).toBe(false);
+    expect(readConfig({ ...env, AGENT_LIVE_ENABLED: 'false' }).status.streamingEnabled).toBe(false);
+    expect(readConfig({ ...env, OPENAI_STREAMING_ASR_MODEL: 'unsupported' }).status.streamingEnabled).toBe(false);
+  });
+
   it('requires explicit live enablement even when credentials and amounts are present', () => {
     const config = readConfig({ ...liveEnv(), AGENT_LIVE_ENABLED: 'false' });
     expect(config.status.liveEnabled).toBe(false);

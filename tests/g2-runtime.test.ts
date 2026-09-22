@@ -44,6 +44,26 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     await runtime.dispose()
   })
 
+  it('keeps the four-row board in one bounded display container without paging', async () => {
+    const { bridge } = fakeBridge()
+    const runtime = new G2Runtime({ bridge })
+    await runtime.connect()
+    const page = vi.mocked(bridge.createStartUpPageContainer).mock.calls[0]![0]
+    const containers = page.textObject!
+    for (const container of containers) {
+      expect(container.xPosition! + container.width!).toBeLessThanOrEqual(576)
+      expect(container.yPosition! + container.height!).toBeLessThanOrEqual(288)
+    }
+    const content = containers.find(container => container.containerName === 'content')!
+    expect(content.height! - 2 * content.paddingLength!).toBeGreaterThanOrEqual(160)
+    const rows = ['1 事:公開事実 問:質問例？', '2 事:公開事実 問:質問例？', '3 事:未確認 問:—', '4 事:未確認 問:—'].join('\n')
+    expect(await runtime.render({ header: '調査結果 2/4件', content: rows, footer: '事=事実 問=質問 / 原文はスマホ' })).toBe(true)
+    const update = vi.mocked(bridge.textContainerUpgrade).mock.calls.find(([value]) => value.containerName === 'content')![0]
+    expect(update.content).toBe(rows)
+    expect(update.content!.split('\n')).toHaveLength(4)
+    await runtime.dispose()
+  })
+
   it.each([1, 2, 3])('rejects startup return code %s', async code => {
     const { bridge } = fakeBridge()
     vi.mocked(bridge.createStartUpPageContainer).mockResolvedValue(code)
@@ -80,6 +100,33 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     expect(onAudio).toHaveBeenCalledOnce()
     expect(f.bridge.audioControl).toHaveBeenLastCalledWith(false)
     expect(runtime.status).toEqual({ state: 'connected', reason: 'duration_limit' })
+    await runtime.dispose()
+  })
+
+  it('accepts more than one minute of continuous PCM until explicit stop closes the microphone', async () => {
+    const f = fakeBridge()
+    const onAudio = vi.fn()
+    const runtime = new G2Runtime({ bridge: f.bridge, onAudio })
+    await runtime.connect()
+    expect(await runtime.startAudio({ continuous: true })).toBe(true)
+    const frame = { audioEvent: { audioPcm: new Uint8Array(32_000), source: AudioInputSource.Glasses } }
+    for (let second = 0; second < 61; second++) {
+      await vi.advanceTimersByTimeAsync(1_000)
+      f.event(frame)
+    }
+    expect(runtime.status.state).toBe('recording')
+    expect(onAudio).toHaveBeenCalledTimes(61)
+    expect(f.bridge.audioControl).toHaveBeenCalledExactlyOnceWith(true, AudioInputSource.Glasses)
+    expect(await runtime.stopAudio()).toBe(true)
+    expect(f.bridge.audioControl).toHaveBeenLastCalledWith(false)
+    f.event(frame)
+    expect(onAudio).toHaveBeenCalledTimes(61)
+    // A subsequent ordinary start still has the original 30-second protection.
+    expect(await runtime.startAudio()).toBe(true)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(runtime.status).toEqual({ state: 'connected', reason: 'duration_limit' })
+    f.event(frame)
+    expect(onAudio).toHaveBeenCalledTimes(61)
     await runtime.dispose()
   })
 
@@ -253,12 +300,12 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     await runtime.dispose()
   })
 
-  it('stops in the background and does not replay a card or restart the microphone on return', async () => {
+  it.each([false, true])('stops in the background without automatic replay or recording (continuous=%s)', async continuous => {
     const f = fakeBridge()
     const onAudio = vi.fn()
     const runtime = new G2Runtime({ bridge: f.bridge, onAudio })
     await runtime.connect()
-    await runtime.startAudio()
+    await runtime.startAudio({ continuous })
     f.event({ sysEvent: { eventType: OsEventTypeList.FOREGROUND_EXIT_EVENT } })
     f.event(pcm())
     expect(onAudio).not.toHaveBeenCalled()
@@ -271,12 +318,12 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     await runtime.dispose()
   })
 
-  it('stops on device disconnect, requires explicit reconnect, and disposes subscriptions', async () => {
+  it.each([false, true])('stops on disconnect and requires explicit reconnect (continuous=%s)', async continuous => {
     const f = fakeBridge()
     const onAudio = vi.fn()
     const runtime = new G2Runtime({ bridge: f.bridge, onAudio })
     await runtime.connect()
-    await runtime.startAudio()
+    await runtime.startAudio({ continuous })
     f.device('disconnected')
     expect(await runtime.startAudio()).toBe(false)
     f.device('connected')

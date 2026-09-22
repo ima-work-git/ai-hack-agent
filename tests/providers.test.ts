@@ -103,6 +103,46 @@ describe('bounded OrcaRouter adapter', () => {
     expect(result.value).toEqual(expected);
   });
 
+  it.each([
+    { personName: 'ちょまどさん', companyName: 'マイクロソフト' },
+    { personName: '千代田まどか', companyName: 'Microsoft' },
+  ])('canonicalizes only the verified person/company pair supplied as conversational aliases', async suppliedTarget => {
+    const api = mockFetch(completion({ ...plan, target: suppliedTarget, query: '公式 @chomado' }));
+    const result = await createLiveProvider(config, { fetch: api }).plan({ ...input, text: 'マイクロソフトのちょまどさんです。' }, signal());
+    expect(result.value.target).toEqual({ personName: '千代田まどか', companyName: 'Microsoft' });
+    expect(api).toHaveBeenCalledOnce();
+  });
+
+  it.each(['ちょまどさんです。', '他社のちょまどさんです。', 'マイクロソフトの別の人です。'])('cannot use a verified record to fill absent identity in %s', async text => {
+    const api = mockFetch(completion({ ...plan, target: { personName: '千代田まどか', companyName: 'Microsoft' }, query: '@chomado' }));
+    await expect(createLiveProvider(config, { fetch: api }).plan({ ...input, text }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
+  });
+
+  it('does not grant an arbitrary account even for a verified alias pair', async () => {
+    const api = mockFetch(completion({ ...plan, target: { personName: 'ちょまど', companyName: 'マイクロソフト' }, query: '@invented' }));
+    await expect(createLiveProvider(config, { fetch: api }).plan({ ...input, text: 'マイクロソフトのちょまどさん' }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
+  });
+
+  it('supplies a source-backed nickname hint to the planner only when both clues occur, without bypassing ambiguity', async () => {
+    const unresolved = { ...plan, target: null, needsConfirmation: true, query: '' };
+    const api = mockFetch(completion(unresolved), completion(unresolved), completion(unresolved));
+    const provider = createLiveProvider(config, { fetch: api });
+    const texts = ['マイクロソフトのちょまどさんについて調べたい', 'ちょまどさんについて調べたい', 'マイクロソフトのちょまどさんと別会社の山田花子さん'];
+    for (const text of texts) {
+      const result = await provider.plan({ ...input, text }, signal());
+      expect(result.value).toMatchObject({ target: null, needsConfirmation: true });
+    }
+    const payloads = api.mock.calls.map(([, options]) => JSON.parse(String(options!.body)));
+    const data = payloads.map(payload => JSON.parse(payload.messages[1].content));
+    expect(data[0].verifiedIdentityHints).toHaveLength(1);
+    expect(data[0].verifiedIdentityHints[0]).toMatchObject({ xHandle: 'chomado', personNames: expect.arrayContaining(['ちょまど']), sourceUrls: expect.arrayContaining(['https://chomado.com/']) });
+    expect(data[1]).not.toHaveProperty('verifiedIdentityHints');
+    expect(data[2].verifiedIdentityHints).toHaveLength(1);
+    expect(payloads[0].messages[0].content).toContain('without asking for a full legal name');
+    expect(payloads[2].messages[0].content).toContain('Never short-circuit ambiguity');
+    expect(api).toHaveBeenCalledTimes(3);
+  });
+
   it.each(['https://x.com.evil.example.org/fixture_user', 'https://x.com/fixture_user/status/123',
     'https://fixture_user@x.com/other_user', 'http://x.com/fixture_user'])('does not grant model-generated handles from non-profile URL %s', async (url) => {
     const api = mockFetch(completion({ ...plan, query: '株式会社灯 山田花子 @fixture_user' }));
@@ -140,6 +180,43 @@ describe('bounded OrcaRouter adapter', () => {
     expect(payload.messages[0].content).toContain('EXACT CONTIGUOUS substring');
     expect(payload.messages[0].content).toContain('at most 1000 characters');
     expect(payload.messages[0].content).toContain('Do not equate aliases or translations');
+  });
+
+  it('offers complete pipe-delimited X profile items without including the whole bio or slicing long items', async () => {
+    const job = '株式会社灯で開発者向けの公開イベントを企画';
+    const negated = '登壇経験があるわけではありません';
+    const longItem = `${'長'.repeat(201)}ではありません`;
+    const description = `${job} ｜ ${negated} | ${longItem} ｜ 公開した読書記録`;
+    const raw = `公開プロフィール: 山田花子 (@fixture_user)\n${description}\n公開投稿: 投稿には | 区切りがありますが分割しません。`;
+    const evidence: EvidenceSource = { sourceId: 'x-profile', url: 'https://x.com/fixture_user', title: 'Profile', text: raw, kind: 'x', retrievedAt: '2026-09-22T00:00:00.000Z' };
+    const api = vi.fn<typeof fetch>(async (_url, init) => {
+      const payload = JSON.parse(String(init!.body));
+      const data = JSON.parse(payload.messages[1].content);
+      const candidates = data.sources[0].excerpts.flatMap((excerpt: { facts: { factId: string; text: string }[] }) => excerpt.facts) as { factId: string; text: string }[];
+      expect(candidates.map(item => item.text)).toContain(job);
+      expect(candidates.map(item => item.text)).toContain(negated);
+      expect(candidates.some(item => item.text.includes('長'))).toBe(false);
+      expect(candidates.some(item => item.text === description)).toBe(false);
+      expect(candidates.some(item => item.text === '区切りがありますが分割しません。')).toBe(false);
+      expect(candidates.every(item => raw.includes(item.text))).toBe(true);
+      expect(payload.messages[0].content).toContain('Do not select facts or suggest questions about medical');
+      expect(payload.messages[0].content).toContain('even when self-published');
+      return completion({ ...assessment, cards: [{ factId: candidates.find(item => item.text === job)!.factId, suggestedQuestion: '公開イベントでは何を紹介していますか。' }] });
+    });
+    const result = await createLiveProvider(config, { fetch: api }).assess(target, [evidence], signal());
+    expect(result.value.cards[0]!.fact).toBe(job);
+    expect(raw.includes(result.value.cards[0]!.excerpt)).toBe(true);
+    expect(result.value.cards[0]!.excerpt).toContain(result.value.cards[0]!.fact);
+    expect(api).toHaveBeenCalledOnce();
+  });
+
+  it('does not split a long web sentence at pipes to manufacture shorter facts', async () => {
+    const raw = `株式会社灯の山田花子。${'長'.repeat(210)} | この結論は正しくありません。`;
+    const api = mockFetch(completion(assessment));
+    const evidence: EvidenceSource = { sourceId: 'web-prose', url: 'https://example.org/', title: 'Page', text: raw, kind: 'web', retrievedAt: '2026-09-22T00:00:00.000Z' };
+    await createLiveProvider(config, { fetch: api }).assess(target, [evidence], signal());
+    const data = JSON.parse(JSON.parse(String(api.mock.calls[0]![1]!.body)).messages[1].content);
+    expect(data.sources[0].excerpts.flatMap((excerpt: { facts: { text: string }[] }) => excerpt.facts).some((item: { text: string }) => item.text.includes('この結論'))).toBe(false);
   });
 
   it('prioritizes exact-name/company eligible evidence while retaining other sources unchanged for ambiguity checks', async () => {
@@ -358,13 +435,26 @@ describe('optional X public lookup and timeline', () => {
     for (const call of api.mock.calls) expect(new Headers(call[1]!.headers).has('X-OrcaRouter-Include-Cost')).toBe(false);
     expect(String(api.mock.calls[0]![0])).toContain('/users/by/username/public_person?');
     expect(String(api.mock.calls[1]![0])).toContain('/users/123/tweets?max_results=5');
-    expect(result.value).toHaveLength(1);
-    expect(result.value[0]!.url).toBe('https://x.com/public_person/status/456');
-    const evidence = await provider.fetchPage(result.value[0]!, signal());
-    expect(evidence.value).toMatchObject({ kind: 'x', url: result.value[0]!.url });
+    expect(result.value).toHaveLength(2);
+    expect(result.value[0]!.url).toBe('https://x.com/public_person');
+    expect(result.value[1]!.url).toBe('https://x.com/public_person/status/456');
+    const profile = await provider.fetchPage(result.value[0]!, signal());
+    expect(profile.value.text).toContain(user.data.description);
+    const evidence = await provider.fetchPage(result.value[1]!, signal());
+    expect(evidence.value).toMatchObject({ kind: 'x', url: result.value[1]!.url });
     expect(evidence.value.text).toContain(post.text);
     expect(evidence).not.toHaveProperty('actualUsd');
     expect(web).not.toHaveBeenCalled();
+    expect(api).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains the public lookup profile for an empty timeline without requesting a next page', async () => {
+    const api = mockFetch(json(user), json({ meta: { result_count: 0, next_token: 'unused' } }));
+    const provider = createLiveProvider(xConfig, { fetch: api });
+    const hits = await provider.search('@public_person', signal());
+    expect(hits.value.map(hit => hit.url)).toEqual(['https://x.com/public_person']);
+    const profile = await provider.fetchPage(hits.value[0]!, signal());
+    expect(profile.value).toMatchObject({ kind: 'x', text: `公開プロフィール: ${user.data.name} (@public_person)\n${user.data.description}` });
     expect(api).toHaveBeenCalledTimes(2);
   });
 
@@ -395,7 +485,8 @@ describe('optional X public lookup and timeline', () => {
   it('does not include another author or treat an error response as an empty timeline', async () => {
     const api = mockFetch(json(user), json({ data: [{ ...post, author_id: '999' }] }), json(user), json({ errors: [{ detail: 'private' }] }));
     const provider = createLiveProvider(xConfig, { fetch: api });
-    expect(await provider.search('@public_person', signal())).toEqual({ value: [] });
+    const hits = await provider.search('@public_person', signal());
+    expect(hits.value.map(hit => hit.url)).toEqual(['https://x.com/public_person']);
     await expect(provider.search('@public_person', signal())).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
   });
 });
@@ -421,6 +512,59 @@ describe('bounded audio transcription', () => {
     const payload = JSON.parse(String(api.mock.calls[0]![1]!.body));
     expect(payload.model).toBe('operator-selected-audio-model');
     expect(payload.messages[1].content[1]).toEqual({ type: 'input_audio', input_audio: { data: wav().toString('base64'), format: 'wav' } });
+  });
+
+  it('returns only literal STT name/company clues from the same call, without expanding aliases', async () => {
+    const spoken = { personName: 'ちょまど', companyName: 'マイクロソフト' };
+    const api = mockFetch(completion({ text: 'マイクロソフトのちょまどさんと、株式会社灯の山田花子さんです。', targets: [
+      spoken, { personName: '千代田まどか', companyName: 'Microsoft' }, target,
+    ] }));
+    const provider = createLiveProvider({ ...config, orcaSttModel: 'fixture-audio' }, { fetch: api });
+    const result = await provider.transcribe!(wav(), 'audio/wav', signal());
+    expect(result.transcriptTargets).toEqual([spoken, target]);
+    expect(result.transcriptHasPersonMention).toBe(true);
+    expect(api).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])('preserves the same-window person-mention hint %s without inventing a company', async hasPersonMention => {
+    const api = mockFetch(completion({ text: hasPersonMention ? '佐藤さんです。' : 'ありがとうございます。', targets: [], hasPersonMention }));
+    const provider = createLiveProvider({ ...config, orcaSttModel: 'fixture-audio' }, { fetch: api });
+    const result = await provider.transcribe!(wav(), 'audio/wav', signal());
+    expect(result).toMatchObject({ transcriptTargets: [], transcriptHasPersonMention: hasPersonMention });
+    expect(api).toHaveBeenCalledOnce();
+  });
+
+  it('preserves an explicit empty clue list and does not invent a target from previous windows', async () => {
+    const api = mockFetch(completion({ text: 'ありがとうございます。', targets: [] }));
+    const provider = createLiveProvider({ ...config, orcaSttModel: 'fixture-audio' }, { fetch: api });
+    expect(await provider.transcribe!(wav(), 'audio/wav', signal())).toEqual({ value: 'ありがとうございます。', transcriptTargets: [] });
+    expect(api).toHaveBeenCalledOnce();
+  });
+
+  it('uses a bounded quoted company clue without mixing past speech into the current transcript', async () => {
+    const current = 'その会社の山田花子さんです。';
+    const context = 'OLD_OUT_OF_CAP'.padEnd(2100, '前') + '株式会社灯について話しています。';
+    const api = mockFetch(completion({ text: current, targets: [target], hasPersonMention: true }));
+    const provider = createLiveProvider({ ...config, orcaSttModel: 'fixture-audio' }, { fetch: api });
+    expect(await provider.transcribe!(wav(), 'audio/wav', signal(), context)).toEqual({ value: current, transcriptTargets: [target], transcriptHasPersonMention: true });
+    expect(api).toHaveBeenCalledOnce();
+    const payload = JSON.parse(String(api.mock.calls[0]![1]!.body));
+    const quoted = JSON.parse(payload.messages[1].content[2].text).previousTranscript;
+    expect(quoted.length).toBeLessThanOrEqual(2000);
+    expect(quoted).toContain('株式会社灯');
+    expect(quoted).not.toContain('OLD_OUT_OF_CAP');
+    expect(payload.messages[0].content).not.toContain('株式会社灯');
+    expect(payload.messages[0].content).toContain('multiple companies');
+  });
+
+  it.each([
+    { text: 'ありがとうございます。', prior: '株式会社灯の山田花子さんです。', hasPersonMention: false },
+    { text: '山田花子さんです。', prior: '別会社のお話です。', hasPersonMention: true },
+  ])('rejects an old person or an unsupported affiliation: $text', async ({ text, prior, hasPersonMention }) => {
+    const api = mockFetch(completion({ text, targets: [target], hasPersonMention }));
+    const provider = createLiveProvider({ ...config, orcaSttModel: 'fixture-audio' }, { fetch: api });
+    expect(await provider.transcribe!(wav(), 'audio/wav', signal(), prior)).toEqual({ value: text, transcriptTargets: [], transcriptHasPersonMention: hasPersonMention });
+    expect(api).toHaveBeenCalledOnce();
   });
 
   it('requires STT configuration and rejects invalid WAV before any upload', async () => {

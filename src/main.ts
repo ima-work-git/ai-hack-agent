@@ -1,7 +1,10 @@
 import './style.css';
-import { ResearchInputSchema, ResearchResultSchema, type ResearchInput, type ResearchResult, type RuntimeStatus, type TraceEvent, type Scenario } from './shared/contracts.ts';
+import { ResearchInputSchema, ResearchResultSchema, type Card, type ResearchInput, type ResearchResult, type RuntimeStatus, type TraceEvent, type Scenario } from './shared/contracts.ts';
 import { G2Runtime, type G2Status } from './integrations/g2-runtime.ts';
 import { PhoneAudio } from './phone-audio.ts';
+import { StreamingAudio } from './streaming-audio.ts';
+import { verifiedAliasForTarget } from './shared/identity-aliases.ts';
+import { TargetSchema } from './shared/contracts.ts';
 import { pcmToWav } from './audio.ts';
 
 // A short-lived QR grant is read once, then removed before any API request.
@@ -13,6 +16,7 @@ let pageLeaving = false;
 
 const DEMO_TEXT = '架空・みなもデザイン株式会社の星野あおいさんについて調べたい。';
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
+const BOARD_MARKUP = Array.from({ length: 4 }, (_, index) => `<button type="button" class="topic-card empty" id="topic-${index}" disabled aria-label="${index + 1}件目は未確認"><span class="topic-number">${index + 1} / 未確認</span><span class="topic-row"><span class="topic-caption">事実</span><span class="topic-fact"${index === 0 ? ' id="fact"' : ''}>未確認</span></span><span class="topic-row"><span class="topic-caption">質問</span><span class="topic-question"${index === 0 ? ' id="question"' : ''}>確認後に表示</span></span></button>`).join('');
 const app = document.getElementById('app')!;
 app.innerHTML = `
 <header class="masthead"><div class="wordmark"><span class="mark" aria-hidden="true">◌</span><div><div class="eyebrow">AI HACK · EVEN G2</div><h1>会話アシスタント <span class="muted">/ 仮称</span></h1></div></div><span class="pill" id="connection">スマートフォン表示</span></header>
@@ -23,11 +27,11 @@ app.innerHTML = `
 <div class="field-row"><div><label for="mode">利用モード</label><select id="mode"><option value="demo">体験デモ</option><option value="live" id="live-option" disabled>実APIで調査</option></select></div><div id="scenario-field"><label for="scenario">確認する場面</label><select id="scenario"><option value="normal">通常・自律的な追加調査</option><option value="ambiguous">同姓同名・候補を確認</option><option value="failure">検索障害・一部の根拠を表示</option><option value="no_evidence">根拠なし・推測せず終了</option></select></div></div>
 <label for="text">会社名と氏名、または会話の文字起こし</label><textarea id="text" maxlength="2000" placeholder="例：〇〇株式会社の〇〇さんです。" spellcheck="false"></textarea>
 <div class="controls"><button id="sample">架空の会話を入力</button><button id="connect">G2を接続</button></div>
-<label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。音声は最大30秒で停止し、文字起こし後に破棄します。</span></label>
-<div class="controls"><button id="record" disabled>音声で入力</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
+<label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。会話モードは音声をOpenAIへ逐次送信して認識し、OrcaRouterで調査します。音声は保存しません。短い録音は最大30秒です。</span></label>
+<div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
 <div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><div id="candidates" class="candidates"></div>
 </section><section class="panel"><div class="section-head"><h2>エージェントの判断</h2><span class="section-number">02 / PROCESS</span></div><p id="trace-empty" class="empty-trace">調査中の判断と復旧の記録がここに表示されます。</p><ol id="trace" class="trace" aria-label="調査の処理履歴"></ol><details><summary>実APIの設定状況</summary><p class="muted" id="configuration"></p><p class="muted">APIキーと費用上限はサーバー側で設定します。</p></details></section></div>
-<div><div class="section-head"><h2>会話のヒント</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="グラス表示のプレビュー"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="hud-body"><p class="hud-fact" id="fact">話題は、根拠とともに。</p><p class="hud-question" id="question">会話を入力して調査を始めると、<br>確認した情報と質問のヒントが届きます。</p></div><div class="hud-foot"><span id="hud-source">公開情報だけを調査</span><span id="hud-expiry">MAX 3 CARDS</span></div></section><nav class="card-nav" aria-label="カード切替"><button id="previous" aria-label="前のカード" disabled>←</button><span id="card-count">0 / 0</span><button id="next" aria-label="次のカード" disabled>→</button></nav>
+<div><div class="section-head"><h2>調査結果と質問 · 4件一覧</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="4件の調査結果と質問"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="topic-board" id="card-board">${BOARD_MARKUP}</div><div class="hud-foot"><span id="hud-source">各カードを押すと原文・出典を表示</span><span id="hud-expiry">0 / 4件確認</span></div></section><nav class="card-nav" aria-label="出典詳細の選択"><button id="previous" aria-label="前の出典" disabled>← 前の出典</button><span id="card-count">0 / 0</span><button id="next" aria-label="次の出典" disabled>次の出典 →</button></nav>
 <div class="notice" id="result-note">体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。</div><div class="metrics"><div class="metric"><strong id="metric-time">—</strong><span>調査にかかった時間</span></div><div class="metric"><strong id="metric-calls">—</strong><span>AI / 検索 / 本文</span></div><div class="metric"><strong id="metric-cost">—</strong><span id="cost-label">実費は未計測</span></div></div><section class="panel evidence-panel"><div class="section-head"><h2>情報の根拠</h2><span class="section-number">04 / EVIDENCE</span></div><p class="muted" id="source-empty">本文の引用・出典・取得時刻を、カードごとに確認できます。</p><div id="sources"></div></section></div></div></main>
 <footer class="footer"><span>AI HACK 2026 · 業務を自律化するAIエージェント</span><span>人の確認が必要なときは、立ち止まる。</span></footer>`;
 
@@ -52,30 +56,62 @@ let audioChunks: Uint8Array[] = [];
 let audioBytes = 0;
 let audioTimer: ReturnType<typeof setTimeout> | undefined;
 let audioSource: 'g2' | 'phone' = 'phone';
+let conversation: StreamingAudio | null = null;
+let pendingTranscript: { itemId: string; text: string } | null = null;
+let identifyingTranscript = false;
+let completedTranscript = '';
+const partialTranscripts = new Map<string, string>();
+let conversationRunning = false;
+let conversationId = '';
+let conversationRequestRevision = 0;
+let conversationLastKey = '';
+let conversationLastAt = 0;
 let g2: G2Runtime;
 
 const status = (text: string, error = false) => { $('status').textContent = text; $('status').classList.toggle('error', error); };
 function refreshControls() {
-  $('research').toggleAttribute('disabled', running || recording || audioBusy);
+  $('research').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
   $('cancel').toggleAttribute('disabled', !running && !recording && !audioBusy);
-  $('mode').toggleAttribute('disabled', running || recording || audioBusy);
-  $('scenario').toggleAttribute('disabled', running || recording || audioBusy);
-  $('record').toggleAttribute('disabled', audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked);
-  $('record').textContent = recording ? '録音を止めて調べる' : '音声で入力';
+  $('mode').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
+  $('scenario').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
+  $('record').toggleAttribute('disabled', !recording && (audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked));
+  $('conversation').toggleAttribute('disabled', recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked);
+  $('record').textContent = recording ? conversationRunning ? '会話モードを終了' : '録音を止めて調べる' : '音声で入力';
 }
 function newViewToken() { viewToken = `${currentId}:${revision}`; g2?.invalidateViews(viewToken); }
+// Count wide characters conservatively and preserve complete Unicode characters.
+function shortText(text: string, maximumWidth: number): string {
+  const characters = Array.from(text.replace(/\s+/g, ' ').trim());
+  const width = (character: string) => /^[\x20-\x7e]$/.test(character) ? 1 : 2;
+  if (characters.reduce((total, character) => total + width(character), 0) <= maximumWidth) return characters.join('');
+  let used = 0; let clipped = '';
+  for (const character of characters) { if (used + width(character) > maximumWidth - 2) break; clipped += character; used += width(character); }
+  return `${clipped}…`;
+}
+function renderBoard(cards: Card[]) {
+  for (let index = 0; index < 4; index++) {
+    const slot = $<HTMLButtonElement>(`topic-${index}`); const card = cards[index];
+    slot.disabled = !card; slot.classList.toggle('empty', !card); slot.classList.toggle('selected', !!card && index === cardIndex);
+    slot.setAttribute('aria-pressed', String(!!card && index === cardIndex));
+    slot.setAttribute('aria-label', card ? `${index + 1}件目の原文と出典を表示` : `${index + 1}件目は未確認`);
+    slot.querySelector('.topic-number')!.textContent = `${index + 1} / ${card ? '原文・出典 ↗' : '未確認'}`;
+    slot.querySelector('.topic-fact')!.textContent = card ? shortText(card.fact, 72) : '未確認';
+    slot.querySelector('.topic-question')!.textContent = card ? shortText(card.suggestedQuestion, 56) : '確認後に表示';
+    slot.onclick = card ? () => { cardIndex = index; renderCard(); } : null;
+  }
+}
 function clearResult() {
   result = null; cardIndex = 0;
   $('candidates').replaceChildren(); $('sources').replaceChildren(); $('source-empty').classList.remove('hidden');
-  $('fact').textContent = '話題は、根拠とともに。'; $('question').textContent = '調査を始めると、確認した情報と質問のヒントが届きます。';
-  $('hud-target').textContent = 'WAITING'; $('hud-source').textContent = '公開情報だけを調査'; $('hud-expiry').textContent = 'MAX 3 CARDS';
+  renderBoard([]);
+  $('hud-target').textContent = 'WAITING'; $('hud-source').textContent = '各カードを押すと原文・出典を表示'; $('hud-expiry').textContent = '0 / 4件確認';
   $('card-count').textContent = '0 / 0'; $('previous').setAttribute('disabled', ''); $('next').setAttribute('disabled', '');
 }
 async function sendView(header: string, content: string, footer: string) {
   if (connected) await g2.render({ header: header.slice(0, 60), content: content.slice(0, 380), footer: footer.slice(0, 100) }, viewToken);
 }
 function renderCard() {
-  const cards = result?.cards.filter(c => Date.parse(c.expiresAt) > Date.now()) || [];
+  const cards = result?.cards.filter(c => Date.parse(c.expiresAt) > Date.now()).slice(0, 4) || [];
   if (!cards.length) {
     if (result?.cards.length) { clearResult(); status('カードの有効期限が切れました。必要なら再調査してください。'); void sendView('会話アシスタント', 'カードの有効期限が切れました。', '再調査してください'); }
     return;
@@ -83,21 +119,28 @@ function renderCard() {
   cardIndex = (cardIndex + cards.length) % cards.length;
   const card = cards[cardIndex]!;
   const source = result!.sources.find(s => s.sourceId === card.sourceId)!;
-  $('fact').textContent = card.fact; $('question').textContent = `質問のヒント：${card.suggestedQuestion}`;
+  renderBoard(cards);
   $('hud-target').textContent = result!.target?.personName || '';
-  $('hud-source').textContent = source.kind === 'fixture' ? '架空の固定資料' : new URL(source.url).hostname;
-  $('hud-expiry').textContent = `${new Date(card.expiresAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} まで`;
+  $('hud-source').textContent = '…は省略。原文・出典はカードを選択';
+  $('hud-expiry').textContent = `${cards.length} / 4件確認`;
   $('card-count').textContent = `${cardIndex + 1} / ${cards.length}`;
   $('previous').toggleAttribute('disabled', cards.length < 2); $('next').toggleAttribute('disabled', cards.length < 2);
   $('sources').replaceChildren(); $('source-empty').classList.add('hidden');
   const evidence = document.createElement('div'); evidence.className = 'source';
   const title = document.createElement('h3'); title.textContent = source.title;
+  const fullFact = document.createElement('p'); fullFact.className = 'source-fact'; fullFact.textContent = `事実（全文）：${card.fact}`;
+  const fullQuestion = document.createElement('p'); fullQuestion.textContent = `質問の提案：${card.suggestedQuestion}`;
   const quote = document.createElement('blockquote'); quote.textContent = card.excerpt;
   const date = document.createElement('p'); date.className = 'muted'; date.textContent = `取得：${new Date(source.retrievedAt).toLocaleString('ja-JP')}`;
-  evidence.append(title, quote, date);
+  const expiry = document.createElement('p'); expiry.className = 'muted'; expiry.textContent = `有効期限：${new Date(card.expiresAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}`;
+  evidence.append(title, fullFact, fullQuestion, quote, date, expiry);
   if (source.kind !== 'fixture' && /^https?:\/\//.test(source.url)) { const link = document.createElement('a'); link.href = source.url; link.textContent = '出典を開く ↗'; link.target = '_blank'; link.rel = 'noopener noreferrer'; evidence.append(link); }
   $('sources').append(evidence);
-  void sendView(`${result!.mode === 'demo' ? '[架空デモ] ' : ''}${result!.target?.personName || ''} ${cardIndex + 1}/${cards.length}`, `${card.fact}\n\n質問：${card.suggestedQuestion}`, `${$('hud-source').textContent} / 5分で失効`);
+  const rows = Array.from({ length: 4 }, (_, index) => {
+    const entry = cards[index];
+    return entry ? `${index + 1} 事:${shortText(entry.fact, 20)} 問:${shortText(entry.suggestedQuestion, 16)}` : `${index + 1} 事:未確認 問:—`;
+  });
+  void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件`, rows.join('\n'), '事=事実 問=質問 / 原文はスマホ');
 }
 function addTrace(event: TraceEvent) {
   if ($('trace').children.length >= 60) return;
@@ -117,9 +160,13 @@ function showResult(value: ResearchResult) {
   }
   $('candidates').replaceChildren();
   if (value.status === 'awaiting_confirmation') {
-    for (const candidate of value.candidates) { const button = document.createElement('button'); button.textContent = `${candidate.personName} / ${candidate.companyName} を選ぶ`; button.onclick = () => { if (lastInput) { $<HTMLTextAreaElement>('text').value = lastInput.text; void research(candidate.id); } }; $('candidates').append(button); }
+    for (const candidate of value.candidates) { const button = document.createElement('button'); button.textContent = `${candidate.personName} / ${candidate.companyName} を選ぶ`; button.onclick = () => { if (lastInput) { $<HTMLTextAreaElement>('text').value = lastInput.text; void research(candidate.id, undefined, conversationId || undefined); } }; $('candidates').append(button); }
   }
-  if (!value.cards.length) { $('fact').textContent = value.status === 'awaiting_confirmation' ? '相手の確認が必要です。' : '確認できた情報はありません。'; $('question').textContent = value.message; void sendView('会話アシスタント', $('fact').textContent!, 'スマートフォンで確認'); }
+  if (!value.cards.length) {
+    renderBoard([]); $('hud-target').textContent = value.target?.personName || '対象未確認'; $('hud-expiry').textContent = '0 / 4件確認';
+    void sendView(value.status === 'awaiting_confirmation' ? '相手の確認が必要です' : '確認できた情報はありません',
+      Array.from({ length: 4 }, (_, index) => `${index + 1} 事:未確認 問:—`).join('\n'), 'スマートフォンで確認');
+  }
   renderCard();
 }
 async function api(path: string, init: RequestInit = {}): Promise<Response> {
@@ -196,14 +243,14 @@ async function expireSession() {
   $('login-status').textContent = '15分経過したため会話データを削除しました。';
   if (await restoreLogin()) status('前の会話データを削除し、新しいセッションを開始しました。マイクは停止しています。');
 }
-async function research(selectedCandidateId?: string, preparedId?: string) {
+async function research(selectedCandidateId?: string, preparedId?: string, activeConversationId?: string) {
   const text = $<HTMLTextAreaElement>('text').value.trim(); if (!text) { status('会社名と氏名、または会話を入力してください。'); return; }
-  if (running || recording || audioBusy || !token) return;
+  if (running || recording && !activeConversationId || audioBusy || !token) return;
   $('resume-notice').classList.add('hidden');
   currentId = preparedId || crypto.randomUUID(); revision += 1; newViewToken(); clearResult();
   $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
   running = true; refreshControls(); controller = new AbortController(); const ownController = controller; const ownId = currentId;
-  const input: ResearchInput = { text, requestId: ownId, subjectRevision: revision, mode: $<HTMLSelectElement>('mode').value as 'demo' | 'live', scenario: $<HTMLSelectElement>('scenario').value as Scenario, ...(selectedCandidateId ? { selectedCandidateId } : {}) };
+  const input: ResearchInput = { text, requestId: ownId, subjectRevision: revision, mode: $<HTMLSelectElement>('mode').value as 'demo' | 'live', scenario: $<HTMLSelectElement>('scenario').value as Scenario, ...(selectedCandidateId ? { selectedCandidateId } : {}), ...(activeConversationId ? { conversationId: activeConversationId } : {}) };
   lastInput = input; status('公開情報を調べています…'); await sendView('会話アシスタント', '公開情報を調査中…', '中止はスマートフォンから');
   let gotResult = false;
   try {
@@ -227,25 +274,122 @@ async function research(selectedCandidateId?: string, preparedId?: string) {
   finally { if (controller === ownController) { running = false; controller = null; refreshControls(); } }
 }
 async function cancel() {
-  const oldId = currentId; const oldRevision = revision; controller?.abort(); controller = null; running = false;
+  const wasConversation = conversationRunning;
+  const oldId = currentId; const oldRevision = revision; abortConversation(); controller?.abort(); controller = null; running = false;
   currentId = crypto.randomUUID(); revision += 1; newViewToken(); clearResult();
   await stopRecording(false);
-  if (oldId && token) void api('/api/cancel', json({ requestId: oldId, subjectRevision: oldRevision })).catch(() => {});
+  if (!wasConversation && oldId && token) void api('/api/cancel', json({ requestId: oldId, subjectRevision: oldRevision })).catch(() => {});
   status('停止しました。遅れて届いた結果は表示しません。'); await sendView('会話アシスタント', '調査を停止しました。', '入力待ち'); refreshControls();
 }
 function g2Status(state: G2Status) {
   connected = state.state === 'connected' || state.state === 'recording';
   const labels: Record<string, string> = { idle: '画面プレビュー', connecting: 'G2へ接続中', connected: 'G2接続受付済み', recording: 'G2で録音中', background: 'バックグラウンド・停止', disconnected: 'G2切断', unavailable: 'Evenアプリ内で接続してください', error: 'G2接続を確認してください', disposed: 'G2接続終了' };
   $('device-status').textContent = `Even G2 · ${labels[state.state] || state.state}`; $('connection').textContent = connected ? 'G2接続受付済み' : 'スマートフォン表示'; $('device-dot').classList.toggle('on', connected);
-  if (recording && audioSource === 'g2' && state.state !== 'recording') void stopRecording(state.state === 'connected');
+  if (recording && audioSource === 'g2' && state.state !== 'recording') { if (conversationRunning) void cancel(); else void stopRecording(state.state === 'connected'); }
   if (['background', 'disconnected', 'error', 'disposed'].includes(state.state)) { currentId = crypto.randomUUID(); newViewToken(); clearResult(); }
 }
 function acceptAudio(chunk: Uint8Array) {
+  if (recording && conversationRunning) { conversation?.append(chunk); return; }
   if (!recording || audioBytes + chunk.length > 960_000) return;
   audioChunks.push(chunk.slice()); audioBytes += chunk.length;
 }
 g2 = new G2Runtime({ onStatus: g2Status, onAudio: acceptAudio, onAction: action => { if (action === 'next') { cardIndex++; renderCard(); } else if (action === 'previous') { cardIndex--; renderCard(); } else if (action === 'exit') void cancel(); } });
-const phone = new PhoneAudio({ onAudio: acceptAudio, onStopped: reason => { if (recording && audioSource === 'phone') void stopRecording(reason !== 'error'); }, onError: message => status(message, true) });
+const phone = new PhoneAudio({ onAudio: acceptAudio, onStopped: reason => { if (recording && audioSource === 'phone') { if (conversationRunning) void cancel(); else void stopRecording(reason !== 'error'); } }, onError: message => status(message, true) });
+function abortConversation() {
+  const group = conversationId;
+  const stream = conversation; conversation = null; conversationRunning = false; conversationId = ''; pendingTranscript = null; partialTranscripts.clear(); completedTranscript = ''; stream?.cancel();
+  if (group && token) {
+    controller?.abort(); controller = null; running = false;
+    void api('/api/cancel', json({ requestId: currentId, subjectRevision: conversationRequestRevision || Math.max(1, revision + 1), conversationId: group })).catch(() => {});
+  }
+}
+async function processConversationTranscript(text: string, generation: number) {
+  const valid = () => generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
+  if (!valid()) return;
+  const id = crypto.randomUUID(); currentId = id; conversationRequestRevision = revision + 1;
+  const own = new AbortController(); controller = own; audioBusy = true; refreshControls();
+  try {
+    const response = await api('/api/conversation/identify', { ...json({ text, requestId: id, subjectRevision: conversationRequestRevision, conversationId }), signal: own.signal });
+    const data = await response.json(); if (!valid()) return;
+    $<HTMLTextAreaElement>('text').value = typeof data.text === 'string' ? data.text : '';
+    const parsed = TargetSchema.array().max(3).safeParse(data.targets);
+    const targets = parsed.success ? parsed.data : [];
+    if (targets.length !== 1) {
+      if (targets.length > 1 || data.hasPersonMention !== false) {
+        newViewToken(); clearResult();
+        await sendView('人物を確認', targets.length > 1 ? '複数の人物が出ています。' : '会社名と氏名を教えてください。', '同じ人として結び付けません');
+      }
+      status(targets.length > 1 ? '複数の人物が出ています。調べたい会社名と氏名を一組で話してください。' : '聞き取り中です。会社名と氏名の組合せが出たら調べます。');
+      return;
+    }
+    const target = verifiedAliasForTarget(targets[0]!)?.target ?? targets[0]!;
+    const key = `${target.companyName}|${target.personName}`.normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+    if (conversationLastKey === key && Date.now() - conversationLastAt < (result?.cards.length ? 120_000 : 30_000)) {
+      status(`${target.personName}さんの話題を表示しながら聞き取り中です。対象が変わると調べ直します。`); return;
+    }
+    conversationLastKey = key; conversationLastAt = Date.now();
+    $<HTMLTextAreaElement>('text').value = `人物の候補：氏名「${targets[0]!.personName}」、会社名「${targets[0]!.companyName}」。所属は公開情報で確認してください。直近の発話：${data.text}`;
+    audioBusy = false; if (controller === own) controller = null;
+    await research(undefined, id, conversationId);
+    if (result?.status === 'awaiting_confirmation' && valid()) {
+      const stream = conversation; conversation = null; conversationRunning = false; recording = false; audioBusy = false; audioGeneration++; pendingTranscript = null; stream?.cancel();
+      await (audioSource === 'g2' ? g2.stopAudio() : phone.stop());
+      status('相手の確認のため聞き取りを一時停止しました。候補を選び、会話モードを再開してください。');
+    }
+    if (result?.reasonCode === 'BUDGET_EXHAUSTED') throw new Error('費用上限に達したため、会話モードを終了しました。');
+  } finally { if (controller === own) controller = null; if (generation === audioGeneration) audioBusy = false; refreshControls(); }
+}
+async function drainTranscripts(generation: number) {
+  if (identifyingTranscript) return;
+  identifyingTranscript = true;
+  try {
+    while (pendingTranscript && conversationRunning && generation === audioGeneration) {
+      const next = pendingTranscript; pendingTranscript = null;
+      if (result?.cards.length && !/(?:会社|株式会社|合同会社|[一-龠]{2,12}(?:さん|氏|様|と申|です)|ちょまど|Microsoft|マイクロソフト|@)/iu.test(next.text)) continue;
+      await processConversationTranscript(next.text, generation);
+    }
+  } catch (error) {
+    if (generation === audioGeneration && conversationRunning) { await stopRecording(false); status(error instanceof Error ? error.message : '会話の調査を続けられませんでした。', true); }
+  } finally { identifyingTranscript = false; if (pendingTranscript && conversationRunning) void drainTranscripts(audioGeneration); }
+}
+async function startConversation() {
+  if (!runtimeStatus.streamingEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || recording || audioBusy || conversationRunning) return;
+  const generation = ++audioGeneration; conversationRunning = true; recording = true;
+  conversationId = ''; conversationRequestRevision = 0; conversationLastKey = ''; conversationLastAt = 0;
+  completedTranscript = ''; partialTranscripts.clear(); pendingTranscript = null;
+  audioSource = connected ? 'g2' : 'phone'; currentId = crypto.randomUUID(); newViewToken(); clearResult();
+  conversation = new StreamingAudio({
+    onDelta: (itemId, delta) => {
+      if (generation !== audioGeneration || !conversationRunning) return;
+      if (!partialTranscripts.has(itemId) && partialTranscripts.size >= 8) partialTranscripts.delete(partialTranscripts.keys().next().value!);
+      partialTranscripts.set(itemId, ((partialTranscripts.get(itemId) ?? '') + delta).slice(-2000));
+      $<HTMLTextAreaElement>('text').value = `${completedTranscript}\n${[...partialTranscripts.values()].join(' ')}`.trim().slice(-2000);
+    },
+    onFinal: (itemId, text) => {
+      if (generation !== audioGeneration || !conversationRunning || !text.trim()) return;
+      partialTranscripts.delete(itemId); completedTranscript = `${completedTranscript}\n${text}`.trim().slice(-1200);
+      $<HTMLTextAreaElement>('text').value = completedTranscript;
+      pendingTranscript = { itemId, text: text.slice(0, 2000) }; void drainTranscripts(generation);
+    },
+    onError: error => { if (generation === audioGeneration) { void stopRecording(false); status(error.message, true); } },
+    onClose: () => { if (generation === audioGeneration && conversationRunning) { void stopRecording(false); status('音声接続が終了しました。会話モードを再開してください。'); } },
+  });
+  status('ストリーミング音声認識へ接続しています…'); refreshControls();
+  try {
+    const setup = api('/api/conversation', json({})).then(response => response.json()); void setup.catch(() => {});
+    // Start the microphone within the user's tap for iPhone permission handling.
+    const microphone = audioSource === 'g2' ? g2.startAudio({ continuous: true }) : phone.start({ continuous: true });
+    const [group, opened] = await Promise.all([setup, microphone]);
+    if (generation !== audioGeneration) return;
+    if (!opened || !recording || typeof group.conversationId !== 'string') throw new Error('マイクを開始できませんでした。接続と許可を確認してください。');
+    conversationId = group.conversationId;
+    const ticketResponse = await api('/api/conversation/stream', json({ conversationId }));
+    const ticket = await ticketResponse.json(); if (generation !== audioGeneration) return;
+    if (!await conversation!.start(ticket.ticket) || generation !== audioGeneration) return;
+    status('ストリーミング認識中です。話している途中から文字が表示され、人物と会社が揃うと調べます。');
+    await sendView('会話モード', '音声をストリーミング認識中', '終了はスマートフォンから');
+  } catch (error) { if (generation === audioGeneration) { await stopRecording(false); status(error instanceof Error ? error.message : '会話モードを開始できませんでした。', true); } }
+}
 async function startRecording() {
   if (!runtimeStatus.sttEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || audioBusy) return;
   const generation = ++audioGeneration;
@@ -258,6 +402,7 @@ async function startRecording() {
 }
 async function stopRecording(transcribe: boolean) {
   if (!transcribe) {
+    abortConversation();
     audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer);
     audioChunks = []; audioBytes = 0;
     await (audioSource === 'g2' ? g2.stopAudio() : phone.stop()); refreshControls(); return;
@@ -291,7 +436,8 @@ $('research').onclick = () => { void research(); }; $('cancel').onclick = () => 
 $('previous').onclick = () => { cardIndex--; renderCard(); }; $('next').onclick = () => { cardIndex++; renderCard(); };
 $('connect').onclick = async () => { const ok = await g2.connect({ header: '会話アシスタント', content: '接続しました。スマートフォンから調査を開始してください。', footer: 'マイクは停止中' }, viewToken); if (!ok) status('Evenアプリからこの画面を開いて接続してください。通常のブラウザーではプレビューを利用できます。'); };
 $('consent').onchange = () => { if (!$<HTMLInputElement>('consent').checked) void stopRecording(false); refreshControls(); };
-$('record').onclick = () => { if (recording) void stopRecording(true); else void startRecording(); };
+$('conversation').onclick = () => { void startConversation(); };
+$('record').onclick = () => { if (conversationRunning) void cancel(); else if (recording) void stopRecording(true); else void startRecording(); };
 $('mode').onchange = () => { currentId = crypto.randomUUID(); newViewToken(); clearResult(); void sendView('会話アシスタント', '調査を開始してください。', 'マイクは停止中'); const demo = $<HTMLSelectElement>('mode').value === 'demo'; $('scenario-field').classList.toggle('hidden', !demo); $('mode-badge').textContent = demo ? '体験デモ · 架空の人物・固定データ' : '実API · 公開情報を調査'; $('hud-mode').textContent = demo ? 'DEMO / FICTIONAL DATA' : 'LIVE / PUBLIC SOURCES'; $('result-note').textContent = demo ? '体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。' : '個人の非公開情報は調査しません。情報が曖昧な場合は確認を求めます。'; refreshControls(); };
 $('resume').onclick = async () => {
   if (running || recording || audioBusy) return;
@@ -310,11 +456,11 @@ $('resume').onclick = async () => {
 };
 $('end').onclick = async () => { if (authBusy) return; setAuthBusy(true); authGeneration++; await cancel(); try { await api('/api/session/forget', json({})); token = ''; expiresAt = 0; clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = '会話データと、この端末のログインの記憶を削除しました。'; } catch (e) { status(e instanceof Error ? e.message : '削除を確認できませんでした。'); } finally { setAuthBusy(false); } };
 document.addEventListener('visibilitychange', () => { if (document.hidden) { void cancel(); } });
-window.addEventListener('pagehide', () => { pageLeaving = true; qrLoginTicket = ''; authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
+window.addEventListener('pagehide', () => { pageLeaving = true; qrLoginTicket = ''; abortConversation(); authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
 setInterval(() => { if (result?.cards.some(card => Date.parse(card.expiresAt) <= Date.now())) renderCard(); if (token && expiresAt > 0 && expiresAt <= Date.now()) void expireSession(); }, 15_000);
 try {
   runtimeStatus = await (await fetch('/api/status', { cache: 'no-store' })).json();
   $('live-option').toggleAttribute('disabled', !runtimeStatus.liveEnabled); $('configuration').textContent = runtimeStatus.liveEnabled ? '実APIでの調査を利用できます。課金額は設定した上限内で予約します。' : `未設定：${runtimeStatus.missing.join('、')}`;
-  if (runtimeStatus.sttEnabled) $('audio-hint').textContent = 'G2接続時はグラス、未接続時はスマートフォンのマイクを使用';
+  if (runtimeStatus.streamingEnabled || runtimeStatus.sttEnabled) $('audio-hint').textContent = 'G2接続時はグラス、未接続時はスマートフォンのマイクを使用';
   $('login').classList.remove('hidden'); if (!runtimeStatus.accessCodeRequired) { $('access-code').classList.add('hidden'); document.querySelector('label[for="access-code"]')?.classList.add('hidden'); await login(); } else if (await restoreLogin()) { qrLoginTicket = ''; } else await redeemQrLogin();
 } catch { $('login').classList.remove('hidden'); $('login-status').textContent = 'サーバーに接続できません。再読み込みしてください。'; }

@@ -37,6 +37,27 @@ function fixture(reply: (input: SelectionInput) => unknown = () => emptyAssessme
 const hasLoneSurrogate = (text: string) => [...text].some(character => character.length === 1 && character.charCodeAt(0) >= 0xd800 && character.charCodeAt(0) <= 0xdfff);
 
 describe('bounded evidence selection — mocked model, no network or assertion of semantic identity', () => {
+  it('allows four selected raw facts and rejects a fifth rather than changing research-call limits', async () => {
+    const facts = ['第一の公開活動です。', '第二の公開活動です。', '第三の公開活動です。', '第四の公開活動です。', '第五の公開活動です。'];
+    const original = source('primary', `${target.companyName}の${target.personName}です。${facts.join('')}`);
+    const f = fixture(data => ({ ...emptyAssessment(), cards: facts.slice(0, 4).map(fact => select(data, 'primary', fact)) }));
+    expect((await f.assess([original])).value.cards.map(card => card.fact)).toEqual(facts.slice(0, 4));
+    const over = fixture(data => ({ ...emptyAssessment(), cards: facts.map(fact => select(data, 'primary', fact)) }));
+    await expect(over.assess([original])).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+  });
+
+  it('uses only verified alias equivalents as eligibility clues while preserving ambiguity and literal facts', async () => {
+    const known = { personName: '千代田まどか', companyName: 'Microsoft' };
+    // Synthetic sentences exercise attribution handling, not real biography.
+    const matched = source('primary', `Madoka Chiyoda (Chomado), Microsoft. ${FACT}`);
+    const other = source('other-company', 'ちょまど。別会社の記述です。');
+    const f = fixture(data => ({ ...emptyAssessment(), identityVerified: false, needsConfirmation: true, cards: [] }));
+    const result = await f.assess([matched, other], known);
+    expect(f.inputs[0]!.sources.map(item => [item.sourceId, item.cardEligible])).toEqual([['primary', true], ['other-company', false]]);
+    expect(f.inputs[0]!.sources[0]!.excerpts[0]!.facts.some(fact => fact.text === FACT)).toBe(true);
+    expect(result.value).toMatchObject({ identityVerified: false, needsConfirmation: true, cards: [] });
+  });
+
   it('maps a known selection to the exact original source and raw contiguous excerpt', async () => {
     const f = fixture(data => ({ ...emptyAssessment(), cards: [select(data)] }));
     const original = primary();

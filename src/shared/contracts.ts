@@ -11,6 +11,7 @@ export const ResearchInputSchema = z.object({
   subjectRevision: z.number().int().positive(),
   mode: ModeSchema.default('demo'), scenario: ScenarioSchema.default('normal'),
   selectedCandidateId: z.string().max(80).optional(),
+  conversationId: z.string().uuid().optional(),
 }).strict();
 export type ResearchInput = z.infer<typeof ResearchInputSchema>;
 export const SearchHitSchema = z.object({ url: z.url().max(2048), title: z.string().max(400), snippet: z.string().max(3000).optional() }).strict();
@@ -31,7 +32,7 @@ export type PlanDecision = z.infer<typeof PlanDecisionSchema>;
 export const ProposedCardSchema = z.object({ fact: z.string().min(1).max(200), suggestedQuestion: z.string().min(1).max(180), sourceId: z.string().max(100), excerpt: z.string().min(1).max(1000) }).strict();
 export const AssessmentSchema = z.object({
   identityVerified: z.boolean(), needsConfirmation: z.boolean(), candidates: z.array(CandidateSchema).max(5),
-  cards: z.array(ProposedCardSchema).max(3), followUpQuery: z.string().max(300).nullable(), reason: z.string().max(600),
+  cards: z.array(ProposedCardSchema).max(4), followUpQuery: z.string().max(300).nullable(), reason: z.string().max(600),
 }).strict();
 export type Assessment = z.infer<typeof AssessmentSchema>;
 export const CardSchema = ProposedCardSchema.extend({ cardId: z.string(), expiresAt: z.iso.datetime(), requestId: z.string(), subjectRevision: z.number().int() }).strict();
@@ -46,11 +47,12 @@ export const ResearchResultSchema = z.object({
   requestId: z.string(), subjectRevision: z.number().int(), mode: ModeSchema,
   status: z.enum(['ready', 'partial', 'no_evidence', 'awaiting_confirmation', 'failed', 'cancelled']),
   target: TargetSchema.nullable(), candidates: z.array(CandidateSchema).max(5),
-  cards: z.array(CardSchema).max(3), sources: z.array(EvidenceSourceSchema).max(4),
+  cards: z.array(CardSchema).max(4), sources: z.array(EvidenceSourceSchema).max(4),
   trace: z.array(TraceEventSchema).max(60), reasonCode: z.string().max(80), message: z.string().max(800), usage: UsageSchema,
 }).strict();
 export type ResearchResult = z.infer<typeof ResearchResultSchema>;
 export const RuntimeStatusSchema = z.object({
+  streamingEnabled: z.boolean().optional(),
   liveEnabled: z.boolean(), missing: z.array(z.string()), sttEnabled: z.boolean(), xEnabled: z.boolean(),
   accessCodeRequired: z.boolean(), version: z.string(),
 }).strict();

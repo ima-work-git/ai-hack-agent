@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import type { G2RuntimeOptions, GlassesView } from '../src/integrations/g2-runtime.ts';
 import type { PhoneAudioOptions } from '../src/phone-audio.ts';
+import type { StreamingAudioOptions } from '../src/streaming-audio.ts';
 import type { ResearchInput, ResearchResult } from '../src/shared/contracts.ts';
 
 interface MockG2 {
@@ -19,7 +20,13 @@ interface MockPhone {
   start: ReturnType<typeof vi.fn>;
   stop: ReturnType<typeof vi.fn>;
 }
-const devices = vi.hoisted(() => ({ g2: null as MockG2 | null, phone: null as MockPhone | null }));
+interface MockStreaming {
+  options: StreamingAudioOptions;
+  start: ReturnType<typeof vi.fn>;
+  append: ReturnType<typeof vi.fn>;
+  cancel: ReturnType<typeof vi.fn>;
+}
+const devices = vi.hoisted(() => ({ g2: null as MockG2 | null, phone: null as MockPhone | null, streaming: null as MockStreaming | null }));
 vi.mock('../src/integrations/g2-runtime.ts', () => ({
   G2Runtime: class implements MockG2 {
     constructor(public options: G2RuntimeOptions) { devices.g2 = this; }
@@ -39,6 +46,14 @@ vi.mock('../src/phone-audio.ts', () => ({
     stop = vi.fn(async () => {
       if (this.recording) { this.recording = false; this.options.onStopped('user'); }
     });
+  },
+}));
+vi.mock('../src/streaming-audio.ts', () => ({
+  StreamingAudio: class implements MockStreaming {
+    constructor(public options: StreamingAudioOptions) { devices.streaming = this; }
+    start = vi.fn(async (_ticket: string) => true);
+    append = vi.fn();
+    cancel = vi.fn(() => { this.options.onClose?.(); });
   },
 }));
 
@@ -101,7 +116,7 @@ function delayPhoneStop() {
 describe('main UI lifecycle regressions — DOM actions and outgoing requests, mocked devices/API', () => {
   beforeEach(() => {
     vi.resetModules(); vi.useFakeTimers(); vi.setSystemTime(new Date('2026-09-22T02:00:00Z'));
-    routes.clear(); devices.g2 = null; devices.phone = null;
+    routes.clear(); devices.g2 = null; devices.phone = null; devices.streaming = null;
     window.history.replaceState(null, '', '/');
     document.body.innerHTML = '<div id="app"></div>';
     vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
@@ -111,10 +126,13 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
       const path = String(input);
       const route = routes.get(path);
       if (route) return route(init);
-      if (path === '/api/status') return jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, xEnabled: false, accessCodeRequired: false, version: 'fixture' });
+      if (path === '/api/status') return jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, streamingEnabled: true, xEnabled: false, accessCodeRequired: false, version: 'fixture' });
       if (path === '/api/session') return jsonResponse(init.method === 'DELETE' ? {} : { token: 'fixture-session-token', revision: 3, expiresAt: Date.now() + 900_000, hasPrevious: true, interrupted: false });
       if (path === '/api/session/restore') return new Response('{}', { status: 401 });
       if (path === '/api/session/forget') return jsonResponse({ ended: true });
+      if (path === '/api/conversation') return jsonResponse({ conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab', expiresAt: Date.now() + 900_000 });
+      if (path === '/api/conversation/stream') return jsonResponse({ ticket: 'fixture-stream-ticket' });
+      if (path === '/api/conversation/identify') return jsonResponse({ text: '架空検証社の架空の検証参加者です。', targets: [{ personName: '架空の検証参加者', companyName: '架空検証社' }], hasPersonMention: true });
       if (path === '/api/transcribe') return jsonResponse({ text: '架空検証社の架空の検証参加者です。' });
       if (path === '/api/research') return resultResponse(JSON.parse(String(init.body)) as ResearchInput);
       if (path === '/api/cancel') return jsonResponse({ cancelled: true });
@@ -159,6 +177,90 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     element('login-form').dispatchEvent(new Event('submit', { cancelable: true })); await flush();
     expect(JSON.parse(String(requests('/api/session')[0]!.body))).toEqual({ accessCode: 'fixture-access-code', rememberDevice: false });
     expect(element('workspace').classList.contains('hidden')).toBe(false);
+  });
+
+  it('streams partial text immediately, researches final identities and captures beyond 30 seconds without duplicate searches', async () => {
+    let text = { text: '架空検証社の架空の検証参加者です。', targets: [{ personName: '架空の検証参加者', companyName: '架空検証社' }], hasPersonMention: true };
+    routes.set('/api/conversation/identify', async () => jsonResponse(text));
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    expect(devices.phone!.start).toHaveBeenCalledWith({ continuous: true });
+    const stream = devices.streaming!;
+    expect(stream.start).toHaveBeenCalledExactlyOnceWith('fixture-stream-ticket');
+    expect(JSON.parse(String(requests('/api/conversation/stream')[0]!.body))).toEqual({ conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab' });
+    const pcm = new Uint8Array([0, 1, 2, 3]); devices.phone!.options.onAudio(pcm);
+    expect(stream.append).toHaveBeenCalledExactlyOnceWith(pcm);
+    stream.options.onDelta('first', '架空検証社の');
+    expect(element<HTMLTextAreaElement>('text').value).toBe('架空検証社の');
+    stream.options.onDelta('first', '架空の検証参加者です。');
+    expect(element<HTMLTextAreaElement>('text').value).toBe(text.text);
+    expect(requests('/api/conversation/identify')).toHaveLength(0);
+    expect(requests('/api/research')).toHaveLength(0);
+    stream.options.onFinal('first', text.text); await flush();
+    expect(requests('/api/transcribe')).toHaveLength(0);
+    expect(requests('/api/conversation/identify')).toHaveLength(1);
+    expect(requests('/api/research')).toHaveLength(1);
+    const input = JSON.parse(String(requests('/api/research')[0]!.body));
+    expect(input.conversationId).toBe('8a874d7b-6dda-41a2-8a27-d70e440b10ab');
+    expect(JSON.parse(String(requests('/api/conversation/identify')[0]!.body)))
+      .toMatchObject({ requestId: input.requestId, subjectRevision: input.subjectRevision, conversationId: input.conversationId, text: text.text });
+    expect(devices.phone!.recording).toBe(true);
+    expect(element<HTMLButtonElement>('record').disabled).toBe(false);
+    await vi.advanceTimersByTimeAsync(31_000);
+    stream.options.onFinal('second', text.text); await flush();
+    expect(requests('/api/research')).toHaveLength(1);
+    expect(requests('/api/conversation/identify')).toHaveLength(2);
+    expect(devices.phone!.recording).toBe(true);
+    text = { text: '今日は良い天気ですね。', targets: [], hasPersonMention: false };
+    stream.options.onFinal('weather', text.text); await flush();
+    expect(element('card-board').textContent).toContain(FACT);
+    text = { text: '別の会社の架空さんも参加します。', targets: [], hasPersonMention: true };
+    stream.options.onFinal('other', text.text); await flush();
+    expect(element('card-board').textContent).not.toContain(FACT);
+    click('record'); await flush();
+    expect(devices.phone!.recording).toBe(false);
+    expect(stream.cancel).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(requests('/api/cancel').at(-1)!.body))).toMatchObject({ conversationId: input.conversationId });
+  });
+
+  it('pauses capture for ambiguous candidates and selects within the original conversation budget', async () => {
+    routes.set('/api/research', async init => {
+      const input = JSON.parse(String(init.body)) as ResearchInput;
+      if (input.selectedCandidateId) return resultResponse(input);
+      const result = researchResult(input.requestId, input.subjectRevision);
+      result.status = 'awaiting_confirmation'; result.cards = []; result.candidates = [{ id: 'candidate-a', personName: '架空の検証参加者', companyName: '架空検証社', reason: '同名の候補', sourceIds: [] }];
+      return new Response(`${JSON.stringify({ type: 'result', result })}\n`);
+    });
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    stream.options.onFinal('ambiguous', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(devices.phone!.recording).toBe(false);
+    expect(stream.cancel).toHaveBeenCalledOnce();
+    expect(element('candidates').children).toHaveLength(1);
+    stream.options.onFinal('late', '別の会社の人物です。'); await flush();
+    expect(requests('/api/conversation/identify')).toHaveLength(1);
+    (element('candidates').firstElementChild as HTMLButtonElement).click(); await flush();
+    expect(requests('/api/research')).toHaveLength(2);
+    expect(JSON.parse(String(requests('/api/research')[1]!.body))).toMatchObject({ selectedCandidateId: 'candidate-a', conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab' });
+    expect(element('card-board').textContent).toContain(FACT);
+  });
+
+  it('cancels streaming and active identification, ignoring delayed final text and identification responses', async () => {
+    const gate = deferred<Response>(); routes.set('/api/conversation/identify', () => gate.promise);
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
+    const sent = requests('/api/conversation/identify')[0]!;
+    const { requestId, subjectRevision, conversationId } = JSON.parse(String(sent.body));
+    click('record'); await flush();
+    expect(sent.signal!.aborted).toBe(true);
+    expect(stream.cancel).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(requests('/api/cancel')[0]!.body))).toMatchObject({ requestId, subjectRevision, conversationId });
+    stream.options.onDelta('late', 'late partial'); stream.options.onFinal('late', 'late transcript');
+    gate.resolve(jsonResponse({ text: 'late transcript', targets: [{ personName: '架空の検証参加者', companyName: '架空検証社' }] })); await flush();
+    expect(requests('/api/conversation/identify')).toHaveLength(1);
+    expect(requests('/api/research')).toHaveLength(0);
+    expect(element<HTMLTextAreaElement>('text').value).not.toContain('late transcript');
+    expect(devices.phone!.recording).toBe(false);
   });
 
   it('starts a fresh session after expiry without retaining conversation or replaying paid work', async () => {
@@ -275,6 +377,20 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
   });
 
+  it('keeps short recording available when streaming is not configured', async () => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, streamingEnabled: false, accessCodeRequired: false }));
+    await boot(); chooseLiveAndConsent();
+    expect(element<HTMLButtonElement>('conversation').disabled).toBe(true);
+    expect(element<HTMLButtonElement>('record').disabled).toBe(false);
+    click('record'); await flush();
+    expect(devices.phone!.start).toHaveBeenCalledOnce();
+    devices.phone!.options.onAudio(new Uint8Array([0, 0, 255, 127]));
+    click('record'); await flush();
+    expect(requests('/api/transcribe')).toHaveLength(1);
+    expect(requests('/api/conversation/stream')).toHaveLength(0);
+    expect(devices.streaming).toBeNull();
+  });
+
   it('shows an actionable error and permits retry when an explicit stop captured no audio', async () => {
     await boot(); chooseLiveAndConsent();
     click('record'); await flush();
@@ -370,6 +486,69 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(devices.g2!.startAudio).not.toHaveBeenCalled();
   });
 
+  it('shows four fact/question pairs together and keeps the G2 board unchanged while selecting source details', async () => {
+    const value = researchResult();
+    const words = ['いち', 'に', 'さん', 'よん'];
+    value.cards = words.map((word, index) => ({ ...value.cards[0]!, cardId: `card-${index}`,
+      fact: `公開事実${word}。`, suggestedQuestion: `質問${word}？`, excerpt: `公開事実${word}。` }));
+    value.sources[0]!.text = value.cards.map(card => card.excerpt).join(' ');
+    routes.set('/api/session/resume', async () => jsonResponse({ result: value }));
+    await boot(); click('connect'); await flush(); click('resume'); await flush();
+    expect([...element('card-board').querySelectorAll('.topic-fact')].map(node => node.textContent))
+      .toEqual(value.cards.map(card => card.fact));
+    expect([...element('card-board').querySelectorAll('.topic-question')].map(node => node.textContent))
+      .toEqual(value.cards.map(card => card.suggestedQuestion));
+    expect(element('card-board').querySelectorAll('button:disabled')).toHaveLength(0);
+    expect(element('hud-expiry').textContent).toBe('4 / 4件確認');
+    const initialView = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(initialView.content.split('\n')).toEqual(words.map((word, index) => `${index + 1} 事:公開事実${word}。 問:質問${word}？`));
+    click('next'); await flush();
+    expect(element('card-count').textContent).toBe('2 / 4');
+    expect(element('sources').querySelector('.source-fact')!.textContent).toBe('事実（全文）：公開事実に。');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toBe(initialView.content);
+    click('topic-3'); await flush();
+    expect(element('card-count').textContent).toBe('4 / 4');
+    expect(element('sources').querySelector('blockquote')!.textContent).toBe('公開事実よん。');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toBe(initialView.content);
+  });
+
+  it.each([0, 1])('leaves unsupported slots unconfirmed when only %s cards have evidence', async count => {
+    const value = researchResult();
+    value.cards = value.cards.slice(0, count);
+    if (!count) { value.status = 'no_evidence'; value.sources = []; }
+    routes.set('/api/session/resume', async () => jsonResponse({ result: value }));
+    await boot(); click('connect'); await flush(); click('resume'); await flush();
+    const missing = element('card-board').querySelectorAll<HTMLButtonElement>('.topic-card.empty');
+    expect(missing).toHaveLength(4 - count);
+    for (const slot of missing) {
+      expect(slot.disabled).toBe(true);
+      expect(slot.querySelector('.topic-fact')!.textContent).toBe('未確認');
+      expect(slot.querySelector('.topic-question')!.textContent).toBe('確認後に表示');
+    }
+    const rows = (devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content.split('\n');
+    expect(rows).toHaveLength(4);
+    expect(rows.filter(row => row.includes('事:未確認'))).toHaveLength(4 - count);
+  });
+
+  it('marks shortened pairs with an ellipsis and retains the full original in source details', async () => {
+    const value = researchResult();
+    const fact = '😀架空の検証対象が公開した活動記録を紹介しています。'.repeat(3);
+    const question = '今回の公開活動でどのようなことを学びましたか？'.repeat(3);
+    value.cards[0] = { ...value.cards[0]!, fact, suggestedQuestion: question, excerpt: fact };
+    value.sources[0]!.text = fact;
+    routes.set('/api/session/resume', async () => jsonResponse({ result: value }));
+    await boot(); click('connect'); await flush(); click('resume'); await flush();
+    expect(element('fact').textContent).toMatch(/…$/);
+    expect(element('question').textContent).toMatch(/…$/);
+    expect(element('sources').querySelector('.source-fact')!.textContent).toBe(`事実（全文）：${fact}`);
+    expect(element('sources').querySelector('blockquote')!.textContent).toBe(fact);
+    const firstRow = (devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content.split('\n')[0]!;
+    expect(firstRow).toContain('事:'); expect(firstRow).toContain('問:'); expect(firstRow.match(/…/g)).toHaveLength(2);
+    expect(firstRow).not.toContain('\ufffd');
+    const width = Array.from(firstRow).reduce((sum, character) => sum + (/^[\x20-\x7e]$/.test(character) ? 1 : 2), 0);
+    expect(width).toBeLessThanOrEqual(45);
+  });
+
   it.each([0, 0.00846])('keeps the reserved cost primary when a live result reports preliminary USD %s', async reportedUsd => {
     routes.set('/api/research', async init => {
       const input = JSON.parse(String(init.body)) as ResearchInput;
@@ -412,7 +591,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     response.resolve(jsonResponse({ result: researchResult() })); await flush();
     expect(element('fact').textContent).not.toBe(FACT);
     expect(element('card-count').textContent).toBe('0 / 0');
-    expect(devices.g2!.render.mock.calls.some(([view]) => (view as GlassesView).content.includes(FACT))).toBe(false);
+    expect(devices.g2!.render.mock.calls.some(([view]) => (view as GlassesView).content.includes('架空の検証'))).toBe(false);
     expect(requests('/api/transcribe')).toHaveLength(0);
   });
 
@@ -452,7 +631,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     devices.g2!.options.onStatus?.({ state: 'connected', reason: 'resume_required' });
     await vi.advanceTimersByTimeAsync(15_000);
     expect(element('fact').textContent).not.toBe(FACT);
-    expect(devices.g2!.render.mock.calls.some(([view]) => (view as GlassesView).content.includes(FACT))).toBe(false);
+    expect(devices.g2!.render.mock.calls.some(([view]) => (view as GlassesView).content.includes('架空の検証'))).toBe(false);
     expect(devices.g2!.startAudio).not.toHaveBeenCalled();
   });
 });

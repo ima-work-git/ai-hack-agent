@@ -21,6 +21,7 @@ const START_TIMEOUT_MS = 10_000;
 interface Capture {
   closed: boolean;
   started: boolean;
+  continuous: boolean;
   deadline: number;
   samples: number;
   stream?: MediaStream;
@@ -53,12 +54,13 @@ export class PhoneAudio {
 
   get recording(): boolean { return Boolean(this.capture?.started && !this.capture.closed); }
 
-  async start(): Promise<boolean> {
+  /** Continuous capture is opt-in for the caller's explicit conversation start. */
+  async start(options: { continuous?: boolean } = {}): Promise<boolean> {
     if (this.capture || this.closing) return false;
     let cancelStart!: () => void;
     const cancelled = new Promise<never>((_, reject) => { cancelStart = () => reject(new Error('cancelled')); });
     const capture: Capture = {
-      closed: false, started: false, deadline: 0, samples: 0, cancelStart,
+      closed: false, started: false, continuous: options.continuous === true, deadline: 0, samples: 0, cancelStart,
       endedHandlers: [], partialWeight: 0, partialSum: 0,
     };
     this.capture = capture;
@@ -79,8 +81,10 @@ export class PhoneAudio {
           throw new Error('cancelled');
         }
         capture.stream = stream;
-        capture.deadline = this.deps.now() + MAX_DURATION_MS;
-        capture.timer = setTimeout(() => { void this.finish(capture, 'limit'); }, MAX_DURATION_MS);
+        capture.deadline = capture.continuous ? Infinity : this.deps.now() + MAX_DURATION_MS;
+        if (!capture.continuous) {
+          capture.timer = setTimeout(() => { void this.finish(capture, 'limit'); }, MAX_DURATION_MS);
+        }
         if (!stream.getAudioTracks().some(track => track.readyState === 'live')) throw new Error('no_audio');
         for (const track of stream.getTracks()) {
           const handler = () => { void this.finish(capture, 'error', 'マイクとの接続が切れました。もう一度開始してください。'); };
@@ -138,8 +142,11 @@ export class PhoneAudio {
 
   private emitPcm(capture: Capture, input: Float32Array, inputRate: number): void {
     const ratio = inputRate / RATE;
-    const remaining = MAX_SAMPLES - capture.samples;
-    const capacity = Math.min(remaining, Math.ceil((input.length + capture.partialWeight) / ratio));
+    // Allocate only this callback's output; continuous capture retains no previous
+    // PCM, just the fractional resampling phase. The caller bounds its rolling buffer.
+    const frameCapacity = Math.ceil((input.length + capture.partialWeight) / ratio);
+    const remaining = capture.continuous ? frameCapacity : MAX_SAMPLES - capture.samples;
+    const capacity = Math.min(remaining, frameCapacity);
     const pcm = new Uint8Array(capacity * 2);
     const view = new DataView(pcm.buffer);
     let written = 0;
@@ -163,9 +170,9 @@ export class PhoneAudio {
       }
       if (written >= remaining) break;
     }
-    capture.samples += written;
+    if (!capture.continuous) capture.samples += written;
     if (written) this.options.onAudio(pcm.subarray(0, written * 2));
-    if (capture.samples >= MAX_SAMPLES) void this.finish(capture, 'limit');
+    if (!capture.continuous && capture.samples >= MAX_SAMPLES) void this.finish(capture, 'limit');
   }
 
   private stopTracks(stream: MediaStream): void {

@@ -47,12 +47,16 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   const sttComplete = explicitStt ? Boolean(providers.sttApiKey && providers.sttBaseUrl && providers.sttModel) : Boolean(providers.orcaApiKey && providers.orcaSttModel);
   const sttMax = Number(env.MAX_STT_CALL_USD || NaN);
   const liveEnabled = env.AGENT_LIVE_ENABLED === 'true' && missing.length === 0;
+  const streamingApiKey = env.OPENAI_API_KEY || '';
+  const streamingModel = env.OPENAI_STREAMING_ASR_MODEL || 'gpt-live-transcribe';
+  const streamingAudioMaxPerMinute = Number(env.STREAMING_ASR_MAX_USD_PER_MINUTE || NaN);
   const status: RuntimeStatus = {
+    streamingEnabled: liveEnabled && !!streamingApiKey && streamingModel === 'gpt-live-transcribe' && Number.isFinite(streamingAudioMaxPerMinute) && streamingAudioMaxPerMinute > 0,
     liveEnabled, missing: env.AGENT_LIVE_ENABLED === 'true' ? missing : ['実APIモードの有効化', ...missing],
     sttEnabled: liveEnabled && sttComplete && Number.isFinite(sttMax) && sttMax > 0,
     xEnabled: liveEnabled && !!providers.xEnabled,
     accessCodeRequired: accessCode.length > 0, version: '0.1.0',
   };
-  return { host, port, origin, accessCode, providers, budget, maximumCosts, sttMax, status };
+  return { host, port, origin, accessCode, providers, budget, maximumCosts, sttMax, status, streamingApiKey, streamingModel, streamingAudioMaxPerMinute };
 }
 export type AppConfig = ReturnType<typeof readConfig>;

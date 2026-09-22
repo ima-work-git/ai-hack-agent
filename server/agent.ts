@@ -4,6 +4,7 @@ import {
 } from '../src/shared/contracts.ts';
 import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, Target, TraceEvent } from '../src/shared/contracts.ts';
 import { extractExplicitXHandles } from '../src/shared/x-account.ts';
+import { evidenceMatchesTarget, verifiedAliasForInputTarget } from '../src/shared/identity-aliases.ts';
 import type { ProviderResult, ResearchProvider } from './provider-contract.ts';
 import { ProviderError } from './provider-contract.ts';
 import { BudgetError, BudgetLedger } from './budget.ts';
@@ -24,7 +25,7 @@ class StopError extends Error {
 }
 const normalize = (s: string) => s.normalize('NFKC').replace(/\s+/g, '').toLocaleLowerCase('ja');
 const contains = (text: string, part: string) => !!normalize(part) && normalize(text).includes(normalize(part));
-const matches = (text: string, target: Target) => contains(text, target.personName) && contains(text, target.companyName);
+const matches = evidenceMatchesTarget;
 const sourceUrlIsPublicShape = (url: string) => {
   try { const u = new URL(url); return ['https:', 'http:'].includes(u.protocol) && !u.username && !u.password; } catch { return false; }
 };
@@ -187,7 +188,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       if (!source || !contains(source.text, proposal.excerpt) || !matches(proposal.excerpt, target) || !contains(proposal.excerpt, proposal.fact)) {
         emit('discard', '出典、対象名・所属、本文引用の検査に通らないカードを棄却しました。'); continue;
       }
-      if (cards.some(c => normalize(c.fact) === normalize(proposal.fact)) || cards.length >= 3) continue;
+      if (cards.some(c => normalize(c.fact) === normalize(proposal.fact)) || cards.length >= 4) continue;
       cards.push({ ...proposal, cardId: randomUUID(), expiresAt: new Date(now() + 300_000).toISOString(), requestId: input.requestId, subjectRevision: input.subjectRevision });
     }
     emit('verify', `${cards.length}件のカードが本文引用と対象照合の検査を通りました。`);
@@ -212,6 +213,11 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       return finish('awaiting_confirmation', 'SELECTED_TARGET_MISMATCH', '選択した対象と抽出結果が一致しませんでした。名前と会社を確認してください。');
     }
     if (plan.needsConfirmation || !target) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '対象を絞るため、氏名・会社名または候補を確認してください。');
+    const verifiedAlias = verifiedAliasForInputTarget(input.text, target);
+    if (verifiedAlias) {
+      if (handles.length && handles[0] !== verifiedAlias.xHandle) return finish('awaiting_confirmation', 'ACCOUNT_IDENTITY_CONFLICT', '入力されたアカウントと確認済みの人物情報が一致しません。対象を確認してください。');
+      if (!handles.length) handles.push(verifiedAlias.xHandle);
+    }
     if (input.selectedCandidateId) emit('human_confirmation', '利用者が選んだ候補で調査を再開します。');
     await gather(plan.query, true);
     if (!sources.length && counts.search < limits.search) {
@@ -227,7 +233,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     }
     let assessment = await assess();
     if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '所属や候補に曖昧さがあります。確認後に調査を再開してください。');
-    if (assessment.followUpQuery && counts.search < 2 && counts.llm < 3 && cards.length < 3) {
+    if (assessment.followUpQuery && counts.search < 2 && counts.llm < 3 && cards.length < 4) {
       emit('replan', '根拠を補うため、追加の公開活動を自律的に調べます。');
       await gather(assessment.followUpQuery, false);
       assessment = await assess();

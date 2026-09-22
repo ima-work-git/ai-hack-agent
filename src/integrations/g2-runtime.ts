@@ -41,7 +41,7 @@ export interface G2RuntimeOptions {
   onAudio?: (chunk: Uint8Array) => void
   onAction?: (action: G2Action) => void
   timeoutMs?: number
-  /** Can shorten the capture window, never extend it beyond 30 seconds. */
+  /** For ordinary capture: can shorten its window, never extend it beyond 30 seconds. */
   maxAudioMs?: number
 }
 
@@ -88,6 +88,7 @@ export class G2Runtime {
   private audioStarting = false
   private audioStopping = 0
   private acceptingAudio = false
+  private audioContinuous = false
   private audioBytes = 0
   private audioDeadline = 0
   private audioTimer: ReturnType<typeof setTimeout> | null = null
@@ -136,16 +137,20 @@ export class G2Runtime {
     return result
   }
 
-  async startAudio(): Promise<boolean> {
+  /** Continuous capture is opt-in for the caller's explicit conversation start. */
+  async startAudio(options: { continuous?: boolean } = {}): Promise<boolean> {
     if (!this.usable() || this.audioStarting || this.audioStopping > 0) return false
     if (this.acceptingAudio) return true
     const bridge = this.bridge!
     const version = ++this.audioVersion
     this.audioStarting = true
+    this.audioContinuous = options.continuous === true
     this.audioBytes = 0
-    this.audioDeadline = Date.now() + this.maxAudioMs
+    this.audioDeadline = this.audioContinuous ? Infinity : Date.now() + this.maxAudioMs
     // The deadline starts at the request, not a possibly delayed acknowledgement.
-    this.audioTimer = setTimeout(() => { void this.stopAudio('duration_limit') }, this.maxAudioMs)
+    if (!this.audioContinuous) {
+      this.audioTimer = setTimeout(() => { void this.stopAudio('duration_limit') }, this.maxAudioMs)
+    }
     const opening = invoke(() => bridge.audioControl(true, AudioInputSource.Glasses))
     // A timed-out or cancelled open can complete later: issue another close then.
     void opening.then(opened => {
@@ -188,6 +193,7 @@ export class G2Runtime {
     this.audioVersion += 1
     if (this.audioTimer !== null) clearTimeout(this.audioTimer)
     this.audioTimer = null
+    this.audioContinuous = false
     this.audioBytes = 0
     this.audioDeadline = 0
     const bridge = this.bridge
@@ -286,10 +292,12 @@ export class G2Runtime {
     }
     if (audio && this.acceptingAudio && audio.source === AudioInputSource.Glasses
       && audio.audioPcm instanceof Uint8Array && audio.audioPcm.length > 0 && audio.audioPcm.length % 2 === 0) {
-      this.audioBytes += audio.audioPcm.length
-      if (this.audioBytes > Math.floor(this.maxAudioMs * 32)) {
-        void this.stopAudio('audio_size_limit')
-        return
+      if (!this.audioContinuous) {
+        this.audioBytes += audio.audioPcm.length
+        if (this.audioBytes > Math.floor(this.maxAudioMs * 32)) {
+          void this.stopAudio('audio_size_limit')
+          return
+        }
       }
       try { this.options.onAudio?.(audio.audioPcm.slice()) } catch { void this.stopAudio('audio_handler_failed') }
     }
