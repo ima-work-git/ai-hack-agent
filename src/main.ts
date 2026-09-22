@@ -4,6 +4,13 @@ import { G2Runtime, type G2Status } from './integrations/g2-runtime.ts';
 import { PhoneAudio } from './phone-audio.ts';
 import { pcmToWav } from './audio.ts';
 
+// A short-lived QR grant is read once, then removed before any API request.
+let qrLoginTicket = new URLSearchParams(window.location.hash.slice(1)).get('login') || '';
+if (new URLSearchParams(window.location.hash.slice(1)).has('login')) {
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+}
+let pageLeaving = false;
+
 const DEMO_TEXT = '架空・みなもデザイン株式会社の星野あおいさんについて調べたい。';
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const app = document.getElementById('app')!;
@@ -162,6 +169,21 @@ async function restoreLogin(): Promise<boolean> {
     return false;
   } finally { clearTimeout(timeout); setAuthBusy(false); }
 }
+async function redeemQrLogin(): Promise<boolean> {
+  if (authBusy || pageLeaving || document.hidden || !qrLoginTicket) return false;
+  const ticket = qrLoginTicket; qrLoginTicket = '';
+  if (!/^[a-f0-9]{64}$/.test(ticket)) { $('login-status').textContent = 'ログイン用QRを読み取れませんでした。新しいQRを読み込んでください。'; return false; }
+  setAuthBusy(true); const generation = ++authGeneration;
+  const abort = new AbortController(); const timeout = setTimeout(() => abort.abort(), 8_000);
+  try {
+    const response = await api('/api/session/qr/redeem', { ...json({ ticket }), signal: abort.signal });
+    const data = await response.json(); if (generation !== authGeneration) return false;
+    acceptSession(data); status('QRでログインしました。G2を接続して開始できます。'); return true;
+  } catch {
+    if (generation === authGeneration) $('login-status').textContent = 'このQRは使用済みか期限切れです。接続を確認し、新しいログイン用QRを読み込んでください。';
+    return false;
+  } finally { clearTimeout(timeout); setAuthBusy(false); }
+}
 function clearConversation() {
   clearResult(); lastInput = null; $<HTMLTextAreaElement>('text').value = '';
   $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
@@ -288,11 +310,11 @@ $('resume').onclick = async () => {
 };
 $('end').onclick = async () => { if (authBusy) return; setAuthBusy(true); authGeneration++; await cancel(); try { await api('/api/session/forget', json({})); token = ''; expiresAt = 0; clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = '会話データと、この端末のログインの記憶を削除しました。'; } catch (e) { status(e instanceof Error ? e.message : '削除を確認できませんでした。'); } finally { setAuthBusy(false); } };
 document.addEventListener('visibilitychange', () => { if (document.hidden) { void cancel(); } });
-window.addEventListener('pagehide', () => { authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
+window.addEventListener('pagehide', () => { pageLeaving = true; qrLoginTicket = ''; authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
 setInterval(() => { if (result?.cards.some(card => Date.parse(card.expiresAt) <= Date.now())) renderCard(); if (token && expiresAt > 0 && expiresAt <= Date.now()) void expireSession(); }, 15_000);
 try {
   runtimeStatus = await (await fetch('/api/status', { cache: 'no-store' })).json();
   $('live-option').toggleAttribute('disabled', !runtimeStatus.liveEnabled); $('configuration').textContent = runtimeStatus.liveEnabled ? '実APIでの調査を利用できます。課金額は設定した上限内で予約します。' : `未設定：${runtimeStatus.missing.join('、')}`;
   if (runtimeStatus.sttEnabled) $('audio-hint').textContent = 'G2接続時はグラス、未接続時はスマートフォンのマイクを使用';
-  $('login').classList.remove('hidden'); if (!runtimeStatus.accessCodeRequired) { $('access-code').classList.add('hidden'); document.querySelector('label[for="access-code"]')?.classList.add('hidden'); await login(); } else await restoreLogin();
+  $('login').classList.remove('hidden'); if (!runtimeStatus.accessCodeRequired) { $('access-code').classList.add('hidden'); document.querySelector('label[for="access-code"]')?.classList.add('hidden'); await login(); } else if (await restoreLogin()) { qrLoginTicket = ''; } else await redeemQrLogin();
 } catch { $('login').classList.remove('hidden'); $('login-status').textContent = 'サーバーに接続できません。再読み込みしてください。'; }

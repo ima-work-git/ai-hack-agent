@@ -102,6 +102,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
   beforeEach(() => {
     vi.resetModules(); vi.useFakeTimers(); vi.setSystemTime(new Date('2026-09-22T02:00:00Z'));
     routes.clear(); devices.g2 = null; devices.phone = null;
+    window.history.replaceState(null, '', '/');
     document.body.innerHTML = '<div id="app"></div>';
     vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
     documentEvents = vi.spyOn(document, 'addEventListener');
@@ -220,6 +221,46 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(requests('/api/session')).toHaveLength(1);
     loggingIn.resolve(jsonResponse({ token: 'new', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false })); await flush();
     expect(element('workspace').classList.contains('hidden')).toBe(false);
+  });
+
+  it('redeems a QR once after erasing its fragment, remembers login and starts no work', async () => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, accessCodeRequired: true }));
+    const ticket = 'a'.repeat(64);
+    window.history.replaceState(null, '', '/#login=' + ticket);
+    routes.set('/api/session/qr/redeem', async init => {
+      expect(window.location.hash).toBe('');
+      expect(JSON.parse(String(init.body))).toEqual({ ticket });
+      return jsonResponse({ token: 'qr-session', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false });
+    });
+    await boot();
+    expect(requests('/api/session/qr/redeem')).toHaveLength(1);
+    expect(element('workspace').classList.contains('hidden')).toBe(false);
+    expect(element<HTMLInputElement>('access-code').value).toBe('');
+    expect(requests('/api/research')).toHaveLength(0);
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled();
+    expect(devices.phone!.start).not.toHaveBeenCalled();
+  });
+
+  it('uses an existing remembered login without spending another QR grant', async () => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, accessCodeRequired: true }));
+    window.history.replaceState(null, '', '/#login=' + 'b'.repeat(64));
+    routes.set('/api/session/restore', async () => jsonResponse({ token: 'restored', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false }));
+    await boot();
+    expect(window.location.hash).toBe('');
+    expect(requests('/api/session/qr/redeem')).toHaveLength(0);
+    expect(element('workspace').classList.contains('hidden')).toBe(false);
+  });
+
+  it('shows QR failure without retrying, leaking the grant, or starting paid work', async () => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, accessCodeRequired: true }));
+    const ticket = 'c'.repeat(64); window.history.replaceState(null, '', '/#login=' + ticket);
+    routes.set('/api/session/qr/redeem', async () => new Response('{}', { status: 401 }));
+    await boot();
+    expect(requests('/api/session/qr/redeem')).toHaveLength(1);
+    expect(element('login-status').textContent).toContain('使用済みか期限切れ');
+    expect(document.body.textContent).not.toContain(ticket);
+    expect(window.location.hash).toBe('');
+    expect(requests('/api/research')).toHaveLength(0);
   });
 
   it('normal explicit phone stop sends one WAV and displays the researched card without touching G2 audio', async () => {
