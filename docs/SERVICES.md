@@ -1,6 +1,6 @@
 # OrcaRouter・実行環境の準備
 
-更新日：2026-09-22。ユーザーからXアカウントとX Developerの準備完了を受領。こちらでのアカウント操作、キー発行、バウチャー適用、API疎通、クラウド作成は未実施。
+更新日：2026-09-22。ユーザーからXアカウント・X Developerの準備とAPI料金チャージの完了を受領。こちらでのアカウント操作、キー発行、バウチャー適用、API疎通、クラウド作成は未実施。
 
 ## OrcaRouter
 
@@ -55,7 +55,7 @@ AWSを使う場合は以下を準備する。
 - Even G2：[既存方式と実機確認](EVEN_G2_INTEGRATION.md)。
 - STT：PCM 16kHz mono入力、日本語の人名/会社名、遅延、課金、保持条件を短い許可済み音声で検証する。OrcaRouterのSTT対応は未確認なので前提にしない。
 - Web検索：利用可能なAPIを選び、検索と本文取得の権限・費用・サイズ/時間制限を決める。検索抜粋だけを裏取り済みとしない。
-- X：開発用アカウント @aihack2026sep と同じアカウントのX Developerを準備済み（ユーザー申告）。人物検索・公開投稿の読取に利用する予定。App・トークン・利用権限・残高・API疎通は未確認。下記手順で確認する。[人物検索](https://docs.x.com/x-api/users/search/introduction)、[料金](https://docs.x.com/x-api/getting-started/pricing)
+- X：開発用アカウント @aihack2026sep と同じアカウントのX Developerを準備済み（ユーザー申告）。人物検索・公開投稿の読取に利用する予定。API料金はチャージ済み（ユーザー申告）。App・トークン・利用権限・現在残高・支出上限・API疎通は未確認。下記手順で確認する。[人物検索](https://docs.x.com/x-api/users/search/introduction)、[料金](https://docs.x.com/x-api/getting-started/pricing)
 - Facebook：Pages向けAPIと個人プロフィールを区別する。任意人物のプロフィールを取得できるとは未確認。必要な許可と読取可能性が確認できるまで公式サイト中心で進める。[Meta公式サンプルのアクセス前提](https://github.com/fbsamples/reels_publishing_apis/blob/main/insta_reels_publishing_api_sample/README.md#before-you-start)
 - 削除/非公開後も検索結果に古い内容が残り得るため、取得本文を確認できない主張をカードに載せない。[X公式説明](https://help.x.com/en/safety-and-security/remove-x-profile-from-google-search)
 
@@ -69,7 +69,8 @@ AWSを使う場合は以下を準備する。
 - [x] 同じアカウントでX Developerを準備（ユーザー申告）
 - [ ] Developer ConsoleのApp作成・利用可能なエンドポイントを確認
 - [ ] AppのBearer Tokenをサーバー側の秘密管理へ設定
-- [ ] 利用クレジット残高・課金単位・支出上限を確認
+- [x] X API料金をチャージ（2026-09-22、ユーザー申告。金額は未共有）
+- [ ] 現在残高・課金単位・支出上限を確認
 - [ ] アプリ側の取得件数・呼出回数・時間・金額上限を実装
 - [ ] 最小読取で401/403/429等の扱いと利用額を確認
 
@@ -83,6 +84,6 @@ AWSを使う場合は以下を準備する。
 
 環境変数の案は `.env.example` の `X_API_BEARER_TOKEN`。実値はサーバー側だけに保存し、`VITE_*`・グラス用パッケージ・公開コードへ入れない。`X_API_ENABLED=false`も現時点では提案値で、読込と停止制御の実装はこれから。
 
-X APIは従量課金で、読取は返却リソース数に応じて課金される。呼出回数だけでなく、ユーザー候補数・投稿数・展開データ数にも上限を設ける。現在価格は実行前にDeveloper Consoleで確認し、STT・OrcaRouterとは別の費用として合算する。クレジット購入や支出設定はまだ行っていない。[公式料金・支出上限](https://docs.x.com/x-api/getting-started/pricing)
+X APIは従量課金で、読取は返却リソース数に応じて課金される。呼出回数だけでなく、ユーザー候補数・投稿数・展開データ数にも上限を設ける。現在価格は実行前にDeveloper Consoleで確認し、STT・OrcaRouterとは別の費用として合算する。ユーザーがクレジットをチャージ済み。こちらでの購入操作は行っておらず、現在残高と支出上限の設定は未確認。[公式料金・支出上限](https://docs.x.com/x-api/getting-started/pricing)
 
 Xへの追加呼出も[設計の調査全体の時間・回数・費用上限](specs/02_AGENT_DESIGN.md)に含める。APIの最小取得件数・ページ数と価格を確認してから件数上限を決め、結果の自動全件取得はしない。
