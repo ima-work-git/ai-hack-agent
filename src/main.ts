@@ -236,8 +236,9 @@ function addTrace(event: TraceEvent) {
   li.append(time, document.createTextNode(event.message)); $('trace').append(li); $('trace').scrollTop = $('trace').scrollHeight;
 }
 function showResult(value: ResearchResult) {
-  result = value; cardIndex = 0; status(value.message);
-  $('result-note').textContent = value.mode === 'demo' ? '架空の人物・固定資料によるデモです。表示の動作確認であり、実APIやG2実機の動作証明ではありません。' : value.message;
+  const failure = value.status === 'failed' ? researchFailure({ code: value.reasonCode, message: value.message }) : undefined;
+  result = value; cardIndex = 0; status(failure ? `${failure.message} ${failure.action}` : value.message);
+  $('result-note').textContent = value.mode === 'demo' ? '架空の人物・固定資料によるデモです。表示の動作確認であり、実APIやG2実機の動作証明ではありません。' : failure ? `${failure.message} ${failure.action}` : value.message;
   $('metric-time').textContent = `${(value.usage.elapsedMs / 1000).toFixed(1)}秒`;
   $('metric-calls').textContent = `${value.usage.llm} / ${value.usage.searches} / ${value.usage.pages}`;
   $('metric-cost').textContent = value.mode === 'demo' ? '模擬' : value.usage.costKnown ? `$${value.usage.actualUsd?.toFixed(4)}` : `$${value.usage.reservedUsd.toFixed(3)}`;
@@ -251,8 +252,8 @@ function showResult(value: ResearchResult) {
   }
   if (!value.cards.length) {
     renderBoard([]); $('hud-target').textContent = value.target?.personName || '対象未確認'; $('hud-expiry').textContent = '0 / 4件確認';
-    void sendView(value.status === 'awaiting_confirmation' ? '相手の確認が必要です' : '確認できた情報はありません',
-      Array.from({ length: 4 }, (_, index) => `${index + 1} 事:未確認 問:—`).join('\n'), 'スマートフォンで確認');
+    void sendView(failure ? '調査を一時停止' : value.status === 'awaiting_confirmation' ? '相手の確認が必要です' : '確認できた情報はありません',
+      failure ? failure.message : Array.from({ length: 4 }, (_, index) => `${index + 1} 事:未確認 問:—`).join('\n'), failure?.action ?? 'スマートフォンで確認');
   }
   renderCard();
 }
@@ -358,12 +359,12 @@ async function research(selectedCandidateId?: string, preparedId?: string, activ
       for (const line of lines) {
         if (!line.trim()) continue; const message = JSON.parse(line);
         if (message.type === 'trace') addTrace(message.event);
-        else if (message.type === 'result') { const parsed = ResearchResultSchema.parse(message.result); if (parsed.requestId === ownId && parsed.subjectRevision === revision) { gotResult = true; showResult(parsed); } }
+        else if (message.type === 'result') { const parsed = parseResearchResult(message.result); if (parsed.requestId === ownId && parsed.subjectRevision === revision) { gotResult = true; showResult(parsed); } }
         else if (message.type === 'error') throw Object.assign(new Error(message.message), { code: typeof message.code === 'string' ? message.code : undefined });
       }
     }
     if (!gotResult && !ownController.signal.aborted) throw new Error('接続が中断されました。再調査してください。');
-  } catch (error) { if (currentId === ownId && !ownController.signal.aborted) { if (activeConversationId) { if (preparedId) throw error; if (mustStopConversation(error)) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話の調査を続けられませんでした。'); } else await waitForNextUtterance(error instanceof Error ? error.message : '調査を完了できませんでした。'); return; } status(error instanceof Error ? error.message : '調査を完了できませんでした。', true); await sendView('これで誰でも雑談マスター', '調査を完了できませんでした。', '入力・設定・接続を確認'); } }
+  } catch (error) { if (currentId === ownId && !ownController.signal.aborted) { if (activeConversationId) { if (preparedId) throw error; if (mustStopConversation(error)) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話の調査を続けられませんでした。'); } else await waitForNextUtterance(error); return; } const failure = researchFailure(error); status(`${failure.message} ${failure.action}`, true); await sendView('これで誰でも雑談マスター', failure.message, failure.action); } }
   finally { if (controller === ownController) { running = false; controller = null; refreshControls(); } }
 }
 async function cancel() {
@@ -406,11 +407,47 @@ function mustStopConversation(error: unknown): boolean {
     /^(?:BUDGET_|AUTH_|SESSION_|CONVERSATION_EXPIRED|CONVERSATION_NOT_FOUND)/u.test(details.code ?? '') ||
     /費用|予算|認証|ログイン|利用期限|(?:セッション|会話モード).*(?:終了|失効|期限)/u.test(details.message ?? '');
 }
-async function waitForNextUtterance(message: string) {
+function parseResearchResult(value: unknown): ResearchResult {
+  const parsed = ResearchResultSchema.safeParse(value);
+  if (!parsed.success) throw Object.assign(new Error('画面で調査結果を読み込めませんでした。'), { code: 'RESPONSE_FORMAT_MISMATCH' });
+  return parsed.data;
+}
+function researchFailure(error: unknown): { message: string; action: string } {
+  const details = error && typeof error === 'object' ? error as { code?: string; status?: number; name?: string } : {};
+  const code = details.code ?? '';
+  const retry = '少し待って、同じ名前でもう一度話してください。';
+  if (code.startsWith('BUDGET_')) {
+    return {
+      message: code === 'BUDGET_EXHAUSTED' ? '設定した費用上限に達しました。' : '費用管理の状態を確認する必要があります。',
+      action: '費用の設定・利用状況を確認してから調査を再開してください。',
+    };
+  }
+  if (code === 'RESPONSE_FORMAT_MISMATCH' || details.name === 'ZodError' || details.name === 'SyntaxError') {
+    return { message: '画面で調査結果を読み込めませんでした。', action: '同じQRを読み直して画面を開き直してください。' };
+  }
+  if (/TIMEOUT|DEADLINE_EXCEEDED/u.test(code) || details.status === 408 || details.status === 504) {
+    return { message: '調査サービスの応答が時間切れになりました。', action: retry };
+  }
+  if (code === 'RATE_LIMITED' || details.status === 429) return { message: '調査サービスが混雑しています。', action: retry };
+  if (code === 'INVALID_PROVIDER_RESPONSE' || code === 'INVALID_OR_UNAVAILABLE_RESPONSE') {
+    return { message: '調査サービスの回答を読み取れませんでした。', action: retry };
+  }
+  if (code === 'PROVIDER_UNAUTHORIZED' || code === 'PROVIDER_CREDITS' || code === 'LIVE_DISABLED') {
+    return { message: '調査サービスの設定・利用状況を確認する必要があります。', action: 'スマートフォンで利用状況を確認してください。' };
+  }
+  if (/PROVIDER_|SOURCES_UNAVAILABLE/u.test(code) || details.status && details.status >= 500 || details.name === 'TypeError') {
+    return { message: '調査サービスに接続できませんでした。', action: retry };
+  }
+  return { message: '調査を完了できませんでした。', action: '接続を確認し、同じ名前でもう一度話してください。' };
+}
+async function waitForNextUtterance(error: unknown) {
+  const failure = researchFailure(error);
   conversationLastKey = ''; conversationLastAt = 0;
   newViewToken(); clearResult();
-  status(`${message} 聞き取りは続いています。名前や所属を言い直してください。`);
-  await sendView('聞き取りを続けています', '調査を完了できませんでした。名前や所属を言い直してください。', '次の発話を待っています');
+  status(`${failure.message} 聞き取りは続いています。${failure.action}`);
+  // The footer shows live microphone status during a conversation; keep the
+  // recovery action in the main content so it remains visible on the glasses.
+  await sendView('聞き取りを続けています', `${failure.message}\n${failure.action}`, '次の発話を待っています');
 }
 async function processConversationTranscript(text: string, generation: number) {
   const subjectGeneration = conversationSubjectGeneration;
@@ -455,7 +492,7 @@ async function processConversationTranscript(text: string, generation: number) {
       status('聞き取りを続けています。名前や所属を言い直すか、候補を選んでください。「聞き直す」で対象をリセットできます。');
     }
     if (result && mustStopConversation({ code: result.reasonCode, message: result.message })) throw Object.assign(new Error(result.message), { code: result.reasonCode });
-    if (result?.status === 'failed') await waitForNextUtterance(result.message);
+    if (result?.status === 'failed') await waitForNextUtterance({ code: result.reasonCode, message: result.message });
   } finally { if (controller === own) controller = null; if (subjectGeneration === conversationSubjectGeneration && generation === audioGeneration) audioBusy = false; refreshControls(); }
 }
 async function drainTranscripts(generation: number) {
@@ -471,7 +508,7 @@ async function drainTranscripts(generation: number) {
     if (drainId === transcriptDrainId && generation === audioGeneration && conversationRunning) {
       const message = error instanceof Error ? error.message : '人物の調査を完了できませんでした。';
       if (mustStopConversation(error)) { await stopRecording(false); reportVoiceError(message); }
-      else await waitForNextUtterance(message);
+      else await waitForNextUtterance(error);
     }
   } finally { if (drainId === transcriptDrainId) { identifyingTranscript = false; if (pendingTranscript && conversationRunning && !resettingConversation) void drainTranscripts(audioGeneration); } }
 }
@@ -643,12 +680,12 @@ $('resume').onclick = async () => {
     if (!token || token !== expectedToken || viewToken !== expectedView || running || recording || audioBusy || document.hidden) return;
     $('resume-notice').classList.add('hidden');
     if (data.result) {
-      const resumed = ResearchResultSchema.parse(data.result);
+      const resumed = parseResearchResult(data.result);
       if (data.input) { lastInput = ResearchInputSchema.parse(data.input); $<HTMLTextAreaElement>('text').value = lastInput.text; $<HTMLSelectElement>('scenario').value = lastInput.scenario; }
       $<HTMLSelectElement>('mode').value = resumed.mode; $('mode').dispatchEvent(new Event('change'));
       currentId = resumed.requestId; newViewToken(); showResult(resumed); $('trace').replaceChildren(); for (const event of resumed.trace) addTrace(event);
     } else status('再表示できる有効なカードはありません。必要なら再調査してください。');
-  } catch (e) { if (token === expectedToken && viewToken === expectedView) status(e instanceof Error ? e.message : '再開できませんでした。'); }
+  } catch (e) { if (token === expectedToken && viewToken === expectedView) { const failure = researchFailure(e); status(`${failure.message} ${failure.action}`); } }
 };
 $('end').onclick = async () => { if (authBusy) return; setAuthBusy(true); authGeneration++; await cancel(); try { await api('/api/session/forget', json({})); token = ''; expiresAt = 0; clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = '会話データと、この端末のログインの記憶を削除しました。'; } catch (e) { status(e instanceof Error ? e.message : '削除を確認できませんでした。'); } finally { setAuthBusy(false); } };
 document.addEventListener('visibilitychange', () => {

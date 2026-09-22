@@ -31,12 +31,17 @@ function sources(relation = true): EvidenceSource[] {
 function proposed(source: EvidenceSource, fact: string) {
   return { fact, sourceId: source.sourceId, excerpt: source.text, suggestedQuestion: 'その活動で印象に残ったことは？' };
 }
-function fixture(options: { relation?: boolean; identityVerified?: boolean; copiedHeaderFact?: boolean } = {}) {
+function fixture(options: { relation?: boolean; identityVerified?: boolean; copiedHeaderFact?: boolean; nameOnly?: boolean; publicIdentitySourceIds?: string[] } = {}) {
   const all = sources(options.relation ?? true); const order: string[] = []; let searches = 0;
+  const plannedTarget = options.nameOnly ? { ...target, companyName: '' } : target;
+  if (options.nameOnly) {
+    all[4]!.url = 'https://chomado.com/chomado/';
+    all[5]!.url = 'https://developer.microsoft.com/ja-jp/advocates/madoka-chiyoda';
+  }
   const cards = [proposed(all[4]!, options.relation === false ? all[4]!.text : officialFact), proposed(all[3]!, facts[2]!), proposed(all[2]!, options.copiedHeaderFact ? copiedBio : facts[1]!), proposed(all[1]!, facts[0]!)];
   const provider: ResearchProvider = {
     mode: 'demo',
-    plan: vi.fn(async () => ({ value: { target, needsConfirmation: false, candidates: [], query: '公式 プロフィール', reason: '模擬入力から抽出' }, actualUsd: 0 })),
+    plan: vi.fn(async () => ({ value: { target: plannedTarget, needsConfirmation: false, candidates: [], query: '公式 プロフィール', reason: '模擬入力から抽出' }, actualUsd: 0 })),
     search: vi.fn(async () => {
       order.push(`search-${++searches}`);
       const hits: SearchHit[] = searches === 1 ? all.slice(0, 4).map(({ url, title, topic }) => ({ url, title, topic })) : [{ url: 'https://secondary.example.org/profile', title: '追加Web候補' }];
@@ -49,7 +54,9 @@ function fixture(options: { relation?: boolean; identityVerified?: boolean; copi
     }),
     assess: vi.fn<ResearchProvider['assess']>(async (_target, evidence) => {
       order.push('assess'); expect(evidence.map(source => source.sourceId)).toEqual(all.map(source => source.sourceId));
-      return { value: { identityVerified: options.identityVerified ?? true, needsConfirmation: false, candidates: [], cards, followUpQuery: null, reason: '模擬の検証結果' }, actualUsd: 0 };
+      return { value: { identityVerified: options.identityVerified ?? true, needsConfirmation: false, candidates: [], cards, followUpQuery: null, reason: '模擬の検証結果',
+        ...(options.nameOnly ? { publicPersonVerified: true, publicIdentitySourceIds: options.publicIdentitySourceIds ?? all.map(source => source.sourceId) } : {}),
+      }, actualUsd: 0 };
     }),
   };
   return { provider, all, order };
@@ -92,6 +99,67 @@ describe('balanced topics through the complete agent', () => {
     expect(result.sources).toHaveLength(6); expect(result.cards).toEqual([]); expect(result.status).not.toBe('ready');
     expect(result.trace.some(event => event.message.includes('本人性'))).toBe(true);
   });
+
+  it('accepts all six retrieved identity sources for a name-only public person', async () => {
+    const f = fixture({ nameOnly: true });
+    const result = await runAgent({ ...input, text: 'ちょまどさんについて' }, f.provider);
+    expect(result.status).toBe('ready'); expect(result.reasonCode).toBe('EVIDENCE_VERIFIED');
+    expect(result.target).toEqual({ personName: target.personName, companyName: '' });
+    expect(result.sources).toHaveLength(6); expect(result.cards).toHaveLength(4);
+    expect(result.cards.map(card => card.topic)).toEqual(['recent_x', 'recent_x', 'popular_x', 'profile']);
+    expect(f.provider.assess).toHaveBeenCalledOnce();
+  });
+
+  it('still rejects a fabricated sixth identity source even with five real source IDs', async () => {
+    const ids = sources().map(source => source.sourceId); ids[5] = 'fabricated-sixth-source';
+    const f = fixture({ nameOnly: true, publicIdentitySourceIds: ids });
+    const result = await runAgent({ ...input, text: 'ちょまどさんについて' }, f.provider);
+    expect(result.sources).toHaveLength(6); expect(result.cards).toEqual([]);
+    expect(result.status).toBe('awaiting_confirmation'); expect(result.reasonCode).toBe('PUBLIC_IDENTITY_CONFIRMATION_REQUIRED');
+    expect(result.trace.some(event => event.message.includes('本人性'))).toBe(true);
+  });
+
+  it('allows a nine-second balanced assessment to finish within the total deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture(); const original = f.provider.assess;
+      f.provider.assess = vi.fn<ResearchProvider['assess']>(async (...args) => { await new Promise(resolve => setTimeout(resolve, 9000)); return original(...args); });
+      let settled = false; const pending = runAgent(input, f.provider).then(result => { settled = true; return result; });
+      await vi.advanceTimersByTimeAsync(8001); expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(999); const result = await pending;
+      expect(result.status).toBe('ready'); expect(result.usage.elapsedMs).toBe(9000); expect(result.cards).toHaveLength(4);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('aborts a balanced assessment at twelve seconds even when the provider ignores cancellation', async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture(); let assessmentSignal: AbortSignal | undefined;
+      f.provider.assess = vi.fn<ResearchProvider['assess']>((_target, _sources, signal) => { assessmentSignal = signal; return new Promise(() => {}); });
+      let settled = false; const pending = runAgent(input, f.provider).then(result => { settled = true; return result; });
+      await vi.advanceTimersByTimeAsync(11999); expect(settled).toBe(false); expect(assessmentSignal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); const result = await pending;
+      expect(result.reasonCode).toBe('OPERATION_TIMEOUT'); expect(result.status).toBe('failed'); expect(result.cards).toEqual([]);
+      expect(assessmentSignal?.aborted).toBe(true); expect(result.usage.elapsedMs).toBe(12000);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('clips the longer balanced assessment to the unchanged twenty-second total deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture(); const plan = f.provider.plan; const search = f.provider.search;
+      f.provider.plan = vi.fn<ResearchProvider['plan']>(async (...args) => { await new Promise(resolve => setTimeout(resolve, 5000)); return plan(...args); });
+      f.provider.search = vi.fn<ResearchProvider['search']>(async (...args) => { await new Promise(resolve => setTimeout(resolve, 2000)); return search(...args); });
+      let assessmentSignal: AbortSignal | undefined;
+      f.provider.assess = vi.fn<ResearchProvider['assess']>((_target, _sources, signal) => { assessmentSignal = signal; return new Promise(() => {}); });
+      let settled = false; const pending = runAgent(input, f.provider).then(result => { settled = true; return result; });
+      await vi.advanceTimersByTimeAsync(19999); expect(settled).toBe(false); expect(f.provider.assess).toHaveBeenCalledOnce();
+      expect(assessmentSignal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); const result = await pending;
+      expect(result.reasonCode).toBe('DEADLINE_EXCEEDED'); expect(result.status).toBe('failed'); expect(result.cards).toEqual([]);
+      expect(assessmentSignal?.aborted).toBe(true); expect(result.usage.elapsedMs).toBe(20000);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
 });
 
 interface SentSource {
@@ -103,6 +171,46 @@ const assessment = (cards: unknown[]): Omit<Assessment, 'cards'> & { cards: unkn
 const completion = (value: unknown) => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(value) } }] }), { headers: { 'Content-Type': 'application/json' } });
 
 describe('OrcaRouter balanced assessment candidate boundaries', () => {
+  it('decodes a name-only assessment with all six identity source IDs and preserves raw fact selection', async () => {
+    const all = sources(); const nameOnly = { ...target, companyName: '' };
+    const api = vi.fn<typeof fetch>(async (_url, init) => {
+      const payload = JSON.parse(JSON.parse(String(init?.body)).messages[1].content) as { sources: SentSource[] };
+      const source = payload.sources.find(source => source.sourceId === 'web-1')!;
+      const fact = source.excerpts.flatMap(excerpt => excerpt.facts).find(fact => fact.text === officialFact)!;
+      expect(fact).toBeDefined(); expect(payload.sources).toHaveLength(6);
+      return completion({ ...assessment([{ factId: fact.factId, suggestedQuestion: '技術紹介で大切にしていることは？' }]),
+        publicPersonVerified: true, publicIdentitySourceIds: payload.sources.map(source => source.sourceId),
+      });
+    });
+    const provider = createLiveProvider({ orcaApiKey: 'fixture', orcaModel: 'fixture', tavilyApiKey: 'fixture' }, { fetch: api });
+    const result = await provider.assess(nameOnly, all, new AbortController().signal);
+    expect(result.value.publicPersonVerified).toBe(true); expect(result.value.publicIdentitySourceIds).toHaveLength(6);
+    expect(new Set(result.value.publicIdentitySourceIds)).toEqual(new Set(all.map(source => source.sourceId)));
+    expect(result.value.cards).toHaveLength(1); expect(result.value.cards[0]).toMatchObject({ sourceId: 'web-1', fact: officialFact, excerpt: all[4]!.text });
+    expect(api).toHaveBeenCalledOnce();
+  });
+
+  it.each([9000, 13000])('bounds the balanced provider response at twelve seconds for a %ims response', async delayMs => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation(milliseconds => {
+      const controller = new AbortController(); setTimeout(() => controller.abort(new DOMException('Timed out', 'TimeoutError')), milliseconds); return controller.signal;
+    });
+    try {
+      const api = vi.fn<typeof fetch>(async (_url, init) => new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => resolve(completion(assessment([]))), delayMs);
+        init?.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(init.signal!.reason); }, { once: true });
+      }));
+      const provider = createLiveProvider({ orcaApiKey: 'fixture', orcaModel: 'fixture', tavilyApiKey: 'fixture' }, { fetch: api });
+      const pending = provider.assess(target, sources(), new AbortController().signal);
+      const outcome = pending.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+      await vi.advanceTimersByTimeAsync(Math.min(delayMs, 12000));
+      const result = await outcome;
+      expect(timeout).toHaveBeenCalledWith(12000); expect(api).toHaveBeenCalledOnce();
+      if (delayMs < 12000) { expect(result.error).toBeUndefined(); expect(result.value?.value.cards).toEqual([]); }
+      else { expect(result.value).toBeUndefined(); expect(result.error).toMatchObject({ code: 'PROVIDER_TIMEOUT' }); }
+    } finally { timeout.mockRestore(); vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
   it('offers only actual post sentences, includes all six sources and maps selected IDs to exact unedited excerpts', async () => {
     const all = sources(); let sent: SentSource[] = [];
     const api = vi.fn<typeof fetch>(async (url, init) => {

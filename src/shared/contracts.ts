@@ -59,7 +59,7 @@ export function validatedCardDisplay(fact: string, excerpt: string, displayFact:
 }
 export const AssessmentSchema = z.object({
   identityVerified: z.boolean(), needsConfirmation: z.boolean(), candidates: z.array(CandidateSchema).max(5),
-  publicPersonVerified: z.boolean().optional(), publicIdentitySourceIds: z.array(z.string().min(1).max(100)).max(4).optional(),
+  publicPersonVerified: z.boolean().optional(), publicIdentitySourceIds: z.array(z.string().min(1).max(100)).max(6).optional(),
   cards: z.array(ProposedCardSchema).max(4), followUpQuery: z.string().max(300).nullable(), reason: z.string().max(600),
 }).strict();
 export type Assessment = z.infer<typeof AssessmentSchema>;
