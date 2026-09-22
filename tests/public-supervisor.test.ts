@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import type { RequestOptions } from 'node:https';
+import type { IncomingHttpHeaders } from 'node:http';
 // @ts-expect-error Standalone Node supervisor intentionally has no build step.
 import { acquireLock, atomicPrivateWrite, bindLoopback, endpointRecord, extractTunnelOrigin, healthProbe, networkAvailable, PORTS, publishEndpoint, recoveryAction, replaceEnvOrigin, restartDelay, runGh, spawnOwned, stopOwnedChild, supervise, SupervisorError, updateEnvOrigin, validOrigin } from '../scripts/serve-public.mjs';
 
@@ -14,6 +16,20 @@ const temporary: string[] = [];
 afterEach(async () => { vi.useRealTimers(); for (const path of temporary.splice(0)) await rm(path, { recursive: true, force: true }); });
 async function directory() { const path = await mkdtemp(join(tmpdir(), 'public-supervisor-')); temporary.push(path); return path; }
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
+const dnsFailure = (code = 'ENOTFOUND') => new TypeError('fetch failed', { cause: Object.assign(new Error('DNS failed'), { code }) });
+function probeTransport(reply: { status?: number; headers?: IncomingHttpHeaders; body?: string; stall?: boolean; error?: string } = {}) {
+  const destroy = vi.fn();
+  const request = vi.fn((url: URL, options: RequestOptions, callback: (response: unknown) => void) => {
+    const req = Object.assign(new EventEmitter(), { destroy, end: () => queueMicrotask(() => {
+      if (reply.error) { req.emit('error', Object.assign(new Error('TLS failed'), { code: reply.error })); return; }
+      const response = Object.assign(new PassThrough(), { statusCode: reply.status ?? 200, headers: reply.headers ?? {} });
+      callback(response);
+      if (!reply.stall) response.end(reply.body ?? JSON.stringify({ liveEnabled: true, version: 'fixture' }));
+    }) });
+    return req;
+  });
+  return { request, destroy };
+}
 
 describe('public endpoint and local secret configuration', () => {
   it('accepts only an exact HTTPS Quick Tunnel origin and discards arbitrary log content', () => {
@@ -102,6 +118,107 @@ describe('health and recovery gates', () => {
   });
 });
 
+describe('DNS-only public status fallback without network calls', () => {
+  it.each(['ENOTFOUND', 'EAI_AGAIN'])('pins a public IPv4 while retaining the original HTTPS hostname for %s', async code => {
+    const fetchRequest = vi.fn().mockRejectedValue(dnsFailure(code));
+    const resolve4 = vi.fn().mockResolvedValue(['104.16.230.132', '104.16.231.132']);
+    const transport = probeTransport();
+    expect(await healthProbe(`${ORIGIN}/api/status`, { statusJson: true, fetchRequest, resolve4, request: transport.request })).toBe(true);
+    expect(resolve4).toHaveBeenCalledExactlyOnceWith(new URL(ORIGIN).hostname, expect.any(AbortSignal));
+    const [url, options] = transport.request.mock.calls[0]!;
+    expect(url.href).toBe(`${ORIGIN}/api/status`);
+    expect(options).toMatchObject({ method: 'GET', agent: false, family: 4 });
+    expect(options.rejectUnauthorized).not.toBe(false);
+    expect(options.headers).toEqual({ 'user-agent': 'AI-HACK-Research/0.1', 'accept-encoding': 'identity', Accept: 'application/json' });
+    const callback = vi.fn();
+    options.lookup!(url.hostname, {}, callback);
+    expect(callback).toHaveBeenCalledWith(null, '104.16.230.132', 4);
+    const all = vi.fn();
+    options.lookup!(url.hostname, { all: true }, all);
+    expect(all).toHaveBeenCalledWith(null, [{ address: '104.16.230.132', family: 4 }]);
+    expect(transport.request).toHaveBeenCalledOnce();
+  });
+
+  it.each(['http://127.0.0.1:4173/api/status', 'https://elsewhere.example.org/api/status',
+    `${ORIGIN}/api/status?token=synthetic`, `${ORIGIN}/api/status#fragment`, `${ORIGIN}/api/other`,
+    'https://user:synthetic@fixture-chat-master.trycloudflare.com/api/status',
+    'https://nested.fixture-chat-master.trycloudflare.com/api/status'])('does not fall back for %s', async url => {
+    const resolve4 = vi.fn(); const request = vi.fn();
+    expect(await healthProbe(url, { statusJson: true, fetchRequest: async () => { throw dnsFailure(); }, resolve4, request })).toBe(false);
+    expect(resolve4).not.toHaveBeenCalled(); expect(request).not.toHaveBeenCalled();
+  });
+
+  it('does not fall back on a normal response, non-DNS errors, an aborted request, or non-JSON probes', async () => {
+    const resolve4 = vi.fn(); const request = vi.fn();
+    for (const fetchRequest of [async () => json({ liveEnabled: true, version: 'fixture' }), async () => json({}, 503),
+      async () => { throw dnsFailure('ECONNRESET'); }, async () => { throw dnsFailure('CERT_HAS_EXPIRED'); }]) {
+      await healthProbe(`${ORIGIN}/api/status`, { statusJson: true, fetchRequest, resolve4, request });
+    }
+    const controller = new AbortController(); controller.abort();
+    await healthProbe(`${ORIGIN}/api/status`, { statusJson: true, signal: controller.signal,
+      fetchRequest: async () => { throw dnsFailure(); }, resolve4, request });
+    await healthProbe(`${ORIGIN}/api/status`, { fetchRequest: async () => { throw dnsFailure(); }, resolve4, request });
+    expect(resolve4).not.toHaveBeenCalled(); expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each([[], ['127.0.0.1'], ['169.254.169.254'], ['192.0.2.1'], ['::1'], ['2606:4700::1111'],
+    ['104.16.230.132', '10.0.0.1']].map(addresses => ({ addresses })))('rejects non-public or non-IPv4 DNS answers $addresses', async ({ addresses }) => {
+    const request = vi.fn();
+    expect(await healthProbe(`${ORIGIN}/api/status`, { statusJson: true,
+      fetchRequest: async () => { throw dnsFailure(); }, resolve4: async () => addresses, request })).toBe(false);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { status: 302, headers: { location: 'https://elsewhere.example.org' } }, { status: 503 },
+    { headers: { 'content-length': '16385' } }, { body: 'x'.repeat(16_385) },
+    { body: 'invalid json' }, { body: 'null' }, { body: '{"liveEnabled":"true","version":"fixture"}' },
+    { body: '{"liveEnabled":true}' }, { error: 'CERT_HAS_EXPIRED' },
+  ])('rejects unsafe or invalid fallback responses %#', async reply => {
+    const transport = probeTransport(reply);
+    expect(await healthProbe(`${ORIGIN}/api/status`, { statusJson: true,
+      fetchRequest: async () => { throw dnsFailure(); }, resolve4: async () => ['104.16.230.132'], request: transport.request })).toBe(false);
+    expect(transport.request).toHaveBeenCalledOnce();
+  });
+
+  it('shares the original ten-second deadline across failed fetch and stalled fallback', async () => {
+    vi.useFakeTimers(); const transport = probeTransport({ stall: true });
+    const fetchRequest = vi.fn().mockImplementation(() => new Promise((_resolve, reject) => setTimeout(() => reject(dnsFailure()), 6000)));
+    let settled = false;
+    const pending = healthProbe(`${ORIGIN}/api/status`, { statusJson: true, fetchRequest,
+      resolve4: async () => ['104.16.230.132'], request: transport.request }).then((value: boolean) => { settled = true; return value; });
+    await vi.advanceTimersByTimeAsync(9999);
+    expect(settled).toBe(false); expect(transport.request).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await pending).toBe(false); expect(transport.destroy).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['dns', 'response'])('cancels a stalled %s without retrying or leaving timers', async stage => {
+    vi.useFakeTimers(); const controller = new AbortController(); const transport = probeTransport({ stall: true });
+    const resolve4 = vi.fn().mockImplementation(() => stage === 'dns' ? new Promise(() => {}) : Promise.resolve(['104.16.230.132']));
+    const pending = healthProbe(`${ORIGIN}/api/status`, { statusJson: true, signal: controller.signal,
+      fetchRequest: async () => { throw dnsFailure(); }, resolve4, request: transport.request });
+    await vi.advanceTimersByTimeAsync(0); controller.abort();
+    expect(await pending).toBe(false);
+    expect(resolve4.mock.calls[0]![1].aborted).toBe(true);
+    expect(transport.request).toHaveBeenCalledTimes(stage === 'dns' ? 0 : 1);
+    expect(transport.destroy).toHaveBeenCalledTimes(stage === 'dns' ? 0 : 1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('cancels the DNS resolver when the bounded fallback deadline expires before the outer deadline', async () => {
+    vi.useFakeTimers(); const resolve4 = vi.fn().mockImplementation(() => new Promise(() => {}));
+    const request = vi.fn();
+    const pending = healthProbe(`${ORIGIN}/api/status`, { statusJson: true,
+      fetchRequest: async () => { throw dnsFailure(); }, resolve4, request });
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(await pending).toBe(false);
+    expect(resolve4.mock.calls[0]![1].aborted).toBe(true);
+    expect(request).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe('owned process and lock safety', () => {
   it('refuses another process on the guard port, only probes a stale PID with signal zero, and releases its own lock', async () => {
     const dir = await directory(); const path = join(dir, 'supervisor.lock');
@@ -185,6 +302,21 @@ function simulation(overrides: Record<string, unknown> = {}) {
 }
 
 describe('supervisor recovery orchestration without external calls', () => {
+  it('publishes a healthy public tunnel without restarting when only OS name lookup fails beyond startup grace', async () => {
+    const transport = probeTransport();
+    const run = simulation({ healthProbe: vi.fn().mockImplementation(async (url: string) => {
+      if (!url.startsWith('https://')) return true;
+      return healthProbe(url, { statusJson: true, fetchRequest: async () => { throw dnsFailure(); },
+        resolve4: async () => ['104.16.230.132'], request: transport.request });
+    }) });
+    await supervise(run.config, run.dependencies);
+    expect(run.children.filter(child => child.kind === 'tunnel')).toHaveLength(1);
+    expect(run.dependencies.publishEndpoint).toHaveBeenCalledOnce();
+    expect(run.dependencies.publishEndpoint.mock.calls[0]![0].origin).toBe(ORIGIN);
+    expect(run.dependencies.log.mock.calls.flat()).not.toContain('TUNNEL_HEALTH_RESTART');
+    expect(transport.request.mock.calls.length).toBeGreaterThan(5);
+  });
+
   it('keeps a new healthy tunnel stable while its public hostname becomes resolvable, then leaves startup grace after first success', async () => {
     let elapsed = 0; const restarts: number[] = [];
     const run = simulation({ healthProbe: vi.fn().mockImplementation(async (url: string) => !url.startsWith('https://') || elapsed === 4 * 60_000) });
