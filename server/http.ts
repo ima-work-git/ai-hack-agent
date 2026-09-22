@@ -6,6 +6,7 @@ import type { ResearchInput, ResearchResult, Target } from '../src/shared/contra
 import type { AppConfig } from './config.ts';
 import { SessionStore } from './sessions.ts';
 import { DeviceLoginError, DeviceLoginStore } from './device-logins.ts';
+import { ReusableQrError, ReusableQrStore } from './reusable-qr.ts';
 import { BudgetError, BudgetLedger } from './budget.ts';
 import { runAgent } from './agent.ts';
 import { createFixtureProvider } from './fixtures.ts';
@@ -13,7 +14,7 @@ import { createLiveProvider, prepareAudio } from './providers.ts';
 import type { ResearchProvider } from './provider-contract.ts';
 import { ProviderError } from './provider-contract.ts';
 import { createStreamingRelay } from './ws-relay.ts';
-import { verifiedAliasForInputTarget } from '../src/shared/identity-aliases.ts';
+import { isTargetGroundedInTranscript } from '../src/shared/identity-aliases.ts';
 
 interface HttpDependencies {
   store?: SessionStore;
@@ -65,6 +66,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   const now = dependencies.now ?? Date.now;
   const store = dependencies.store ?? new SessionStore(config.budget.directory, now);
   const deviceLogins = dependencies.deviceLogins ?? new DeviceLoginStore(config.budget.directory, config.accessCode, now);
+  const reusableQr = new ReusableQrStore(config.budget.directory, config.accessCode, now);
   const budget = dependencies.budget ?? (config.status.liveEnabled ? new BudgetLedger(config.budget) : undefined);
   const liveProvider = dependencies.liveProvider ?? createLiveProvider(config.providers);
   const research = dependencies.runAgent ?? runAgent;
@@ -103,6 +105,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
     }
     // An unavailable credential file must never turn a timer error into a crash.
     try { deviceLogins.sweep(); } catch { /* Authentication reads the store again and fails closed. */ }
+    try { reusableQr.sweep(); } catch { /* A grant must still authenticate against its persisted expiry. */ }
     for (const [id] of active) if (!store.get(id)) active.delete(id);
     for (const [key, value] of attempts) if (value.until <= now()) attempts.delete(key);
   }, 10_000);
@@ -199,8 +202,9 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         // Consume synchronously before issuing any credential. Concurrent or
         // retried requests cannot reuse a grant, including after later failures.
         qrTickets.delete(hash);
-        if (!grant || grant.expiresAt <= now() || !store.get(grant.issuerSessionId)) throw new HttpError(401, 'QRコードが失効しました。新しいQRコードで開始してください。');
-        const remembered = deviceLogins.issue(deviceCookie(req));
+        const recurring = reusableQr.authenticate(body.ticket);
+        if (!recurring && (!grant || grant.expiresAt <= now() || !store.get(grant.issuerSessionId))) throw new HttpError(401, 'QRコードが失効しました。新しいQRコードで開始してください。');
+        const remembered = deviceLogins.issue(deviceCookie(req), recurring?.expiresAt);
         const { session, token } = store.login();
         res.setHeader('Set-Cookie', [cookie(session.id, session.expiresAt), rememberedCookie(remembered.token, remembered.expiresAt)]);
         sendJson(res, 200, { token, expiresAt: session.expiresAt, revision: session.revision, hasPrevious: false, interrupted: false });
@@ -219,6 +223,23 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       const authorization = req.headers.authorization;
       const session = authorization?.startsWith('Bearer ') ? store.authenticate(authorization.slice(7)) : null;
       if (!session) throw new HttpError(401, '再ログインしてください。');
+      if (path === '/api/session/qr/reusable' && req.method === 'POST') {
+        sameOrigin(req); rateLimit(req, 'code');
+        const body = z.object({ expiresAt: z.iso.datetime(), accessCode: z.string().max(512).default('') }).strict().parse(await jsonBody(req));
+        if (config.accessCode.length < 16 || !safeEqual(body.accessCode, config.accessCode)) throw new HttpError(401, '利用コードが一致しません。');
+        if (!store.authenticate(authorization!.slice(7))) throw new HttpError(401, '再ログインしてください。');
+        try { sendJson(res, 200, reusableQr.issue(Date.parse(body.expiresAt))); }
+        catch (error) {
+          if (error instanceof ReusableQrError) throw new HttpError(error.code === 'INVALID_EXPIRY' ? 400 : 503, 'QRを発行できません。期限は48時間以内、発行数は5枚までです。');
+          throw error;
+        }
+        return true;
+      }
+      if (path === '/api/session/qr/reusable' && req.method === 'DELETE') {
+        sameOrigin(req);
+        const body = z.object({ ticket: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(await jsonBody(req));
+        reusableQr.revoke(body.ticket); sendJson(res, 200, { revoked: true }); return true;
+      }
       if (req.method === 'POST' && path === '/api/conversation/stream') {
         sameOrigin(req);
         const body = z.object({ conversationId: z.string().uuid() }).strict().parse(await jsonBody(req));
@@ -251,13 +272,10 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
           await budget.settle(reservation, planned.actualUsd ?? null);
           const plan = PlanDecisionSchema.parse(planned.value);
           if (controller.signal.aborted || conversations.get(session.id) !== group || !store.finish(session.id, controller)) throw new HttpError(409, '停止または失効した解析です。');
-          const normalize = (text: string) => text.normalize('NFKC').replace(/\s+/g, '').toLocaleLowerCase('ja');
-          const current = normalize(body.text); const context = normalize(group.transcriptContext);
           const proposed = plan.needsConfirmation ? plan.candidates : plan.target ? [plan.target] : [];
-          const targets = proposed.filter(target => current.includes(normalize(target.personName)) && context.includes(normalize(target.companyName)) ||
-            verifiedAliasForInputTarget(group.transcriptContext, target) && verifiedAliasForInputTarget(`${body.text}\n${target.companyName}`, target)).slice(0, 3).map(({ personName, companyName }) => ({ personName, companyName }));
+          const targets = proposed.filter(target => isTargetGroundedInTranscript(body.text, group.transcriptContext, target)).slice(0, 3).map(({ personName, companyName }) => ({ personName, companyName }));
           window.transcribed = true; session.running = false; store.save(session); active.delete(session.id);
-          sendJson(res, 200, { text: body.text, targets, hasPersonMention: true });
+          sendJson(res, 200, { text: body.text, targets, hasPersonMention: targets.length > 0 || plan.hasPersonMention !== false });
         } finally { clearTimeout(timer); res.off('close', disconnected); if (active.get(session.id)?.controller === controller) { store.cancel(session.id); active.delete(session.id); } }
         return true;
       }
@@ -271,8 +289,9 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         sendJson(res, 200, { conversationId: conversation.id, expiresAt: conversation.expiresAt }); return true;
       }
       if (req.method === 'POST' && path === '/api/session/qr') {
-        sameOrigin(req);
-        z.object({}).strict().parse(await jsonBody(req));
+        sameOrigin(req); rateLimit(req, 'code');
+        const body = z.object({ accessCode: z.string().max(512).default('') }).strict().parse(await jsonBody(req));
+        if (config.accessCode.length < 16 || !safeEqual(body.accessCode, config.accessCode)) throw new HttpError(401, '利用コードが一致しません。');
         // Body reading is asynchronous: the issuer may expire or log out meanwhile.
         if (!store.authenticate(authorization!.slice(7))) throw new HttpError(401, '再ログインしてください。');
         sweepQrTickets();

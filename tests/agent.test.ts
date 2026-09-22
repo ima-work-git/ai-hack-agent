@@ -393,3 +393,50 @@ describe('bounded evidence research', () => {
     expect(result.cards).toHaveLength(0);
   });
 });
+
+describe('person-only public-profile research', () => {
+  function publicProvider(assessmentChanges: Partial<Assessment> = {}, personName = '架空作家'): ResearchProvider {
+    const subject = { personName, companyName: '' };
+    const text = `${personName}の公式プロフィールです。公開の執筆講座で創作について紹介しています。`;
+    const source = { sourceId: 'public-profile', url: 'https://author.example.org/profile', title: '架空の公式資料', text, retrievedAt: '2026-09-22T00:00:00Z', kind: 'web' as const };
+    return {
+      mode: 'demo',
+      plan: async () => ({ value: { target: subject, needsConfirmation: false, candidates: [], query: `${personName} 公式`, reason: '入力に明記', hasPersonMention: true }, actualUsd: 0 }),
+      search: vi.fn(async () => ({ value: [{ url: source.url, title: source.title }], actualUsd: 0 })),
+      fetchPage: async () => ({ value: source, actualUsd: 0 }),
+      assess: async () => ({ value: { identityVerified: true, publicPersonVerified: true, publicIdentitySourceIds: ['public-profile'], needsConfirmation: false, candidates: [], cards: [{ fact: '公開の執筆講座で創作について紹介しています。', excerpt: text, sourceId: source.sourceId, suggestedQuestion: '講座で印象に残ったことは？' }], followUpQuery: null, reason: '架空の一次資料で検証', ...assessmentChanges }, actualUsd: 0 }),
+    };
+  }
+
+  it('discovers an unregistered public person through web sources with no company or invented X account', async () => {
+    const provider = publicProvider();
+    const result = await runAgent(input({ text: '架空作家さんについて' }), provider);
+    expect(result.status).toBe('ready'); expect(result.target?.companyName).toBe(''); expect(result.cards).toHaveLength(1);
+    expect(provider.search).toHaveBeenCalledWith('架空作家 公式', expect.any(AbortSignal));
+    expect(result.usage).toMatchObject({ llm: 2, searches: 1, pages: 1 });
+  });
+
+  it.each([
+    { publicPersonVerified: false },
+    { publicIdentitySourceIds: [] },
+    { publicIdentitySourceIds: ['fabricated-profile'] },
+    { identityVerified: false },
+    { needsConfirmation: true },
+  ])('requires clarification for private, absent, forged or ambiguous public identity evidence %#', async changes => {
+    const result = await runAgent(input({ text: '架空作家さんについて' }), publicProvider(changes));
+    expect(result.status).toBe('awaiting_confirmation'); expect(result.cards).toEqual([]);
+  });
+
+  it('uses at most the remaining search and assessment when primary public evidence is missing', async () => {
+    const result = await runAgent(input({ text: '架空作家さんについて' }), publicProvider({ publicPersonVerified: false, followUpQuery: '公式 プロフィール' }));
+    expect(result.status).toBe('awaiting_confirmation'); expect(result.cards).toEqual([]);
+    expect(result.usage).toMatchObject({ llm: 3, searches: 2, pages: 1 });
+  });
+
+  it('routes a verified kana nickname to its grounded account without adding API calls', async () => {
+    const provider = publicProvider({}, '西村博之');
+    const result = await runAgent(input({ text: 'ヒロユキについて' }), provider);
+    expect(result.status).toBe('ready'); expect(provider.search).toHaveBeenCalledWith('西村博之 公式 @hirox246', expect.any(AbortSignal));
+    expect(result.target).toEqual({ personName: '西村博之', companyName: '' });
+  });
+});

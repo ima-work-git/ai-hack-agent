@@ -51,8 +51,45 @@ describe('bounded OrcaRouter adapter', () => {
     } });
     const payload = JSON.parse(String(options!.body));
     expect(payload).toMatchObject({ model: 'operator-selected-model', response_format: { type: 'json_object' }, stream: false });
-    expect(payload.messages[1].content).toBe(JSON.stringify({ text: input.text }));
+    expect(payload.messages[1].content).toBe(JSON.stringify({ currentTranscript: input.text, text: input.text }));
     expect(payload.messages[0].content).not.toContain(config.orcaApiKey);
+  });
+
+  it.each([
+    ['ヒロユキさんについて', 'ひろゆき', '西村博之', 'hirox246'],
+    ['ほりえもんについて', 'ホリエモン', '堀江貴文', 'takapon_jp'],
+  ])('plans a known public nickname without manufacturing a company: %s', async (text, personName, canonical, handle) => {
+    const api = mockFetch(completion({ ...plan, target: { personName, companyName: '' }, query: `公式 @${handle}`, hasPersonMention: true }));
+    const result = await createLiveProvider(config, { fetch: api }).plan({ ...input, text }, signal());
+    expect(result.value.target).toEqual({ personName: canonical, companyName: '' });
+    const body = JSON.parse(String(api.mock.calls[0]![1]!.body));
+    expect(JSON.parse(body.messages[1].content).verifiedIdentityHints).toHaveLength(1);
+    expect(api).toHaveBeenCalledOnce();
+  });
+
+  it('allows an unregistered named candidate to seek public primary profiles without granting an X handle', async () => {
+    const supplied = { ...plan, target: { personName: '架空作家', companyName: '' }, query: '架空作家 公式', hasPersonMention: true };
+    const api = mockFetch(completion(supplied), completion({ ...supplied, query: '@guessed' }));
+    const provider = createLiveProvider(config, { fetch: api });
+    expect((await provider.plan({ ...input, text: '架空作家さんについて' }, signal())).value).toEqual(supplied);
+    await expect(provider.plan({ ...input, text: '架空作家さんについて' }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
+  });
+
+  it('requires the person in CURRENT even if a past quoted context contains a verified alias', async () => {
+    const quoted = `引用された会話\n${JSON.stringify({ previousTranscript: 'ひろゆきについて話していました', currentTranscript: 'ありがとうございます' })}`;
+    const invented = { ...plan, target: { personName: '西村博之', companyName: '' }, query: '公式', hasPersonMention: true };
+    const ordinary = { ...plan, target: null, query: '', hasPersonMention: false };
+    const api = mockFetch(completion(invented), completion(ordinary));
+    const provider = createLiveProvider(config, { fetch: api });
+    await expect(provider.plan({ ...input, text: quoted }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
+    expect((await provider.plan({ ...input, text: quoted }, signal())).value).toMatchObject({ target: null, hasPersonMention: false });
+  });
+
+  it('does not fill a missing company with model knowledge or accept a contradictory no-person flag', async () => {
+    const api = mockFetch(completion(plan), completion({ ...plan, hasPersonMention: false }));
+    const provider = createLiveProvider(config, { fetch: api });
+    await expect(provider.plan({ ...input, text: '山田花子さん' }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
+    await expect(provider.plan(input, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
   });
 
   it('returns inline USD as preliminary only, including zero, without releasing the reservation', async () => {
@@ -138,8 +175,8 @@ describe('bounded OrcaRouter adapter', () => {
     expect(data[0].verifiedIdentityHints[0]).toMatchObject({ xHandle: 'chomado', personNames: expect.arrayContaining(['ちょまど']), sourceUrls: expect.arrayContaining(['https://chomado.com/']) });
     expect(data[1]).not.toHaveProperty('verifiedIdentityHints');
     expect(data[2].verifiedIdentityHints).toHaveLength(1);
-    expect(payloads[0].messages[0].content).toContain('without asking for a full legal name');
-    expect(payloads[2].messages[0].content).toContain('Never short-circuit ambiguity');
+    expect(payloads[0].messages[0].content).toContain('matching nickname needs no request for a legal name');
+    expect(payloads[2].messages[0].content).toContain('hint never resolves multiple people');
     expect(api).toHaveBeenCalledTimes(3);
   });
 
@@ -524,6 +561,12 @@ describe('bounded audio transcription', () => {
     expect(result.transcriptTargets).toEqual([spoken, target]);
     expect(result.transcriptHasPersonMention).toBe(true);
     expect(api).toHaveBeenCalledOnce();
+  });
+
+  it('retains a spoken person-only candidate with no affiliation and without expanding an alias', async () => {
+    const api = mockFetch(completion({ text: 'ほりえもんさんの話です。', targets: [{ personName: 'ホリエモン', companyName: '' }, { personName: '堀江貴文', companyName: '' }], hasPersonMention: true }));
+    const provider = createLiveProvider({ ...config, orcaSttModel: 'fixture-audio-model' }, { fetch: api });
+    expect((await provider.transcribe!(wav(), 'audio/wav', signal())).transcriptTargets).toEqual([{ personName: 'ホリエモン', companyName: '' }]);
   });
 
   it.each([true, false])('preserves the same-window person-mention hint %s without inventing a company', async hasPersonMention => {

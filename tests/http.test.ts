@@ -231,7 +231,7 @@ describe('conversation-wide audio and research budget', () => {
 });
 
 describe('single-use QR login', () => {
-  const issue = (f: Awaited<ReturnType<typeof fixture>>, token: string, headers: Record<string, string> = {}, body = '{}') =>
+  const issue = (f: Awaited<ReturnType<typeof fixture>>, token: string, headers: Record<string, string> = {}, body = JSON.stringify({ accessCode: f.config.accessCode })) =>
     f.request('/api/session/qr', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...headers }, body });
   const redeem = (f: Awaited<ReturnType<typeof fixture>>, ticket: string, headers: Record<string, string> = {}) =>
     f.request('/api/session/qr/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ ticket }) });
@@ -309,6 +309,61 @@ describe('single-use QR login', () => {
     expect((await redeem(f, 'a'.repeat(64))).status).toBe(429);
     f.advance(60_000);
     expect((await redeem(f, 'a'.repeat(64))).status).toBe(401);
+  });
+});
+
+describe('reusable fixed-expiry QR login', () => {
+  it('requires the operator code again to issue either QR type from a QR-derived session', async () => {
+    const f = await fixture(); const issuer = await f.login();
+    const expiresAt = new Date(issuer.body.expiresAt + 60 * 60_000).toISOString();
+    const issue = (token: string, reusable: boolean, data: Record<string, unknown>) => f.request(`/api/session/qr${reusable ? '/reusable' : ''}`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ ...(reusable ? { expiresAt } : {}), ...data }),
+    });
+    const grant = await (await issue(issuer.body.token, true, { accessCode: f.config.accessCode })).json();
+    const redeemed = await f.request('/api/session/qr/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticket: grant.ticket }) });
+    expect(redeemed.status).toBe(200); const recipient = await redeemed.json();
+    for (const reusable of [false, true]) {
+      expect((await issue(recipient.token, reusable, {})).status).toBe(401);
+      expect((await issue(recipient.token, reusable, { accessCode: 'wrong-code' })).status).toBe(401);
+      expect((await issue(recipient.token, reusable, { accessCode: f.config.accessCode, extra: true })).status).toBe(400);
+    }
+    expect((await issue(recipient.token, true, { accessCode: f.config.accessCode })).status).toBe(200);
+  });
+
+  it('shares the code attempt limit across both QR issuance routes and login', async () => {
+    const f = await fixture(); const issuer = await f.login();
+    const expiresAt = new Date(issuer.body.expiresAt + 60 * 60_000).toISOString();
+    const issue = (reusable: boolean) => f.request(`/api/session/qr${reusable ? '/reusable' : ''}`, {
+      method: 'POST', headers: { Authorization: `Bearer ${issuer.body.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ accessCode: 'wrong-code', ...(reusable ? { expiresAt } : {}) }),
+    });
+    for (let attempt = 0; attempt < 9; attempt++) expect((await issue(attempt % 2 === 0)).status).toBe(401);
+    expect((await issue(false)).status).toBe(429); expect((await issue(true)).status).toBe(429);
+    f.advance(60_000); expect((await issue(true)).status).toBe(401);
+  });
+
+  it('can be scanned repeatedly after issuer logout and restart but not after its fixed deadline', async () => {
+    const f = await fixture(); const issuer = await f.login();
+    const expiresAt = issuer.body.expiresAt - 900_000 + 36 * 60 * 60_000;
+    const issue = (headers: Record<string, string> = {}, deadline = expiresAt) => f.request('/api/session/qr/reusable', {
+      method: 'POST', headers: { Authorization: `Bearer ${issuer.body.token}`, 'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ expiresAt: new Date(deadline).toISOString(), accessCode: f.config.accessCode }),
+    });
+    expect((await issue({ Authorization: 'Bearer invalid' })).status).toBe(401);
+    expect((await issue({ Origin: 'https://foreign.invalid' })).status).toBe(403);
+    expect((await issue({}, expiresAt + 24 * 60 * 60_000)).status).toBe(400);
+    const issued = await issue(); const grant = await issued.json(); expect(issued.status).toBe(200); expect(grant.expiresAt).toBe(expiresAt);
+    const redeem = () => f.request('/api/session/qr/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticket: grant.ticket }) });
+    await f.request('/api/session', { method: 'DELETE', headers: { Authorization: `Bearer ${issuer.body.token}` } });
+    const first = await redeem(); const firstBody = await first.json();
+    const second = await redeem(); const secondBody = await second.json();
+    expect(first.status).toBe(200); expect(second.status).toBe(200);
+    expect(firstBody.token).not.toBe(secondBody.token);
+    expect(secondBody).toMatchObject({ hasPrevious: false, revision: 0 });
+    expect(await readFile(join(f.directory, 'reusable-qr.json'), 'utf8')).not.toContain(grant.ticket);
+    f.restart(); f.advance(35 * 60 * 60_000);
+    const nearExpiry = await redeem(); expect(nearExpiry.status).toBe(200);
+    const devices = JSON.parse(await readFile(join(f.directory, 'device-logins.json'), 'utf8')).devices;
+    expect(devices.every((device: { expiresAt: number }) => device.expiresAt <= expiresAt)).toBe(true);
+    f.advance(60 * 60_000); expect((await redeem()).status).toBe(401);
   });
 });
 

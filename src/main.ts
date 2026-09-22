@@ -20,13 +20,13 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getEleme
 const BOARD_MARKUP = Array.from({ length: 4 }, (_, index) => `<button type="button" class="topic-card empty" id="topic-${index}" disabled aria-label="${index + 1}件目は未確認"><span class="topic-number">${index + 1} / 未確認</span><span class="topic-row"><span class="topic-caption">事実</span><span class="topic-fact"${index === 0 ? ' id="fact"' : ''}>未確認</span></span><span class="topic-row"><span class="topic-caption">質問</span><span class="topic-question"${index === 0 ? ' id="question"' : ''}>確認後に表示</span></span></button>`).join('');
 const app = document.getElementById('app')!;
 app.innerHTML = `
-<header class="masthead"><div class="wordmark"><span class="mark" aria-hidden="true">◌</span><div><div class="eyebrow">AI HACK · EVEN G2</div><h1>会話アシスタント <span class="muted">/ 仮称</span></h1></div></div><span class="pill" id="connection">スマートフォン表示</span></header>
+<header class="masthead"><div class="wordmark"><span class="mark" aria-hidden="true">◌</span><div><div class="eyebrow">AI HACK · EVEN G2</div><h1>これで誰でも雑談マスター</h1></div></div><span class="pill" id="connection">スマートフォン表示</span></header>
 <section class="panel login hidden" id="login"><div class="eyebrow">WELCOME BACK</div><h2>セッションを始める</h2><p class="muted">会話のデータは最長15分で削除されます。再開時もマイクは自動で起動しません。</p><form id="login-form"><label for="access-code">利用コード</label><input type="password" id="access-code" autocomplete="current-password" minlength="16"><label class="check"><input id="remember-device" type="checkbox" checked><span>この端末では12時間、利用コードの入力を省略する</span></label><div class="controls"><button class="primary" type="submit">開始する</button></div><p class="status" id="login-status" role="status"></p></form></section>
 <main class="workspace hidden" id="workspace"><div class="intro"><div><div class="eyebrow">LESS SEARCHING, MORE CONVERSATION</div><h1>目の前の会話に、次のきっかけを。</h1><p>公開情報の調査と根拠の確認を、エージェントに任せる。</p></div><span class="mode-badge" id="mode-badge">体験デモ · 架空の人物・固定データ</span></div>
 <div class="notice hidden" id="resume-notice">前のセッションがあります。内容を表示するには、再開してください。<div class="controls"><button id="resume">前の内容を再開</button></div></div>
 <div class="grid"><div><section class="panel"><div class="section-head"><h2>会話から調べる</h2><span class="section-number">01 / INPUT</span></div><p class="muted">氏名と会社名を手がかりに、公開情報を確認します。</p>
 <div class="field-row"><div><label for="mode">利用モード</label><select id="mode"><option value="demo">体験デモ</option><option value="live" id="live-option" disabled>実APIで調査</option></select></div><div id="scenario-field"><label for="scenario">確認する場面</label><select id="scenario"><option value="normal">通常・自律的な追加調査</option><option value="ambiguous">同姓同名・候補を確認</option><option value="failure">検索障害・一部の根拠を表示</option><option value="no_evidence">根拠なし・推測せず終了</option></select></div></div>
-<label for="text">会社名と氏名、または会話の文字起こし</label><p class="muted">事前登録・入力は不要です。会話モードを開始すると、会話から人物と会社を見つけて調べます。</p><textarea id="text" maxlength="2000" placeholder="会話モードでは自動で文字が入ります。手入力もできます。" spellcheck="false"></textarea>
+<label for="text">人物名（会社名は任意）、または会話の文字起こし</label><p class="muted">事前登録・入力は不要です。会話モードを開始すると、会話から人物を見つけ、会社名などの手がかりも使って調べます。</p><textarea id="text" maxlength="2000" placeholder="会話モードでは自動で文字が入ります。手入力もできます。" spellcheck="false"></textarea>
 <div class="controls"><button id="sample">架空の会話を入力</button><button id="connect">G2を接続</button></div>
 <label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。会話モードは音声をOpenAIへ逐次送信して認識し、OrcaRouterで調査します。音声は保存しません。短い録音は最大30秒です。</span></label>
 <label for="microphone">使うマイク</label><select id="microphone"><option value="g2" ${conversationLaunch ? 'selected' : ''}>Even G2のマイク</option><option value="phone" ${conversationLaunch ? '' : 'selected'}>スマートフォンのマイク</option></select>
@@ -74,7 +74,7 @@ type VoicePhase = 'off' | 'connecting' | 'listening' | 'paused' | 'stopped' | 'e
 let voicePhase: VoicePhase = 'off';
 let voicePreview = '';
 let voiceDisplayTimer: ReturnType<typeof setTimeout> | undefined;
-const emptyGlassesView = (): GlassesView => ({ header: '会話アシスタント', content: '会話を待っています', footer: 'マイクは停止中' });
+const emptyGlassesView = (): GlassesView => ({ header: 'これで誰でも雑談マスター', content: '会話を待っています', footer: 'マイクは停止中' });
 let glassesView = emptyGlassesView();
 
 const status = (text: string, error = false) => { $('status').textContent = text; $('status').classList.toggle('error', error); };
@@ -154,7 +154,7 @@ function setVoicePhase(phase: VoicePhase) {
 function renderCard() {
   const cards = result?.cards.filter(c => Date.parse(c.expiresAt) > Date.now()).slice(0, 4) || [];
   if (!cards.length) {
-    if (result?.cards.length) { clearResult(); status('カードの有効期限が切れました。必要なら再調査してください。'); void sendView('会話アシスタント', 'カードの有効期限が切れました。', '再調査してください'); }
+    if (result?.cards.length) { clearResult(); status('カードの有効期限が切れました。必要なら再調査してください。'); void sendView('これで誰でも雑談マスター', 'カードの有効期限が切れました。', '再調査してください'); }
     return;
   }
   cardIndex = (cardIndex + cards.length) % cards.length;
@@ -201,7 +201,7 @@ function showResult(value: ResearchResult) {
   }
   $('candidates').replaceChildren();
   if (value.status === 'awaiting_confirmation') {
-    for (const candidate of value.candidates) { const button = document.createElement('button'); button.textContent = `${candidate.personName} / ${candidate.companyName} を選ぶ`; button.onclick = () => { if (lastInput) { $<HTMLTextAreaElement>('text').value = lastInput.text; void research(candidate.id, undefined, conversationId || undefined); } }; $('candidates').append(button); }
+    for (const candidate of value.candidates) { const button = document.createElement('button'); button.textContent = `${candidate.personName}${candidate.companyName ? ` / ${candidate.companyName}` : ''} を選ぶ`; button.onclick = () => { if (lastInput) { $<HTMLTextAreaElement>('text').value = lastInput.text; void research(candidate.id, undefined, conversationId || undefined); } }; $('candidates').append(button); }
   }
   if (!value.cards.length) {
     renderBoard([]); $('hud-target').textContent = value.target?.personName || '対象未確認'; $('hud-expiry').textContent = '0 / 4件確認';
@@ -290,14 +290,14 @@ async function expireSession() {
   if (await restoreLogin()) status('前の会話データを削除し、新しいセッションを開始しました。マイクは停止しています。');
 }
 async function research(selectedCandidateId?: string, preparedId?: string, activeConversationId?: string) {
-  const text = $<HTMLTextAreaElement>('text').value.trim(); if (!text) { status('会社名と氏名、または会話を入力してください。'); return; }
+  const text = $<HTMLTextAreaElement>('text').value.trim(); if (!text) { status('人物名、または会話を入力してください。'); return; }
   if (running || recording && !activeConversationId || audioBusy || !token) return;
   $('resume-notice').classList.add('hidden');
   currentId = preparedId || crypto.randomUUID(); revision += 1; newViewToken(); clearResult();
   $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
   running = true; refreshControls(); controller = new AbortController(); const ownController = controller; const ownId = currentId;
   const input: ResearchInput = { text, requestId: ownId, subjectRevision: revision, mode: $<HTMLSelectElement>('mode').value as 'demo' | 'live', scenario: $<HTMLSelectElement>('scenario').value as Scenario, ...(selectedCandidateId ? { selectedCandidateId } : {}), ...(activeConversationId ? { conversationId: activeConversationId } : {}) };
-  lastInput = input; status('公開情報を調べています…'); await sendView('会話アシスタント', '公開情報を調査中…', '中止はスマートフォンから');
+  lastInput = input; status('公開情報を調べています…'); await sendView('これで誰でも雑談マスター', '公開情報を調査中…', '中止はスマートフォンから');
   let gotResult = false;
   try {
     const response = await api('/api/research', { ...json(input), signal: ownController.signal });
@@ -316,7 +316,7 @@ async function research(selectedCandidateId?: string, preparedId?: string, activ
       }
     }
     if (!gotResult && !ownController.signal.aborted) throw new Error('接続が中断されました。再調査してください。');
-  } catch (error) { if (currentId === ownId && !ownController.signal.aborted) { status(error instanceof Error ? error.message : '調査を完了できませんでした。', true); await sendView('会話アシスタント', '調査を完了できませんでした。', '入力・設定・接続を確認'); } }
+  } catch (error) { if (currentId === ownId && !ownController.signal.aborted) { status(error instanceof Error ? error.message : '調査を完了できませんでした。', true); await sendView('これで誰でも雑談マスター', '調査を完了できませんでした。', '入力・設定・接続を確認'); } }
   finally { if (controller === ownController) { running = false; controller = null; refreshControls(); } }
 }
 async function cancel() {
@@ -325,7 +325,7 @@ async function cancel() {
   currentId = crypto.randomUUID(); revision += 1; newViewToken(); clearResult();
   await stopRecording(false);
   if (!wasConversation && oldId && token) void api('/api/cancel', json({ requestId: oldId, subjectRevision: oldRevision })).catch(() => {});
-  status('停止しました。遅れて届いた結果は表示しません。'); await sendView('会話アシスタント', '調査を停止しました。', '入力待ち'); refreshControls();
+  status('停止しました。遅れて届いた結果は表示しません。'); await sendView('これで誰でも雑談マスター', '調査を停止しました。', '入力待ち'); refreshControls();
 }
 function g2Status(state: G2Status) {
   connected = state.state === 'connected' || state.state === 'recording';
@@ -365,9 +365,9 @@ async function processConversationTranscript(text: string, generation: number) {
     if (targets.length !== 1) {
       if (targets.length > 1 || data.hasPersonMention !== false) {
         newViewToken(); clearResult();
-        await sendView('人物を確認', targets.length > 1 ? '複数の人物が出ています。' : '会社名と氏名を教えてください。', '同じ人として結び付けません');
+        await sendView('人物を確認', targets.length > 1 ? '複数の人物が出ています。' : '人物名や所属などを教えてください。', '同じ人として結び付けません');
       }
-      status(targets.length > 1 ? '複数の人物が出ています。調べたい会社名と氏名を一組で話してください。' : '聞き取り中です。会社名と氏名の組合せが出たら調べます。');
+      status(targets.length > 1 ? '複数の人物が出ています。調べたい人物を一人ずつ話してください。' : '聞き取り中です。人物名が出たら公開情報を調べます。');
       return;
     }
     const target = verifiedAliasForTarget(targets[0]!)?.target ?? targets[0]!;
@@ -376,7 +376,7 @@ async function processConversationTranscript(text: string, generation: number) {
       status(`${target.personName}さんの話題を表示しながら聞き取り中です。対象が変わると調べ直します。`); return;
     }
     conversationLastKey = key; conversationLastAt = Date.now();
-    $<HTMLTextAreaElement>('text').value = `人物の候補：氏名「${targets[0]!.personName}」、会社名「${targets[0]!.companyName}」。所属は公開情報で確認してください。直近の発話：${data.text}`;
+    $<HTMLTextAreaElement>('text').value = `人物の候補：氏名「${target.personName}」${target.companyName ? `、会社名「${target.companyName}」` : '、所属は未指定'}。本人の公開プロフィールで確認してください。直近の発話：${data.text}`;
     audioBusy = false; if (controller === own) controller = null;
     await research(undefined, id, conversationId);
     if (result?.status === 'awaiting_confirmation' && valid()) {
@@ -394,7 +394,6 @@ async function drainTranscripts(generation: number) {
   try {
     while (pendingTranscript && conversationRunning && generation === audioGeneration) {
       const next = pendingTranscript; pendingTranscript = null;
-      if (result?.cards.length && !/(?:会社|株式会社|合同会社|[一-龠]{2,12}(?:さん|氏|様|と申|です)|ちょまど|Microsoft|マイクロソフト|@)/iu.test(next.text)) continue;
       await processConversationTranscript(next.text, generation);
     }
   } catch (error) {
@@ -440,7 +439,7 @@ async function startConversation() {
     const ticket = await ticketResponse.json(); if (generation !== audioGeneration) return;
     if (!await conversation!.start(ticket.ticket) || generation !== audioGeneration) return;
     setVoicePhase('listening');
-    status('ストリーミング認識中です。話している途中から文字が表示され、人物と会社が揃うと調べます。');
+    status('ストリーミング認識中です。話している途中から文字が表示され、人物名を見つけたら公開情報を調べます。');
     await sendView('会話モード', '音声をストリーミング認識中', '終了はスマートフォンから');
   } catch (error) { if (generation === audioGeneration) { await stopRecording(false); setVoicePhase('error'); status(error instanceof Error ? error.message : '会話モードを開始できませんでした。', true); } }
 }
@@ -450,7 +449,7 @@ async function startRecording() {
   setVoicePhase('off');
   const generation = ++audioGeneration;
   audioSource = $<HTMLSelectElement>('microphone').value === 'g2' ? 'g2' : 'phone'; audioChunks = []; audioBytes = 0; recording = true; currentId = crypto.randomUUID();
-  newViewToken(); clearResult(); void sendView('会話アシスタント', '録音中・最大30秒', '停止はスマートフォンから'); status('録音しています。30秒以内に停止します。'); refreshControls();
+  newViewToken(); clearResult(); void sendView('これで誰でも雑談マスター', '録音中・最大30秒', '停止はスマートフォンから'); status('録音しています。30秒以内に停止します。'); refreshControls();
   const ok = audioSource === 'g2' ? await g2.startAudio() : await phone.start();
   if (generation !== audioGeneration) return;
   if (!ok || !recording) { await stopRecording(false); status('録音を開始できませんでした。接続とマイクの許可を確認してください。', true); return; }
@@ -491,7 +490,7 @@ $('sample').onclick = () => { $<HTMLTextAreaElement>('text').value = DEMO_TEXT; 
 $('research').onclick = () => { void research(); }; $('cancel').onclick = () => { void cancel(); };
 $('previous').onclick = () => { cardIndex--; renderCard(); }; $('next').onclick = () => { cardIndex++; renderCard(); };
 async function connectGlasses() {
-  const ok = await g2.connect({ header: '会話アシスタント', content: '登録は不要です。スマートフォンで同意を確認し、会話モードを開始してください。', footer: 'マイクは停止中' }, viewToken);
+  const ok = await g2.connect({ header: 'これで誰でも雑談マスター', content: '登録は不要です。スマートフォンで同意を確認し、会話モードを開始してください。', footer: 'マイクは停止中' }, viewToken);
   if (ok) $<HTMLSelectElement>('microphone').value = 'g2';
   if (!ok) status('Evenアプリからこの画面を開いて接続してください。通常のブラウザーではプレビューを利用できます。');
   return ok;
@@ -509,7 +508,7 @@ $('connect').onclick = () => { void connectGlasses(); };
 $('consent').onchange = () => { if (!$<HTMLInputElement>('consent').checked) void stopRecording(false); refreshControls(); };
 $('conversation').onclick = () => { void startConversation(); };
 $('record').onclick = () => { if (conversationRunning) void cancel(); else if (recording) void stopRecording(true); else void startRecording(); };
-$('mode').onchange = () => { currentId = crypto.randomUUID(); newViewToken(); clearResult(); void sendView('会話アシスタント', '調査を開始してください。', 'マイクは停止中'); const demo = $<HTMLSelectElement>('mode').value === 'demo'; $('scenario-field').classList.toggle('hidden', !demo); $('mode-badge').textContent = demo ? '体験デモ · 架空の人物・固定データ' : '実API · 公開情報を調査'; $('hud-mode').textContent = demo ? 'DEMO / FICTIONAL DATA' : 'LIVE / PUBLIC SOURCES'; $('result-note').textContent = demo ? '体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。' : '個人の非公開情報は調査しません。情報が曖昧な場合は確認を求めます。'; refreshControls(); };
+$('mode').onchange = () => { currentId = crypto.randomUUID(); newViewToken(); clearResult(); void sendView('これで誰でも雑談マスター', '調査を開始してください。', 'マイクは停止中'); const demo = $<HTMLSelectElement>('mode').value === 'demo'; $('scenario-field').classList.toggle('hidden', !demo); $('mode-badge').textContent = demo ? '体験デモ · 架空の人物・固定データ' : '実API · 公開情報を調査'; $('hud-mode').textContent = demo ? 'DEMO / FICTIONAL DATA' : 'LIVE / PUBLIC SOURCES'; $('result-note').textContent = demo ? '体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。' : '個人の非公開情報は調査しません。情報が曖昧な場合は確認を求めます。'; refreshControls(); };
 $('resume').onclick = async () => {
   if (running || recording || audioBusy) return;
   const expectedToken = token; const expectedView = viewToken;

@@ -43,6 +43,15 @@ describe('independent remembered-device credentials', () => {
     expect(JSON.parse(await readFile(f.file, 'utf8')).devices).toEqual([]);
   });
 
+  it('never keeps a remembered device beyond the reusable QR deadline', async () => {
+    const f = await fixture(); const expiry = Date.UTC(2026, 8, 22) + 60_000;
+    const device = f.store.issue(undefined, expiry);
+    expect(device.expiresAt).toBe(expiry);
+    f.advance(60_000);
+    expect(f.createStore().authenticate(device.token)).toBeNull();
+    expect(() => f.store.issue(undefined, expiry)).toThrow('INVALID_EXPIRY');
+  });
+
   it('invalidates all remembered logins on access-code change and permits a fresh code-authenticated issuance', async () => {
     const f = await fixture(); const old = f.store.issue();
     const changed = f.createStore('another-fixture-access-code');

@@ -222,6 +222,51 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(JSON.parse(String(requests('/api/cancel').at(-1)!.body))).toMatchObject({ conversationId: input.conversationId });
   });
 
+  it('researches company-less names while cards are visible and preserves them during ordinary conversation', async () => {
+    let identified = { personName: '架空の検証参加者', companyName: '架空検証社' };
+    let hasPersonMention = true;
+    routes.set('/api/conversation/identify', async init => {
+      const { text } = JSON.parse(String(init.body));
+      return jsonResponse({ text, targets: hasPersonMention ? [identified] : [], hasPersonMention });
+    });
+    routes.set('/api/research', async init => {
+      const input = JSON.parse(String(init.body)) as ResearchInput;
+      const result = researchResult(input.requestId, input.subjectRevision);
+      result.target = { ...identified };
+      result.cards[0]!.fact = `画面遷移の架空テスト資料${requests('/api/research').length}です。`;
+      return new Response(`${JSON.stringify({ type: 'result', result })}\n`, { headers: { 'Content-Type': 'application/x-ndjson' } });
+    });
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    stream.options.onFinal('initial', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(element('card-board').textContent).toContain('架空テスト資料1');
+
+    for (const [index, [spoken, canonical]] of [
+      ['ひろゆき', '西村博之'], ['ほりえもん', '堀江貴文'], ['架空作家', '架空作家'],
+    ].entries()) {
+      identified = { personName: spoken!, companyName: '' };
+      stream.options.onFinal(`person-${index}`, `${spoken}について話しましょう。`); await flush();
+      expect(requests('/api/conversation/identify')).toHaveLength(index + 2);
+      expect(requests('/api/research')).toHaveLength(index + 2);
+      const identifiedInput = JSON.parse(String(requests('/api/conversation/identify').at(-1)!.body));
+      const researchInput = JSON.parse(String(requests('/api/research').at(-1)!.body));
+      expect(identifiedInput.text).toBe(`${spoken}について話しましょう。`);
+      expect(researchInput.text).toContain(`氏名「${canonical}」`);
+      expect(researchInput.text).toContain('所属は未指定');
+      expect(researchInput.text).not.toContain('会社名「');
+      expect(researchInput.text).not.toContain('架空検証社');
+      expect(element('card-board').textContent).toContain(`架空テスト資料${index + 2}`);
+    }
+    const visibleCards = element('card-board').textContent;
+    hasPersonMention = false;
+    stream.options.onFinal('ordinary', '今日は良い天気ですね。'); await flush();
+    expect(requests('/api/conversation/identify')).toHaveLength(5);
+    expect(requests('/api/research')).toHaveLength(4);
+    expect(element('card-board').textContent).toBe(visibleCards);
+    expect(devices.phone!.recording).toBe(true);
+    click('record'); await flush();
+  });
+
   it('shows live ASR status on G2 while preserving four cards and clears it on stop', async () => {
     await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!;

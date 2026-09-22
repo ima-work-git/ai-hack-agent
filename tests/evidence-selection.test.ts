@@ -37,6 +37,28 @@ function fixture(reply: (input: SelectionInput) => unknown = () => emptyAssessme
 const hasLoneSurrogate = (text: string) => [...text].some(character => character.length === 1 && character.charCodeAt(0) >= 0xd800 && character.charCodeAt(0) <= 0xdfff);
 
 describe('bounded evidence selection — mocked model, no network or assertion of semantic identity', () => {
+  it('selects exact source facts for an unregistered public figure without a company, preserving primary-evidence assessment', async () => {
+    const subject = { personName: '架空作家', companyName: '' };
+    const original = source('primary', `${subject.personName}の公式プロフィールです。${FACT}`);
+    const f = fixture(data => ({ ...emptyAssessment(), publicPersonVerified: true, publicIdentitySourceIds: ['primary'], cards: [select(data)] }));
+    const result = await f.assess([original], subject);
+    expect(result.value).toMatchObject({ publicPersonVerified: true, publicIdentitySourceIds: ['primary'], cards: [{ sourceId: 'primary', fact: FACT, excerpt: original.text }] });
+    expect(f.inputs[0]!.sources[0]!.cardEligible).toBe(true);
+    expect(f.api).toHaveBeenCalledOnce();
+  });
+
+  it('uses a curated public nickname only on its verified account and does not treat co-occurrence as proof', async () => {
+    const subject = { personName: '西村博之', companyName: '' };
+    const profile = { ...source('primary', `公開プロフィール: ひろゆき (@hirox246)\n${FACT}`), kind: 'x' as const, url: 'https://x.com/hirox246' };
+    const other = { ...source('other', `ひろゆきです。${OTHER_FACT}`), url: 'https://x.com/unrelated' };
+    const f = fixture(() => ({ ...emptyAssessment(), identityVerified: false, publicPersonVerified: false, publicIdentitySourceIds: [], needsConfirmation: true }));
+    const result = await f.assess([profile, other], subject);
+    expect(f.inputs[0]!.sources.find(item => item.sourceId === 'primary')?.cardEligible).toBe(true);
+    expect(f.inputs[0]!.sources.find(item => item.sourceId === 'other')?.cardEligible).toBe(false);
+    expect(result.value).toMatchObject({ identityVerified: false, needsConfirmation: true, cards: [] });
+    expect(f.inputs[0]!.sources).toHaveLength(2);
+  });
+
   it('adds a concise exact display phrase and complete question in the same assessment without replacing evidence', async () => {
     const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), displayFact: '設計手法を紹介しました。', displayQuestion: '研究会で印象に残った質問は？' }] }));
     const result = await f.assess();

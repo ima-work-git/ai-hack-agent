@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const TargetSchema = z.object({ personName: z.string().min(1).max(100), companyName: z.string().min(1).max(160) }).strict();
+export const TargetSchema = z.object({ personName: z.string().trim().min(1).max(100), companyName: z.string().trim().max(160) }).strict();
 export type Target = z.infer<typeof TargetSchema>;
 export const ModeSchema = z.enum(['demo', 'live']);
 export const ScenarioSchema = z.enum(['normal', 'ambiguous', 'failure', 'no_evidence']);
@@ -22,11 +22,12 @@ export const EvidenceSourceSchema = z.object({
   kind: z.enum(['web', 'x', 'fixture']),
 }).strict();
 export type EvidenceSource = z.infer<typeof EvidenceSourceSchema>;
-export const CandidateSchema = z.object({ id: z.string().min(1).max(80), personName: z.string().min(1).max(100), companyName: z.string().min(1).max(160), reason: z.string().max(400), sourceIds: z.array(z.string()).max(4) }).strict();
+export const CandidateSchema = z.object({ id: z.string().min(1).max(80), personName: z.string().trim().min(1).max(100), companyName: z.string().trim().max(160), reason: z.string().max(400), sourceIds: z.array(z.string()).max(4) }).strict();
 export type Candidate = z.infer<typeof CandidateSchema>;
 export const PlanDecisionSchema = z.object({
   target: TargetSchema.nullable(), needsConfirmation: z.boolean(),
   candidates: z.array(CandidateSchema).max(5), query: z.string().max(300), reason: z.string().max(600),
+  hasPersonMention: z.boolean().optional(),
 }).strict();
 export type PlanDecision = z.infer<typeof PlanDecisionSchema>;
 const withoutOmission = (value: string) => !/[…⋯]|\.{3}|。{3}|[\r\n]/u.test(value);
@@ -48,6 +49,7 @@ export function validatedCardDisplay(fact: string, excerpt: string, displayFact:
 }
 export const AssessmentSchema = z.object({
   identityVerified: z.boolean(), needsConfirmation: z.boolean(), candidates: z.array(CandidateSchema).max(5),
+  publicPersonVerified: z.boolean().optional(), publicIdentitySourceIds: z.array(z.string().min(1).max(100)).max(4).optional(),
   cards: z.array(ProposedCardSchema).max(4), followUpQuery: z.string().max(300).nullable(), reason: z.string().max(600),
 }).strict();
 export type Assessment = z.infer<typeof AssessmentSchema>;
