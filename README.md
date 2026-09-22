@@ -9,6 +9,8 @@
 
 初回利用時は各自の `aidlc` コマンドの利用準備、Codexのhooks承認、ツール内の診断を行ってください。業務テーマのワークフローはまだ開始していません。
 
+2026-09-22：本リポジトリのローカル環境へ公式設定・版登録を適用し、診断はエラー0件。AI-DLCの開始時に方式の選択を求められ、現在は回答待ちです。[開発入力ブリーフ](docs/PROJECT_BRIEF.md)に決定事項・提案・未確認事項をまとめています。
+
 リポジトリ：[ima-work-git/ai-hack-agent](https://github.com/ima-work-git/ai-hack-agent)
 
 ## 最初にすること
@@ -26,9 +28,11 @@ AI-DLCでは人が重要な開発判断を行います。プロダクト側で�
 
 | 目的 | 資料 |
 | --- | --- |
+| AI-DLCで作業を開始・再開する | [開発入力ブリーフ](docs/PROJECT_BRIEF.md) |
 | 準備の抜けを防ぐ | [準備・初期タスク](docs/PREPARATION.md) |
 | 招待、分担、PR、main保護 | [チーム・GitHub](docs/TEAM_AND_GITHUB.md) |
 | Even G2の既存方式を引き継ぐ | [G2連携と接続確認](docs/EVEN_G2_INTEGRATION.md) |
+| 再利用コードの確認結果と修正候補を見る | [G2再利用確認記録](docs/validation/EVEN_G2_REUSE_AUDIT.md) |
 | AWS公式ワークフローを導入する | [AI-DLCセットアップ](docs/AI_DLC_SETUP.md) |
 | OrcaRouter・クラウドの利用準備 | [サービス準備](docs/SERVICES.md) |
 | 作るものを決める | [課題・要件](docs/specs/01_INTENT_AND_REQUIREMENTS.md) |
