@@ -35,6 +35,7 @@ describe('public-person discovery and kana equivalence', () => {
   it.each([
     ['ひろゆき', '西村博之', 'hirox246'], ['ヒロユキ', '西村博之', 'hirox246'], ['西村博之', '西村博之', 'hirox246'],
     ['ホリエモン', '堀江貴文', 'takapon_jp'], ['ほりえもん', '堀江貴文', 'takapon_jp'], ['堀江貴文', '堀江貴文', 'takapon_jp'],
+    ['ちょまど', '千代田まどか', 'chomado'], ['チョマド', '千代田まどか', 'chomado'], ['千代田まどか', '千代田まどか', 'chomado'],
   ])('maps only supported public aliases without inventing an affiliation: %s', (name, canonical, handle) => {
     const record = verifiedAliasForTarget({ personName: name, companyName: '' });
     expect(record?.target).toEqual({ personName: canonical, companyName: '' }); expect(record?.xHandle).toBe(handle);
@@ -59,8 +60,14 @@ describe('public-person discovery and kana equivalence', () => {
 });
 
 describe('catalog names stay separate from ASR corrections', () => {
+  it('has one unambiguous alias for each canonical person/company target', () => {
+    for (const alias of VERIFIED_IDENTITY_ALIASES) {
+      expect(verifiedAliasForTarget(alias.target)?.id).toBe(alias.id);
+    }
+  });
+
   it.each(PUBLIC_FIGURE_CATALOG)('accepts the source-backed kana of $canonicalName without inventing an X account', record => {
-    const companyName = record.id === 'madoka-chiyoda' ? 'Microsoft' : '';
+    const companyName = '';
     const alias = verifiedAliasForTarget({ personName: record.kana, companyName });
     expect(alias?.target).toEqual({ personName: record.canonicalName, companyName });
     expect(alias?.xHandle).toBe(record.xHandle);
@@ -78,10 +85,28 @@ describe('catalog names stay separate from ASR corrections', () => {
     }
   });
 
-  it('preserves the existing company-scoped Chomado rule', () => {
-    expect(verifiedAliasForTarget({ personName: 'ちょまど', companyName: '' })).toBeUndefined();
+  it('keeps Chomado public-person discovery separate from the existing company-scoped rule', () => {
+    const publicTarget = { personName: '千代田まどか', companyName: '' };
+    const alias = verifiedAliasForTarget({ personName: 'ちょまど', companyName: '' });
+    expect(alias).toMatchObject({ scope: 'public-person', target: publicTarget, xHandle: 'chomado' });
+    expect(alias?.sourceUrls).toContain('https://chomado.com/chomado/');
+    expect(alias?.sourceUrls).toContain('https://developer.microsoft.com/ja-jp/advocates/madoka-chiyoda');
+    expect(verifiedAliasForInputTarget('チョマドさんの話題です', publicTarget)?.target).toEqual(publicTarget);
+    expect(isTargetGroundedInTranscript('チョマドさんについて', '', publicTarget)).toBe(true);
+    expect(isTargetGroundedInTranscript('ありがとう', 'チョマドさんについて', publicTarget)).toBe(false);
     expect(verifiedAliasForTarget({ personName: 'ちよだまどか', companyName: 'Microsoft' })?.xHandle).toBe('chomado');
+    expect(verifiedAliasForTarget({ personName: 'ちょまど', companyName: 'Microsoft' })?.scope).toBe('person-company');
+    expect(verifiedAliasForInputTarget('チョマドさんについて', target)).toBeUndefined();
     expect(verifiedAliasForTarget({ personName: 'ちよだまどか', companyName: 'made in Japan' })).toBeUndefined();
+  });
+
+  it('still requires source evidence for companyless Chomado instead of trusting a nickname alone', () => {
+    const publicTarget = { personName: '千代田まどか', companyName: '' };
+    expect(evidenceMatchesTarget('ちょまどの公開技術イベントです。', publicTarget, 'https://x.com/chomado/status/123')).toBe(true);
+    expect(evidenceMatchesTarget('ちょまどの公開技術イベントです。', publicTarget, 'https://x.com/another/status/123')).toBe(false);
+    expect(evidenceMatchesTarget('別人の公開技術イベントです。', publicTarget, 'https://x.com/chomado/status/123')).toBe(false);
+    expect(evidenceMatchesTarget('ちょまどの公開プロフィールです。', publicTarget, 'https://unrelated.example/profile')).toBe(false);
+    expect(isVerifiedPublicSource('https://x.com.evil.example/chomado', publicTarget)).toBe(false);
   });
 
   it('does not grant unknown accounts or nonstandard ports to catalog entries', () => {

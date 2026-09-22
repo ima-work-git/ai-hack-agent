@@ -65,7 +65,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     if (options.signal?.aborted) throw new StopError('CANCELLED');
     if (now() >= deadline) throw new StopError('DEADLINE_EXCEEDED');
   };
-  const call = async <T>(kind: keyof typeof counts, operation: (signal: AbortSignal) => Promise<ProviderResult<T>>): Promise<T> => {
+  const call = async <T>(kind: keyof typeof counts, operation: (signal: AbortSignal) => Promise<ProviderResult<T>>, operationTimeoutMs = 8_000): Promise<T> => {
     check();
     if (counts[kind] >= limits[kind]) throw new StopError('CALL_LIMIT');
     let reservation: BudgetReservation | undefined;
@@ -73,7 +73,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     let timer: ReturnType<typeof setTimeout> | undefined;
     let rejectStop: (error: unknown) => void = () => {};
     const abort = () => { controller.abort(); rejectStop(new StopError('CANCELLED')); };
-    const timeoutMs = Math.max(0, Math.min(8_000, deadline - now()));
+    const timeoutMs = Math.max(0, Math.min(operationTimeoutMs, deadline - now()));
     const stop = new Promise<never>((_resolve, reject) => {
       rejectStop = reject;
       timer = setTimeout(() => { controller.abort(); reject(new StopError(now() >= deadline ? 'DEADLINE_EXCEEDED' : 'OPERATION_TIMEOUT')); }, timeoutMs);
@@ -187,7 +187,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
   const assess = async (): Promise<Assessment> => {
     check();
     emit('assess', '対象の一致と本文の根拠を評価します。');
-    return AssessmentSchema.parse(await call('llm', signal => provider.assess(target!, sources, signal)));
+    return AssessmentSchema.parse(await call('llm', signal => provider.assess(target!, sources, signal), balancedTopics ? 12_000 : 8_000));
   };
   const applyAssessment = (assessment: Assessment): boolean => {
     if (assessment.needsConfirmation) {

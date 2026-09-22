@@ -184,7 +184,7 @@ describe('bounded OrcaRouter adapter', () => {
     await expect(createLiveProvider(config, { fetch: api }).plan({ ...input, text: 'マイクロソフトのちょまどさん' }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
   });
 
-  it('supplies a source-backed nickname hint to the planner only when both clues occur, without bypassing ambiguity', async () => {
+  it('supplies public nickname hints without inventing company clues or bypassing ambiguity', async () => {
     const unresolved = { ...plan, target: null, needsConfirmation: true, query: '' };
     const api = mockFetch(completion(unresolved), completion(unresolved), completion(unresolved));
     const provider = createLiveProvider(config, { fetch: api });
@@ -195,10 +195,11 @@ describe('bounded OrcaRouter adapter', () => {
     }
     const payloads = api.mock.calls.map(([, options]) => JSON.parse(String(options!.body)));
     const data = payloads.map(payload => JSON.parse(payload.messages[1].content));
-    expect(data[0].verifiedIdentityHints).toHaveLength(1);
+    expect(data[0].verifiedIdentityHints).toHaveLength(2);
     expect(data[0].verifiedIdentityHints[0]).toMatchObject({ xHandle: 'chomado', personNames: expect.arrayContaining(['ちょまど']), sourceUrls: expect.arrayContaining(['https://chomado.com/']) });
-    expect(data[1]).not.toHaveProperty('verifiedIdentityHints');
-    expect(data[2].verifiedIdentityHints).toHaveLength(1);
+    expect(data[1].verifiedIdentityHints).toHaveLength(1);
+    expect(data[1].verifiedIdentityHints[0]).toMatchObject({ scope: 'public-person', target: { personName: '千代田まどか', companyName: '' }, xHandle: 'chomado' });
+    expect(data[2].verifiedIdentityHints).toHaveLength(2);
     expect(payloads[0].messages[0].content).toContain('matching nickname needs no request for a legal name');
     expect(payloads[2].messages[0].content).toContain('hint never resolves multiple people');
     expect(api).toHaveBeenCalledTimes(3);

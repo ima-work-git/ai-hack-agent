@@ -358,12 +358,93 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!; stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
     expect(element('status').textContent).toContain('聞き取りは続いています');
-    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain('言い直してください');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain('調査サービスに接続できませんでした');
+    expect(element('status').textContent).not.toContain('名前や所属を言い直してください');
     expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
     const sent = requests(path).length; await vi.advanceTimersByTimeAsync(5000); expect(requests(path)).toHaveLength(sent);
     routes.delete(path); stream.options.onFinal('retry', '架空検証社の架空の検証参加者です。'); await flush();
     expect(requests(path)).toHaveLength(sent + 1); expect(element('card-board').textContent).toContain(FACT);
     expect(devices.g2!.startAudio).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['INVALID_PROVIDER_RESPONSE', '調査サービスの回答を読み取れませんでした'],
+    ['INVALID_OR_UNAVAILABLE_RESPONSE', '調査サービスの回答を読み取れませんでした'],
+    ['OPERATION_TIMEOUT', '応答が時間切れ'],
+    ['DEADLINE_EXCEEDED', '応答が時間切れ'],
+    ['PROVIDER_TIMEOUT', '応答が時間切れ'],
+    ['RATE_LIMITED', '調査サービスが混雑しています'],
+    ['SOURCES_UNAVAILABLE', '調査サービスに接続できませんでした'],
+  ])('explains a failed research result %s without blaming the name or stopping ASR', async (reasonCode, expectedMessage) => {
+    routes.set('/api/research', async init => {
+      const input = JSON.parse(String(init.body)) as ResearchInput;
+      const result = researchResult(input.requestId, input.subjectRevision);
+      result.status = 'failed'; result.cards = []; result.reasonCode = reasonCode; result.message = '調査を完了できませんでした。入力を確認してください。';
+      return new Response(`${JSON.stringify({ type: 'result', result })}\n`);
+    });
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!; stream.options.onFinal('failure', '架空検証社の架空の検証参加者です。'); await flush();
+    const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(view.content).toContain(expectedMessage); expect(view.content).toContain('同じ名前');
+    expect(element('status').textContent).toContain(expectedMessage);
+    expect(element('status').textContent).toContain('聞き取りは続いています');
+    expect(element('status').textContent).not.toContain('名前や所属を言い直');
+    expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+    routes.delete('/api/research'); stream.options.onFinal('retry', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(requests('/api/research')).toHaveLength(2); expect(element('card-board').textContent).toContain(FACT);
+  });
+
+  it.each([
+    [429, 'RATE_LIMITED', '調査サービスが混雑しています'],
+    [504, 'PROVIDER_TIMEOUT', '応答が時間切れ'],
+    [502, 'INVALID_PROVIDER_RESPONSE', '調査サービスの回答を読み取れませんでした'],
+  ] as const)('preserves caught HTTP error codes for recovery feedback %s', async (httpStatus, code, expectedMessage) => {
+    routes.set('/api/conversation/identify', async () => new Response(JSON.stringify({ message: '外部サービスの応答を処理できません。', code }), { status: httpStatus }));
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!; stream.options.onFinal('failure', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(element('status').textContent).toContain(expectedMessage);
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain(expectedMessage);
+    expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['http', 'BUDGET_EXHAUSTED', 429, '設定した費用上限に達しました'],
+    ['http', 'BUDGET_LEDGER_INVALID', 500, '費用管理の状態を確認する必要があります'],
+    ['result', 'BUDGET_EXHAUSTED', 200, '設定した費用上限に達しました'],
+    ['result', 'BUDGET_NOT_CONFIGURED', 200, '費用管理の状態を確認する必要があります'],
+  ] as const)('gives a cost-management action for manual research %s %s instead of retrying the name', async (kind, code, httpStatus, expectedMessage) => {
+    routes.set('/api/research', async init => {
+      if (kind === 'http') return new Response(JSON.stringify({ code, message: '費用管理の確認が必要です。' }), { status: httpStatus });
+      const input = JSON.parse(String(init.body)) as ResearchInput;
+      const result = researchResult(input.requestId, input.subjectRevision);
+      result.status = 'failed'; result.cards = []; result.reasonCode = code;
+      return new Response(`${JSON.stringify({ type: 'result', result })}\n`);
+    });
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush();
+    element<HTMLTextAreaElement>('text').value = '架空検証社の架空の検証参加者です。';
+    click('research'); await flush();
+    expect(element('status').textContent).toContain(expectedMessage);
+    expect(element('status').textContent).toContain('費用の設定・利用状況を確認');
+    expect(element('status').textContent).not.toMatch(/混雑|同じ名前/);
+    const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(view.content).toContain(expectedMessage);
+    expect(view.footer).toContain('費用の設定・利用状況を確認');
+  });
+
+  it('asks to reopen the same QR for an incompatible result, without exposing schema details or stopping ASR', async () => {
+    routes.set('/api/research', async init => {
+      const input = JSON.parse(String(init.body)) as ResearchInput;
+      return new Response(`${JSON.stringify({ type: 'result', result: { ...researchResult(input.requestId, input.subjectRevision), unexpectedField: 'private-validator-fixture' } })}\n`);
+    });
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!; stream.options.onFinal('failure', '架空検証社の架空の検証参加者です。'); await flush();
+    const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(view.content).toContain('画面で調査結果を読み込めませんでした');
+    expect(view.content).toContain('同じQRを読み直して');
+    expect(element('status').textContent).toContain('同じQRを読み直して');
+    expect(element('status').textContent).not.toMatch(/unexpectedField|unrecognized_keys|private-validator-fixture|Zod/);
+    expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+    expect(element('card-board').textContent).not.toContain(FACT);
   });
 
   it.each([

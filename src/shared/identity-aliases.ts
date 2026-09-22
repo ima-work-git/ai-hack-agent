@@ -31,8 +31,9 @@ const existingPublicSources: Readonly<Record<string, readonly string[]>> = {
 };
 const unique = (values: readonly string[]) => [...new Set(values)];
 const catalogAliases: VerifiedIdentityAlias[] = PUBLIC_FIGURE_CATALOG.flatMap(record => {
-  // Preserve an existing company-scoped identity instead of silently broadening it.
-  if (companyAliases.some(alias => alias.target.personName === record.canonicalName)) return [];
+  // A primary-source public identity can be researched without an employer.
+  // Keep company-scoped records separate: this adds no affiliation and never
+  // changes which supplied company/name pairs the existing records accept.
   const personNames = unique([record.canonicalName, record.kana, ...record.publicNames]);
   const sourceUrls = unique([...(existingPublicSources[record.id] ?? []), record.officialProfileUrl, ...(record.readingSourceUrl ? [record.readingSourceUrl] : []), ...(record.xHandleSourceUrl ? [record.xHandleSourceUrl] : [])]);
   const common = { scope: 'public-person' as const, personNames, ...(record.xHandle ? { xHandle: record.xHandle } : {}), checkedOn: record.checkedOn };
