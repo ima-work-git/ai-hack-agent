@@ -1,0 +1,215 @@
+import { randomUUID } from 'node:crypto';
+import {
+  AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, ResearchInputSchema, ResearchResultSchema, SearchHitSchema,
+} from '../src/shared/contracts.ts';
+import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, Target, TraceEvent } from '../src/shared/contracts.ts';
+import type { ProviderResult, ResearchProvider } from './provider-contract.ts';
+import { ProviderError } from './provider-contract.ts';
+import { BudgetError, BudgetLedger } from './budget.ts';
+import type { BudgetReservation } from './budget.ts';
+
+export interface AgentOptions {
+  signal?: AbortSignal;
+  onEvent?: (event: TraceEvent) => void;
+  budget?: BudgetLedger;
+  maximumCosts?: { llm: number; search: number; page: number };
+  now?: () => number;
+  budgetRunId?: string;
+  confirmedTarget?: Target;
+}
+class StopError extends Error {
+  readonly code: string;
+  constructor(code: string) { super(code); this.code = code; }
+}
+const normalize = (s: string) => s.normalize('NFKC').replace(/\s+/g, '').toLocaleLowerCase('ja');
+const contains = (text: string, part: string) => !!normalize(part) && normalize(text).includes(normalize(part));
+const matches = (text: string, target: Target) => contains(text, target.personName) && contains(text, target.companyName);
+const sourceUrlIsPublicShape = (url: string) => {
+  try { const u = new URL(url); return ['https:', 'http:'].includes(u.protocol) && !u.username && !u.password; } catch { return false; }
+};
+
+export async function runAgent(rawInput: ResearchInput, provider: ResearchProvider, options: AgentOptions = {}): Promise<ResearchResult> {
+  const input = ResearchInputSchema.parse(rawInput);
+  const now = options.now ?? Date.now;
+  const started = now();
+  const deadline = started + 20_000;
+  const budgetRunId = options.budgetRunId ?? randomUUID();
+  const handles = [...new Set([...input.text.matchAll(/(?:^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{1,15})(?=$|[^A-Za-z0-9_])/g)].map(match => match[1]!.toLowerCase()))];
+  const trace: TraceEvent[] = [];
+  const sources: EvidenceSource[] = [];
+  let cards: Card[] = [];
+  let target: Target | null = null;
+  let candidates: Candidate[] = [];
+  let hadFailure = false;
+  let counts = { llm: 0, search: 0, page: 0 };
+  let observedCost = 0;
+  let reservedCost = 0;
+  let knownCost = true;
+  const limits = { llm: 3, search: 2, page: 4 };
+  const emit = (step: string, message: string) => {
+    if (trace.length >= 60) return;
+    const event = { eventId: trace.length + 1, step, message: `${input.mode === 'demo' ? '模擬：' : ''}${message}`, at: new Date(now()).toISOString() };
+    trace.push(event);
+    try { options.onEvent?.(event); } catch { /* An observer must not alter the research outcome. */ }
+  };
+  const check = () => {
+    if (options.signal?.aborted) throw new StopError('CANCELLED');
+    if (now() >= deadline) throw new StopError('DEADLINE_EXCEEDED');
+  };
+  const call = async <T>(kind: keyof typeof counts, operation: (signal: AbortSignal) => Promise<ProviderResult<T>>): Promise<T> => {
+    check();
+    if (counts[kind] >= limits[kind]) throw new StopError('CALL_LIMIT');
+    let reservation: BudgetReservation | undefined;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let rejectStop: (error: unknown) => void = () => {};
+    const abort = () => { controller.abort(); rejectStop(new StopError('CANCELLED')); };
+    const timeoutMs = Math.max(0, Math.min(8_000, deadline - now()));
+    const stop = new Promise<never>((_resolve, reject) => {
+      rejectStop = reject;
+      timer = setTimeout(() => { controller.abort(); reject(new StopError(now() >= deadline ? 'DEADLINE_EXCEEDED' : 'OPERATION_TIMEOUT')); }, timeoutMs);
+    });
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
+    const pending = Promise.resolve().then(async () => {
+      if (input.mode === 'live') {
+        reservation = await options.budget!.reserve(budgetRunId, options.maximumCosts![kind]);
+        reservedCost += options.maximumCosts![kind];
+      }
+      try {
+        check();
+        if (controller.signal.aborted) throw new StopError('OPERATION_TIMEOUT');
+      } catch (error) {
+        // Nothing has been sent: this reservation can be released without guessing a charge.
+        if (reservation) { await options.budget!.settle(reservation, 0); reservedCost -= options.maximumCosts![kind]; }
+        throw error;
+      }
+      counts[kind] += 1;
+      return operation(controller.signal);
+    }).then(async result => {
+      const actual = result.actualUsd;
+      if (actual !== undefined && (!Number.isFinite(actual) || actual < 0)) throw new ProviderError('INVALID_COST', '費用応答が不正です。');
+      if (reservation) {
+        await options.budget!.settle(reservation, actual ?? null);
+        if (actual !== undefined) reservedCost -= options.maximumCosts![kind];
+      }
+      if (actual === undefined) knownCost = false; else observedCost += actual;
+      return result.value;
+    }).catch(error => { knownCost = false; throw error; });
+    try {
+      const result = await Promise.race([pending, stop]);
+      check();
+      return result;
+    } catch (error) {
+      knownCost = false;
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+      options.signal?.removeEventListener('abort', abort);
+    }
+  };
+  const finish = async (status: ResearchResult['status'], reasonCode: string, message: string): Promise<ResearchResult> => {
+    if (status === 'cancelled') { cards = []; sources.length = 0; candidates = []; }
+    emit(status, message);
+    // Accounting is already durably recorded by each operation. No extra lock wait after deadline.
+    const reservedUsd = Math.max(0, reservedCost);
+    const actualUsd: number | null = knownCost ? observedCost : null;
+    return ResearchResultSchema.parse({
+      requestId: input.requestId, subjectRevision: input.subjectRevision, mode: input.mode, status, target, candidates, cards, sources, trace,
+      reasonCode, message: `${input.mode === 'demo' ? '模擬データ（架空の人物・会社）。' : ''}${message}`,
+      usage: { llm: counts.llm, searches: counts.search, pages: counts.page, elapsedMs: Math.max(0, now() - started), reservedUsd, actualUsd, costKnown: knownCost },
+    });
+  };
+  const fatal = (error: unknown) => error instanceof StopError && error.code !== 'OPERATION_TIMEOUT' || error instanceof BudgetError;
+  const queryForTarget = (query: string) => {
+    if (!target) throw new StopError('TARGET_UNRESOLVED');
+    // Model-selected topics stay inside the research purpose; source text cannot become an exfiltration query.
+    const allowedTopics = ['公式', 'プロフィール', '事業', '登壇', '公開活動', 'インタビュー', '趣味', '経歴', 'official', 'profile', 'business', 'conference'];
+    const topics = allowedTopics.filter(topic => query.toLowerCase().includes(topic)).slice(0, 3);
+    return `${target.personName} ${target.companyName} ${topics.length ? topics.join(' ') : '公式 プロフィール'}${handles.length === 1 ? ` @${handles[0]}` : ''}`;
+  };
+  const gather = async (query: string) => {
+    emit('search', '対象の氏名と会社名に絞って公開情報を検索します。');
+    let hits;
+    try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.search(queryForTarget(query), signal))); }
+    catch (error) { if (fatal(error)) throw error; hadFailure = true; emit('recovery', '検索を取得できませんでした。別の検索か検証済みの情報へ縮退します。'); return; }
+    for (const hit of hits) {
+      if (counts.page >= limits.page) break;
+      if (!sourceUrlIsPublicShape(hit.url) || sources.some(s => s.url === hit.url)) continue;
+      try {
+        const source = EvidenceSourceSchema.parse(await call('page', signal => provider.fetchPage(hit, signal)));
+        if (!sourceUrlIsPublicShape(source.url) || input.mode === 'live' && source.kind === 'fixture' || sources.some(s => s.sourceId === source.sourceId)) {
+          hadFailure = true; emit('discard', '取得元の識別子または形式が不正なため資料を除外しました。'); continue;
+        }
+        sources.push(source);
+        emit('fetch', '本文を取得しました。検索抜粋だけでは根拠に採用しません。');
+      } catch (error) {
+        if (fatal(error)) throw error;
+        hadFailure = true;
+        emit('recovery', 'ページを取得できませんでした。残る公開資料を調べます。');
+      }
+    }
+  };
+  const assess = async (): Promise<Assessment> => {
+    check();
+    emit('assess', '対象の一致と本文の根拠を評価します。');
+    return AssessmentSchema.parse(await call('llm', signal => provider.assess(target!, sources, signal)));
+  };
+  const applyAssessment = (assessment: Assessment): boolean => {
+    if (assessment.needsConfirmation) {
+      candidates = assessment.candidates.filter(candidate => candidate.sourceIds.length > 0 && candidate.sourceIds.every(id => {
+        const source = sources.find(s => s.sourceId === id);
+        return source && matches(source.text, candidate);
+      }));
+      cards = []; // No personal facts are shown while identity remains ambiguous.
+      return false;
+    }
+    if (!assessment.identityVerified || !target) { cards = []; emit('discard', '対象を特定できる根拠が足りないため、人物の事実を採用しません。'); return true; }
+    for (const proposal of assessment.cards) {
+      const source = sources.find(s => s.sourceId === proposal.sourceId);
+      if (!source || !contains(source.text, proposal.excerpt) || !matches(proposal.excerpt, target) || !contains(proposal.excerpt, proposal.fact)) {
+        emit('discard', '出典、対象名・所属、本文引用の検査に通らないカードを棄却しました。'); continue;
+      }
+      if (cards.some(c => normalize(c.fact) === normalize(proposal.fact)) || cards.length >= 3) continue;
+      cards.push({ ...proposal, cardId: randomUUID(), expiresAt: new Date(now() + 300_000).toISOString(), requestId: input.requestId, subjectRevision: input.subjectRevision });
+    }
+    emit('verify', `${cards.length}件のカードが本文引用と対象照合の検査を通りました。`);
+    return true;
+  };
+
+  try {
+    if (provider.mode !== input.mode) throw new StopError('PROVIDER_MODE_MISMATCH');
+    if (input.mode === 'live' && (!options.budget || !options.maximumCosts ||
+        ![options.maximumCosts.llm, options.maximumCosts.search, options.maximumCosts.page].every(v => Number.isFinite(v) && v >= 0))) throw new StopError('BUDGET_NOT_CONFIGURED');
+    if (input.mode === 'live' && options.budgetRunId) {
+      const prior = await options.budget!.snapshot(budgetRunId);
+      observedCost = prior.actualUsd; reservedCost = prior.reservedUsd; knownCost = prior.costKnown;
+    }
+    if (handles.length > 1) return finish('awaiting_confirmation', 'MULTIPLE_HANDLES', '複数のXアカウントがあります。調べたいアカウントを1件に絞ってください。');
+    emit('plan', '入力から調査対象を抽出し、調査先を計画します。');
+    const plan = PlanDecisionSchema.parse(await call('llm', signal => provider.plan(input, signal)));
+    target = plan.target;
+    candidates = plan.candidates;
+    if (options.confirmedTarget && (!target || normalize(target.personName) !== normalize(options.confirmedTarget.personName) || normalize(target.companyName) !== normalize(options.confirmedTarget.companyName))) {
+      target = options.confirmedTarget;
+      return finish('awaiting_confirmation', 'SELECTED_TARGET_MISMATCH', '選択した対象と抽出結果が一致しませんでした。名前と会社を確認してください。');
+    }
+    if (plan.needsConfirmation || !target) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '対象を絞るため、氏名・会社名または候補を確認してください。');
+    if (input.selectedCandidateId) emit('human_confirmation', '利用者が選んだ候補で調査を再開します。');
+    await gather(plan.query);
+    let assessment = await assess();
+    if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '所属や候補に曖昧さがあります。確認後に調査を再開してください。');
+    if (assessment.followUpQuery && counts.search < 2 && counts.llm < 3 && cards.length < 3) {
+      emit('replan', '根拠を補うため、追加の公開活動を自律的に調べます。');
+      await gather(assessment.followUpQuery);
+      assessment = await assess();
+      if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '追加資料で対象に曖昧さが見つかりました。候補を確認してください。');
+    }
+    if (cards.length) return finish(hadFailure ? 'partial' : 'ready', hadFailure ? 'PARTIAL_SOURCES_UNAVAILABLE' : 'EVIDENCE_VERIFIED', hadFailure ? '取得できなかった資料があります。確認できた根拠だけを表示します。' : '本文と対象を照合した話題カードを表示します。');
+    return finish(hadFailure ? 'failed' : 'no_evidence', hadFailure ? 'SOURCES_UNAVAILABLE' : 'NO_VERIFIABLE_EVIDENCE', hadFailure ? '情報源を取得できず、根拠を確認できませんでした。入力または接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
+  } catch (error) {
+    const reason = error instanceof StopError || error instanceof BudgetError || error instanceof ProviderError ? error.code : 'INVALID_OR_UNAVAILABLE_RESPONSE';
+    if (reason === 'CANCELLED') return finish('cancelled', reason, '調査を停止しました。遅れて届いた結果は表示しません。');
+    return finish(cards.length ? 'partial' : 'failed', reason, cards.length ? '上限または障害で終了しました。検証済みのカードだけを表示します。' : '調査を完了できませんでした。入力・設定・接続を確認して再開してください。');
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "package_id": "jp.imawork.aihack.conversation",
+  "edition": "202601",
+  "name": "Conversation Guide",
+  "version": "0.1.0",
+  "min_app_version": "2.0.0",
+  "min_sdk_version": "0.0.12",
+  "entrypoint": "index.html",
+  "permissions": [{"name": "g2-microphone", "desc": "相手の同意を得て開始した会話を、最大30秒だけ文字に変換します。"}],
+  "supported_languages": ["ja"]
+}

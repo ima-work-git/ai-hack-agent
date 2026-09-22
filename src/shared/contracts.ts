@@ -1,0 +1,55 @@
+import { z } from 'zod';
+
+export const TargetSchema = z.object({ personName: z.string().min(1).max(100), companyName: z.string().min(1).max(160) }).strict();
+export type Target = z.infer<typeof TargetSchema>;
+export const ModeSchema = z.enum(['demo', 'live']);
+export const ScenarioSchema = z.enum(['normal', 'ambiguous', 'failure', 'no_evidence']);
+export type Scenario = z.infer<typeof ScenarioSchema>;
+export const ResearchInputSchema = z.object({
+  text: z.string().trim().min(1).max(2000),
+  requestId: z.string().regex(/^[a-zA-Z0-9_-]{8,80}$/),
+  subjectRevision: z.number().int().positive(),
+  mode: ModeSchema.default('demo'), scenario: ScenarioSchema.default('normal'),
+  selectedCandidateId: z.string().max(80).optional(),
+}).strict();
+export type ResearchInput = z.infer<typeof ResearchInputSchema>;
+export const SearchHitSchema = z.object({ url: z.url().max(2048), title: z.string().max(400), snippet: z.string().max(3000).optional() }).strict();
+export type SearchHit = z.infer<typeof SearchHitSchema>;
+export const EvidenceSourceSchema = z.object({
+  sourceId: z.string().min(1).max(100), url: z.url().max(2048), title: z.string().max(400),
+  retrievedAt: z.iso.datetime(), text: z.string().max(40000),
+  kind: z.enum(['web', 'x', 'fixture']),
+}).strict();
+export type EvidenceSource = z.infer<typeof EvidenceSourceSchema>;
+export const CandidateSchema = z.object({ id: z.string().min(1).max(80), personName: z.string().min(1).max(100), companyName: z.string().min(1).max(160), reason: z.string().max(400), sourceIds: z.array(z.string()).max(4) }).strict();
+export type Candidate = z.infer<typeof CandidateSchema>;
+export const PlanDecisionSchema = z.object({
+  target: TargetSchema.nullable(), needsConfirmation: z.boolean(),
+  candidates: z.array(CandidateSchema).max(5), query: z.string().max(300), reason: z.string().max(600),
+}).strict();
+export type PlanDecision = z.infer<typeof PlanDecisionSchema>;
+export const ProposedCardSchema = z.object({ fact: z.string().min(1).max(200), suggestedQuestion: z.string().min(1).max(180), sourceId: z.string().max(100), excerpt: z.string().min(1).max(1000) }).strict();
+export const AssessmentSchema = z.object({
+  identityVerified: z.boolean(), needsConfirmation: z.boolean(), candidates: z.array(CandidateSchema).max(5),
+  cards: z.array(ProposedCardSchema).max(3), followUpQuery: z.string().max(300).nullable(), reason: z.string().max(600),
+}).strict();
+export type Assessment = z.infer<typeof AssessmentSchema>;
+export const CardSchema = ProposedCardSchema.extend({ cardId: z.string(), expiresAt: z.iso.datetime(), requestId: z.string(), subjectRevision: z.number().int() }).strict();
+export type Card = z.infer<typeof CardSchema>;
+export const TraceEventSchema = z.object({ eventId: z.number().int().positive(), step: z.string().max(60), message: z.string().max(800), at: z.iso.datetime() }).strict();
+export type TraceEvent = z.infer<typeof TraceEventSchema>;
+export const UsageSchema = z.object({ llm: z.number().int().nonnegative(), searches: z.number().int().nonnegative(), pages: z.number().int().nonnegative(), elapsedMs: z.number().nonnegative(), reservedUsd: z.number().nonnegative(), actualUsd: z.number().nonnegative().nullable(), costKnown: z.boolean() }).strict();
+export type Usage = z.infer<typeof UsageSchema>;
+export const ResearchResultSchema = z.object({
+  requestId: z.string(), subjectRevision: z.number().int(), mode: ModeSchema,
+  status: z.enum(['ready', 'partial', 'no_evidence', 'awaiting_confirmation', 'failed', 'cancelled']),
+  target: TargetSchema.nullable(), candidates: z.array(CandidateSchema).max(5),
+  cards: z.array(CardSchema).max(3), sources: z.array(EvidenceSourceSchema).max(4),
+  trace: z.array(TraceEventSchema).max(60), reasonCode: z.string().max(80), message: z.string().max(800), usage: UsageSchema,
+}).strict();
+export type ResearchResult = z.infer<typeof ResearchResultSchema>;
+export const RuntimeStatusSchema = z.object({
+  liveEnabled: z.boolean(), missing: z.array(z.string()), sttEnabled: z.boolean(), xEnabled: z.boolean(),
+  accessCodeRequired: z.boolean(), version: z.string(),
+}).strict();
+export type RuntimeStatus = z.infer<typeof RuntimeStatusSchema>;
