@@ -58,6 +58,11 @@ describe('bounded evidence selection — mocked model, no network or assertion o
     expect((await f.assess()).value.cards).toEqual([]);
   });
 
+  it('checks sensitive content before dropping an invalid or impolite display helper', async () => {
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), displayQuestion: 'ワクチンの副反応は…？' }] }));
+    expect((await f.assess()).value.cards).toEqual([]);
+  });
+
   it('selects exact source facts for an unregistered public figure without a company, preserving primary-evidence assessment', async () => {
     const subject = { personName: '架空作家', companyName: '' };
     const original = source('primary', `${subject.personName}の公式プロフィールです。${FACT}`);
@@ -81,9 +86,9 @@ describe('bounded evidence selection — mocked model, no network or assertion o
   });
 
   it('adds a concise exact display phrase and complete question in the same assessment without replacing evidence', async () => {
-    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), displayFact: '設計手法を紹介しました。', displayQuestion: '研究会で印象に残った質問は？' }] }));
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), displayFact: '設計手法を紹介しました。', displayQuestion: '研究会で印象に残った質問はありますか？' }] }));
     const result = await f.assess();
-    expect(result.value.cards[0]).toMatchObject({ fact: FACT, excerpt: primary().text, displayFact: '設計手法を紹介しました。', displayQuestion: '研究会で印象に残った質問は？' });
+    expect(result.value.cards[0]).toMatchObject({ fact: FACT, excerpt: primary().text, displayFact: '設計手法を紹介しました。', displayQuestion: '研究会で印象に残った質問はありますか？' });
     expect(f.api).toHaveBeenCalledOnce();
   });
 

@@ -14,6 +14,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   const providers: ProviderConfig = {
     orcaApiKey: env.ORCAROUTER_API_KEY || env.ORCA_API_KEY || '',
     orcaModel: env.ORCAROUTER_MODEL || env.ORCA_MODEL || '',
+    orcaAssessmentModel: env.ORCAROUTER_ASSESSMENT_MODEL?.trim() || undefined,
     orcaSttModel: env.ORCAROUTER_STT_MODEL || '',
     tavilyApiKey: env.TAVILY_API_KEY || '',
     xBalancedTopics: env.X_BALANCED_TOPICS !== 'false',

@@ -1,5 +1,7 @@
 # 移動確認・検索語選択・指定人物の検索
 
+> 2026-09-23追記：通常単一タップの聞き直し／再開と毎回の同意確認UIは [仕様08](08_RESPECTFUL_QUESTIONS_AND_EXPLICIT_AUDIO_CONTROLS.md) で置き換える。出典移動のタップは音声操作として再処理しない。以下は当時の決定と、それ以外の継続する仕様。
+
 ## 要求
 
 2026-09-23のユーザー要求：[Issue #28](https://github.com/ima-work-git/ai-hack-agent/issues/28)。

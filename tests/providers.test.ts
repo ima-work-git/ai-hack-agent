@@ -95,6 +95,31 @@ describe('explicit assessment identity context', () => {
 });
 
 describe('bounded OrcaRouter adapter', () => {
+  it('routes only assessment to its optional model while preserving planning, STT and strict response validation', async () => {
+    const api = mockFetch(completion(plan), completion(assessment), completion({ text: '模擬の音声入力です。' }),
+      completion({ ...assessment, inventedFlag: true }),
+      completion({ ...assessment, cards: [{ factId: 'unknown-fact', suggestedQuestion: '木製の試作機、素材選びで大切にしたことは何ですか？' }] }));
+    const provider = createLiveProvider({ ...config, orcaAssessmentModel: 'assessment-only-model', orcaSttModel: 'audio-only-model' }, { fetch: api });
+    await provider.plan(input, signal());
+    await provider.assess(target, [], signal());
+    await provider.transcribe!(pcmToWav(new Uint8Array(320)), 'audio/wav', signal());
+    await expect(provider.assess(target, [], signal())).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    expect((await provider.assess(target, [], signal())).value.cards).toEqual([]);
+    expect(api.mock.calls.map(([, init]) => JSON.parse(String(init!.body)).model)).toEqual([
+      config.orcaModel, 'assessment-only-model', 'audio-only-model', 'assessment-only-model', 'assessment-only-model',
+    ]);
+    for (const [url, init] of api.mock.calls) {
+      expect(url).toBe('https://api.orcarouter.ai/v1/chat/completions');
+      expect(init).toMatchObject({ headers: { Authorization: `Bearer ${config.orcaApiKey}` }, redirect: 'error' });
+    }
+  });
+
+  it.each([undefined, '', '  '])('keeps the original assessment model when the optional override is %s', async orcaAssessmentModel => {
+    const api = mockFetch(completion(assessment));
+    await createLiveProvider({ ...config, orcaAssessmentModel }, { fetch: api }).assess(target, [], signal());
+    expect(JSON.parse(String(api.mock.calls[0]![1]!.body)).model).toBe(config.orcaModel);
+  });
+
   it('does not contact a provider with missing keys or model configuration', async () => {
     const api = mockFetch();
     const provider = createLiveProvider({ ...config, orcaApiKey: '' }, { fetch: api });

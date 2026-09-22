@@ -29,10 +29,10 @@ app.innerHTML = `
 <div class="field-row"><div><label for="mode">利用モード</label><select id="mode"><option value="demo">体験デモ</option><option value="live" id="live-option" disabled>実APIで調査</option></select></div><div id="scenario-field"><label for="scenario">確認する場面</label><select id="scenario"><option value="normal">通常・自律的な追加調査</option><option value="ambiguous">同姓同名・候補を確認</option><option value="failure">検索障害・一部の根拠を表示</option><option value="no_evidence">根拠なし・推測せず終了</option></select></div></div>
 <label for="text">人物名（会社名は任意）、または会話の文字起こし</label><p class="muted">事前登録・入力は不要です。会話モードを開始すると、会話から人物を見つけ、会社名などの手がかりも使って調べます。</p><textarea id="text" maxlength="2000" placeholder="会話モードでは自動で文字が入ります。手入力もできます。" spellcheck="false"></textarea>
 <div class="controls"><button id="sample">架空の会話を入力</button><button id="connect">G2を接続</button></div>
-<label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。会話モードは音声をOpenAIへ逐次送信して認識し、OrcaRouterで調査します。音声は保存しません。短い録音は最大30秒です。</span></label>
+<p class="muted" id="audio-notice">会話相手への説明・同意は事前に済んでいる運用です。「会話モードを開始」で音声をOpenAIへ送信し、OrcaRouterで調査します。音声は保存しません。「中止」でいつでも停止できます。</p>
 <label for="microphone">使うマイク</label><select id="microphone"><option value="g2" ${conversationLaunch ? 'selected' : ''}>Even G2のマイク</option><option value="phone" ${conversationLaunch ? '' : 'selected'}>スマートフォンのマイク</option></select>
 <div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="retry-listening" disabled>聞き直す</button><button id="lock-person" disabled>この人物で固定</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
-<p class="muted" id="person-state" role="status">G2：1回タップで聞き直し・2回で人物固定。スクロールは移動確認。1回で進む・2回でそのまま。</p><div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><section id="search-panel" class="search-panel hidden" aria-label="検索キーワード"><h3>検索キーワード</h3><p id="current-search" role="status"></p><p class="muted">別候補を選ぶと、今の調査を止めてその語で調べ直します。候補は本人確認済みという意味ではありません。</p><div id="search-choices" class="candidates"></div></section><p class="status hidden" id="correction-hint" role="status"></p><div id="candidates" class="candidates"></div>
+<p class="muted" id="person-state" role="status">G2：下スクロールで出典、一覧の上スクロールで聞き直しを確認。1回で実行・2回で取消。通常の2回は人物固定。</p><div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><section id="search-panel" class="search-panel hidden" aria-label="検索キーワード"><h3>検索キーワード</h3><p id="current-search" role="status"></p><p class="muted">別候補を選ぶと、今の調査を止めてその語で調べ直します。候補は本人確認済みという意味ではありません。</p><div id="search-choices" class="candidates"></div></section><p class="status hidden" id="correction-hint" role="status"></p><div id="candidates" class="candidates"></div>
 </section><section class="panel"><div class="section-head"><h2>エージェントの判断</h2><span class="section-number">02 / PROCESS</span></div><p id="trace-empty" class="empty-trace">調査中の判断と復旧の記録がここに表示されます。</p><ol id="trace" class="trace" aria-label="調査の処理履歴"></ol><details><summary>実APIの設定状況</summary><p class="muted" id="configuration"></p><p class="muted">APIキーと費用上限はサーバー側で設定します。</p></details></section></div>
 <div><div class="section-head"><h2>調査結果と質問 · 4件一覧</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="4件の調査結果と質問"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="topic-board" id="card-board">${BOARD_MARKUP}</div><div class="hud-foot"><span id="hud-source">各カードを押すと原文・出典を表示</span><span id="hud-expiry">0 / 4件確認</span></div></section><nav class="card-nav" aria-label="出典詳細の選択"><button id="previous" aria-label="前の出典" disabled>← 前の出典</button><span id="card-count">0 / 0</span><button id="next" aria-label="次の出典" disabled>次の出典 →</button></nav>
 <div class="notice" id="result-note">体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。</div><div class="metrics"><div class="metric"><strong id="metric-time">—</strong><span>調査にかかった時間</span></div><div class="metric"><strong id="metric-calls">—</strong><span>AI / 検索 / 本文</span></div><div class="metric"><strong id="metric-cost">—</strong><span id="cost-label">実費は未計測</span></div></div><section class="panel evidence-panel" id="evidence-panel" tabindex="-1"><div class="section-head"><h2>情報の根拠</h2><span class="section-number">04 / EVIDENCE</span></div><p class="muted" id="source-empty">本文の引用・出典・取得時刻を、カードごとに確認できます。</p><div id="sources"></div></section></div></div></main>
@@ -52,6 +52,7 @@ type SourcePosition = { cardId: string; sourceId: string; excerpt: string; page:
 let sourcePosition: SourcePosition | null = null;
 let pendingNavigation: { page: number; position: SourcePosition | null; view: string } | null = null;
 let pendingSearchChoice: string | null = null;
+let pendingAudioAction: { action: 'retry' | 'restart'; view: string } | null = null;
 let searchCandidateIndex = -1;
 let searchCandidates: SearchCandidate[] = [];
 let currentSearch = '';
@@ -105,18 +106,18 @@ function refreshControls() {
   $('microphone').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning || microphoneConnecting);
   $('mode').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
   $('scenario').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
-  $('record').toggleAttribute('disabled', !recording && (microphoneConnecting || audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked));
-  $('conversation').toggleAttribute('disabled', microphoneConnecting || recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked);
+  $('record').toggleAttribute('disabled', !recording && (microphoneConnecting || audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live')));
+  $('conversation').toggleAttribute('disabled', microphoneConnecting || recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live'));
   $('retry-listening').toggleAttribute('disabled', !conversationRunning || !conversationId || resettingConversation);
   $('lock-person').toggleAttribute('disabled', !conversationRunning || resettingConversation || !hasCurrentCards() || !result?.target);
   $('lock-person').textContent = lockedPerson ? '固定を解除して聞き直す' : 'この人物で固定';
-  $('person-state').textContent = lockedPerson ? `${lockedPerson.personName}さんを固定中。聞き取りは継続。1回タップで解除・聞き直し。` : 'G2：1回タップで聞き直し・2回で人物固定。スクロールは移動確認。1回で進む・2回でそのまま。';
+  $('person-state').textContent = lockedPerson ? `${lockedPerson.personName}さんを固定中。聞き取りは継続。一覧で上スクロール→1回で解除・聞き直し。` : 'G2：下スクロールで出典、一覧の上スクロールで聞き直しを確認。1回で実行・2回で取消。通常の2回は人物固定。';
   renderSearchCandidates();
   $('conversation').textContent = voicePhase === 'error' ? '会話モードを再開' : '会話モードを開始';
   $('record').textContent = recording ? conversationRunning ? '会話モードを終了' : '録音を止めて調べる' : '音声で入力';
   if (voicePhase !== 'off') queueVoiceDisplay();
 }
-function newViewToken() { lockedPerson = null; sourcePage = -1; sourcePosition = null; pendingNavigation = null; pendingSearchChoice = null; viewToken = `${currentId}:${revision}`; glassesView = emptyGlassesView(); g2?.invalidateViews(viewToken); }
+function newViewToken() { lockedPerson = null; sourcePage = -1; sourcePosition = null; pendingNavigation = null; pendingSearchChoice = null; pendingAudioAction = null; viewToken = `${currentId}:${revision}`; glassesView = emptyGlassesView(); g2?.invalidateViews(viewToken); }
 // Count wide characters conservatively and preserve complete Unicode characters.
 function shortText(text: string, maximumWidth: number): string {
   const characters = Array.from(text.replace(/\s+/g, ' ').trim());
@@ -178,6 +179,12 @@ function pageAt(cards: Card[], position: SourcePosition | null): number {
 }
 function navigateGlassesSource(direction: 1 | -1) {
   const cards = result?.cards.filter(card => Date.parse(card.expiresAt) > Date.now()).slice(0, 4) ?? [];
+  if (direction === -1 && (voicePhase === 'error' || (sourcePage < 0 && conversationRunning))) {
+    pendingNavigation = null; pendingSearchChoice = null;
+    pendingAudioAction = { action: conversationRunning ? 'retry' : 'restart', view: viewToken };
+    void renderGlassesView(); return;
+  }
+  pendingAudioAction = null;
   if (!cards.length && searchCandidates.length && conversationRunning && !choosingSearch) {
     searchCandidateIndex = (searchCandidateIndex + direction + searchCandidates.length) % searchCandidates.length;
     pendingSearchChoice = searchCandidates[searchCandidateIndex]!.id;
@@ -194,6 +201,17 @@ function navigateGlassesSource(direction: 1 | -1) {
   void renderGlassesView();
 }
 function settleNavigation(accept: boolean): boolean {
+  if (pendingAudioAction) {
+    const choice = pendingAudioAction; pendingAudioAction = null;
+    if (accept && choice.view === viewToken && token && !document.hidden && !pageLeaving) {
+      if (choice.action === 'retry' && conversationRunning) { void retryConversation(); return true; }
+      if (choice.action === 'restart' && voicePhase === 'error' && !conversationRunning) { void startConversation(); return true; }
+    }
+    if (hasCurrentCards()) renderCard();
+    else if (conversationRunning && searchCandidates.length) renderSearchView();
+    else void renderGlassesView();
+    return true;
+  }
   if (pendingSearchChoice) {
     const id = pendingSearchChoice; pendingSearchChoice = null;
     if (accept) void chooseSearchCandidate(id); else if (hasCurrentCards()) renderCard(); else renderSearchView();
@@ -255,7 +273,7 @@ function renderBoard(cards: Card[]) {
   }
 }
 function clearResult(preserveSelection = false) {
-  if (!preserveSelection) { lockedPerson = null; sourcePage = -1; sourcePosition = null; pendingNavigation = null; }
+  if (!preserveSelection) { lockedPerson = null; sourcePage = -1; sourcePosition = null; pendingNavigation = null; pendingAudioAction = null; }
   result = null; cardIndex = 0;
   $('candidates').replaceChildren(); $('sources').replaceChildren(); $('source-empty').classList.remove('hidden');
   renderBoard([]);
@@ -283,7 +301,8 @@ async function renderGlassesView() {
     }
     footer = shortText(footer, 46);
   }
-  if (pendingNavigation) footer = `${pendingNavigation.page === -1 ? '一覧に戻る' : '出典へ進む'}？ 1回=進む 2回=そのまま`;
+  if (pendingAudioAction) footer = `${pendingAudioAction.action === 'retry' ? '人物を聞き直す' : '音声を再開する'}？ 1回=実行 2回=そのまま`;
+  else if (pendingNavigation) footer = `${pendingNavigation.page === -1 ? '一覧に戻る' : '出典へ進む'}？ 1回=進む 2回=そのまま`;
   else if (pendingSearchChoice) footer = '候補を選ぶ？ 1回=選ぶ 2回=そのまま';
   await g2.render({ ...glassesView, footer }, viewToken);
 }
@@ -310,8 +329,8 @@ function reportVoiceError(message: string) {
     : /応答.*検証|応答.*確認/.test(message) ? '音声API応答エラー・再開してください'
     : /サービス|音声認識/.test(message) ? '音声API接続失敗・再開してください'
     : '音声接続切れ・再開してください';
-  setVoicePhase('error'); status(`${message} G2は1回タップ、スマホは「会話モードを再開」で再開できます。`, true);
-  void sendView('音声を再開できます', 'G2は1回タップで再開\nスマホは「会話モードを再開」', voiceErrorLabel); refreshControls();
+  setVoicePhase('error'); status(`${message} G2は上スクロールで再開確認→1回タップ、スマホは「会話モードを再開」で再開できます。`, true);
+  void sendView('音声を再開できます', 'G2は上スクロール→1回タップで再開\nスマホは「会話モードを再開」', voiceErrorLabel); refreshControls();
 }
 function renderCard() {
   const cards = result?.cards.filter(c => Date.parse(c.expiresAt) > Date.now()).slice(0, 4) || [];
@@ -377,7 +396,7 @@ function renderCard() {
     return entry ? `${index + 1}${label ? ` ${label}` : ''} 事実:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')}\n推奨質問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事実:未確認\n推奨質問:—`;
   });
   refreshControls();
-  if (pendingNavigation || pendingSearchChoice) { void renderGlassesView(); return; }
+  if (pendingNavigation || pendingSearchChoice || pendingAudioAction) { void renderGlassesView(); return; }
   if (sourcePosition) sourcePage = pageAt(cards, sourcePosition);
   if (sourcePage >= 0) {
     const pages = cards.flatMap((entry, index) => {
@@ -391,7 +410,7 @@ function renderCard() {
     return;
   }
   sourcePosition = null;
-  void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${lockedPerson ? '固定 ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件${isProgressive(result) ? ' 速報・追加調査中' : ''}`, rows.join('\n\n'), 'スクロールで移動確認 / 1回=再認識 2回=固定');
+  void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${lockedPerson ? '固定 ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件${isProgressive(result) ? ' 速報・追加調査中' : ''}`, rows.join('\n\n'), '下=出典確認 上=聞き直し確認 / 2回=固定');
 }
 function addTrace(event: TraceEvent) {
   if (event.search) {
@@ -411,7 +430,7 @@ function showResult(value: ResearchResult) {
     preserveCurrentCards({ code: value.reasonCode, message: value.message }); return;
   }
   if (lockedPerson && value.cards.length && value.target && (value.target.personName !== lockedPerson.personName || value.target.companyName !== lockedPerson.companyName)) {
-    status('固定した人物と異なる調査結果は表示しません。変更するには1回タップで聞き直してください。'); return;
+    status('固定した人物と異なる調査結果は表示しません。変更は一覧の上スクロールから聞き直してください。'); return;
   }
   if (!value.cards.length) lockedPerson = null;
   clearResult(true); result = value;
@@ -455,12 +474,11 @@ const json = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Cont
 function acceptSession(data: { token: string; revision: number; expiresAt: number; hasPrevious: boolean; interrupted: boolean }) {
   token = data.token; revision = data.revision; expiresAt = data.expiresAt;
   $<HTMLInputElement>('access-code').value = ''; $('login').classList.add('hidden'); $('workspace').classList.remove('hidden');
-  $<HTMLInputElement>('consent').checked = false;
   $('resume-notice').classList.toggle('hidden', !data.hasPrevious && !data.interrupted);
   if (data.interrupted) status('前の調査が中断されました。マイクは停止しています。必要なら再調査してください。');
   if (conversationLaunch && runtimeStatus.liveEnabled) {
     $<HTMLSelectElement>('mode').value = 'live'; $('mode').dispatchEvent(new Event('change'));
-    status('人物・会社の入力は不要です。同意を確認して「会話モードを開始」を押してください。');
+    status('人物・会社の入力は不要です。「会話モードを開始」を押してください。');
     if (!connected) void connectGlasses();
   }
   refreshControls();
@@ -516,7 +534,7 @@ function clearConversation() {
   $('correction-hint').textContent = ''; $('correction-hint').classList.add('hidden');
   clearResult(); lastInput = null; $<HTMLTextAreaElement>('text').value = '';
   $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
-  $('resume-notice').classList.add('hidden'); $<HTMLInputElement>('consent').checked = false;
+  $('resume-notice').classList.add('hidden');
 }
 async function expireSession() {
   const generation = ++authGeneration; expiresAt = 0;
@@ -602,11 +620,12 @@ function acceptAudio(chunk: Uint8Array) {
 g2 = new G2Runtime({ onStatus: g2Status, onAudio: acceptAudio, onAction: action => {
   if (action === 'next') navigateGlassesSource(1);
   else if (action === 'previous') navigateGlassesSource(-1);
-  else if (action === 'retry') {
+  else if (action === 'primary') {
     if (settleNavigation(true)) return;
-    if (conversationRunning) void retryConversation();
-    else if (voicePhase === 'error' && token && !document.hidden && !pageLeaving) void startConversation();
-  } else if (action === 'lock') { if (!settleNavigation(false)) lockCurrentPerson(); }
+    // A late or duplicate navigation tap must never become an audio reset.
+    if (hasCurrentCards() && voicePhase !== 'error') navigateGlassesSource(1);
+    else status('聞き直すには上スクロールで確認を表示し、1回タップしてください。');
+  } else if (action === 'secondary') { if (!settleNavigation(false)) lockCurrentPerson(); }
   else if (action === 'exit') void cancel();
 } });
 function lockCurrentPerson() {
@@ -616,12 +635,12 @@ function lockCurrentPerson() {
   // identification response that was already in flight when the user locked.
   conversationSubjectGeneration++; transcriptDrainId++; identifyingTranscript = false;
   pendingTranscript = null; identifyController?.abort(); identifyController = null; identifyingRequest = null; audioBusy = false;
-  status(`${lockedPerson.personName}さんを固定しました。聞き取りは続けます。変更は1回タップで聞き直してください。`);
+  status(`${lockedPerson.personName}さんを固定しました。聞き取りは続けます。変更は一覧の上スクロールから聞き直してください。`);
   renderCard(); refreshControls();
 }
 const phone = new PhoneAudio({ onAudio: acceptAudio, onStopped: reason => { if (recording && audioSource === 'phone') { if (conversationRunning) void cancel(); else void stopRecording(reason !== 'error'); } }, onError: message => status(message, true) });
 function abortConversation() {
-  pendingNavigation = null; pendingSearchChoice = null;
+  pendingNavigation = null; pendingSearchChoice = null; pendingAudioAction = null;
   choosingSearch = false;
   lockedPerson = null;
   const wasActive = conversationRunning;
@@ -690,7 +709,7 @@ async function waitForNextUtterance(error: unknown) {
 async function processConversationTranscript(text: string, generation: number) {
   const subjectGeneration = conversationSubjectGeneration;
   const own = new AbortController();
-  const valid = () => !own.signal.aborted && subjectGeneration === conversationSubjectGeneration && !resettingConversation && !choosingSearch && !lockedPerson && generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
+  const valid = () => !own.signal.aborted && subjectGeneration === conversationSubjectGeneration && !resettingConversation && !choosingSearch && !lockedPerson && generation === audioGeneration && conversationRunning && !!token && !document.hidden ;
   if (!valid()) return;
   const id = crypto.randomUUID(); const identifyRevision = revision + 1;
   identifyController = own; identifyingRequest = { requestId: id, subjectRevision: identifyRevision }; audioBusy = true; refreshControls();
@@ -752,7 +771,7 @@ async function drainTranscripts(generation: number) {
   } finally { if (drainId === transcriptDrainId) { identifyingTranscript = false; if (pendingTranscript && conversationRunning && !resettingConversation) void drainTranscripts(audioGeneration); } }
 }
 async function keepConversationAlive() {
-  if (!conversationRunning || !conversationId || !token || document.hidden || pageLeaving || !$<HTMLInputElement>('consent').checked || keepaliveController) return;
+  if (!conversationRunning || !conversationId || !token || document.hidden || pageLeaving || keepaliveController) return;
   const group = conversationId; const generation = audioGeneration; const expectedToken = token;
   const own = new AbortController(); keepaliveController = own;
   const timeout = setTimeout(() => own.abort(), 8_000);
@@ -801,7 +820,7 @@ async function retryConversation() {
   }
 }
 async function chooseSearchCandidate(choiceId: string) {
-  if (choosingSearch || resettingConversation || !conversationRunning || !conversationId || !token || document.hidden || pageLeaving || !$<HTMLInputElement>('consent').checked) return;
+  if (choosingSearch || resettingConversation || !conversationRunning || !conversationId || !token || document.hidden || pageLeaving) return;
   const choice = searchCandidates.find(candidate => candidate.id === choiceId); if (!choice) return;
   const group = conversationId; const generation = audioGeneration; const subjectGeneration = ++conversationSubjectGeneration;
   choosingSearch = true; resettingConversation = true; transcriptDrainId++; identifyingTranscript = false;
@@ -840,7 +859,7 @@ async function startConversation() {
     if (generation !== audioGeneration || !token || document.hidden || pageLeaving) return;
     return startConversation();
   }
-  if (!runtimeStatus.streamingEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || recording || audioBusy || conversationRunning || microphoneConnecting) return;
+  if (!runtimeStatus.streamingEnabled || $<HTMLSelectElement>('mode').value !== 'live' || running || recording || audioBusy || conversationRunning || microphoneConnecting) return;
   if ($<HTMLSelectElement>('microphone').value === 'g2' && !connected) { if (await prepareGlassesMicrophone()) void startConversation(); return; }
   clearSearch();
   const generation = ++audioGeneration; conversationRunning = true; recording = true;
@@ -872,7 +891,7 @@ async function startConversation() {
   });
   conversation = stream;
   const valid = () => generation === audioGeneration && conversationRunning && recording && conversation === stream
-    && !!token && !document.hidden && !pageLeaving && $<HTMLInputElement>('consent').checked;
+    && !!token && !document.hidden && !pageLeaving;
   status('音声認識を準備しています。準備完了後に話してください。'); refreshControls();
   try {
     const setup = api('/api/conversation', json({})).then(response => response.json()); void setup.catch(() => {});
@@ -899,7 +918,7 @@ async function startConversation() {
   } catch (error) { if (generation === audioGeneration) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話モードを開始できませんでした。'); } }
 }
 async function startRecording() {
-  if (!runtimeStatus.sttEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || audioBusy || microphoneConnecting) return;
+  if (!runtimeStatus.sttEnabled || $<HTMLSelectElement>('mode').value !== 'live' || running || audioBusy || microphoneConnecting) return;
   if ($<HTMLSelectElement>('microphone').value === 'g2' && !connected) { if (await prepareGlassesMicrophone()) void startRecording(); return; }
   setVoicePhase('off');
   const generation = ++audioGeneration;
@@ -924,7 +943,7 @@ async function stopRecording(transcribe: boolean) {
   const generation = audioGeneration;
   recording = false; audioBusy = true; clearTimeout(audioTimer);
   const chunks = audioChunks; audioChunks = []; audioBytes = 0; const id = currentId;
-  const valid = () => generation === audioGeneration && id === currentId && !!token && !document.hidden && $<HTMLInputElement>('consent').checked;
+  const valid = () => generation === audioGeneration && id === currentId && !!token && !document.hidden;
   refreshControls();
   await (audioSource === 'g2' ? g2.stopAudio() : phone.stop());
   const canTranscribe = valid();
@@ -948,7 +967,7 @@ $('sample').onclick = () => { $<HTMLTextAreaElement>('text').value = DEMO_TEXT; 
 $('research').onclick = () => { void research(); }; $('cancel').onclick = () => { void cancel(); };
 $('previous').onclick = () => { cardIndex--; renderCard(); }; $('next').onclick = () => { cardIndex++; renderCard(); };
 async function connectGlasses() {
-  const ok = await g2.connect({ header: 'これで誰でも雑談マスター', content: '登録は不要です。スマートフォンで同意を確認し、会話モードを開始してください。', footer: 'マイクは停止中' }, viewToken);
+  const ok = await g2.connect({ header: 'これで誰でも雑談マスター', content: '登録は不要です。スマートフォンで会話モードを開始してください。', footer: 'マイクは停止中' }, viewToken);
   if (ok) $<HTMLSelectElement>('microphone').value = 'g2';
   if (!ok) status('Evenアプリからこの画面を開いて接続してください。通常のブラウザーではプレビューを利用できます。');
   return ok;
@@ -963,7 +982,6 @@ async function prepareGlassesMicrophone() {
   } finally { microphoneConnecting = false; refreshControls(); }
 }
 $('connect').onclick = () => { void connectGlasses(); };
-$('consent').onchange = () => { if (!$<HTMLInputElement>('consent').checked) void stopRecording(false); refreshControls(); };
 $('conversation').onclick = () => { void startConversation(); };
 $('retry-listening').onclick = () => { void retryConversation(); };
 $('lock-person').onclick = () => { if (lockedPerson) void retryConversation(); else lockCurrentPerson(); };

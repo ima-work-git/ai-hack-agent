@@ -18,7 +18,8 @@ export interface GlassesView {
   footer: string
 }
 
-export type G2Action = 'primary' | 'retry' | 'lock' | 'previous' | 'next' | 'exit'
+/** Physical gestures only. The current UI confirmation chooses their meaning. */
+export type G2Action = 'primary' | 'secondary' | 'previous' | 'next' | 'exit'
 export type G2State = 'idle' | 'connecting' | 'connected' | 'recording' | 'background'
   | 'disconnected' | 'unavailable' | 'error' | 'disposed'
 export interface G2Status { state: G2State; reason?: string }
@@ -72,6 +73,9 @@ const SAFE_VIEW: GlassesView = {
 // not specify their relative delivery order or gesture timing. This is the
 // app's coalescing window, not a claimed hardware double-tap threshold.
 const SINGLE_TAP_DELAY_MS = 500
+// A gesture may arrive through both sysEvent and textEvent. There is no native
+// gesture ID/timestamp, so suppress a bounded tail after either accepted tap.
+const TAP_DUPLICATE_GUARD_MS = 500
 
 class BridgeTimeout extends Error {}
 
@@ -117,7 +121,7 @@ export class G2Runtime {
   private lastImageContent: string | null = null
   private lastText: Partial<GlassesView> = {}
   private singleTapTimer: ReturnType<typeof setTimeout> | null = null
-  private singleTapBlockedUntil = 0
+  private tapBlockedUntil = 0
 
   constructor(private readonly options: G2RuntimeOptions = {}) {
     this.timeoutMs = Number.isFinite(options.timeoutMs)
@@ -318,9 +322,9 @@ export class G2Runtime {
     if (!this.usable()) return
     if (eventTypes.includes(OsEventTypeList.DOUBLE_CLICK_EVENT)) {
       this.cancelSingleTap()
-      if (Date.now() >= this.singleTapBlockedUntil) {
-        this.singleTapBlockedUntil = Date.now() + SINGLE_TAP_DELAY_MS
-        this.action('lock')
+      if (Date.now() >= this.tapBlockedUntil) {
+        this.tapBlockedUntil = Date.now() + TAP_DUPLICATE_GUARD_MS
+        this.action('secondary')
       }
       return
     }
@@ -347,13 +351,18 @@ export class G2Runtime {
   }
 
   private deferSingleTap(): void {
-    if (Date.now() < this.singleTapBlockedUntil) return
+    if (Date.now() < this.tapBlockedUntil) return
     this.cancelSingleTap()
     const version = this.connectionVersion
     const epoch = this.viewEpoch
     this.singleTapTimer = setTimeout(() => {
       this.singleTapTimer = null
-      if (this.usable() && version === this.connectionVersion && epoch === this.viewEpoch) this.action('retry')
+      if (this.usable() && version === this.connectionVersion && epoch === this.viewEpoch) {
+        // Set the guard before the callback: it may synchronously change the
+        // displayed page or subject, then receive a trailing sibling event.
+        this.tapBlockedUntil = Date.now() + TAP_DUPLICATE_GUARD_MS
+        this.action('primary')
+      }
     }, SINGLE_TAP_DELAY_MS)
   }
 
