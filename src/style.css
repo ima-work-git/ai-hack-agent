@@ -8,3 +8,5 @@
 /* Separate the four suggestions and keep selectable search terms readable. */
 .topic-board{row-gap:24px}.topic-caption{white-space:nowrap}.search-panel{margin:16px 0;padding:14px;border:1px solid #ccd8c9;border-radius:8px;background:#f1f5ed}.search-panel p,.search-panel button{overflow-wrap:anywhere}.search-panel h3{font-size:14px}.search-panel .candidates button{line-height:1.65;padding:10px}
 @media(max-width:480px){.topic-board{row-gap:22px}.topic-row{display:block}.topic-caption{display:block;margin-bottom:3px}}
+
+.people-panel{margin-bottom:22px}.people-list{list-style:none;padding:0;margin:12px 0;max-height:330px;overflow:auto}.people-list li{margin:0 0 8px}.people-list button{display:block;width:100%;text-align:left;font-size:13px;line-height:1.7;overflow-wrap:anywhere}.people-list button.selected{background:#e6efdf;border-color:#547b56}.people-panel .controls{margin-top:10px}

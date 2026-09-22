@@ -176,6 +176,164 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals();
   });
 
+
+  describe('recognized-person history navigation', () => {
+    const names = ['架空参加者あ', '架空参加者い', '架空参加者う', '架空参加者え', '架空参加者お', '架空参加者か'];
+    const target = (name: string) => ({ personName: name, companyName: '架空会社' });
+    const view = () => devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    const people = () => [...element('people-list').querySelectorAll<HTMLButtonElement>('button')];
+    function namedResult(input: ResearchInput, name: string): ResearchResult {
+      const value = fourCardResult(input, name, 'COMPLETE'); value.target = target(name); return value;
+    }
+    function fixtures() {
+      routes.set('/api/conversation/identify', async init => {
+        const text = (JSON.parse(String(init.body)) as { text: string }).text;
+        return jsonResponse({ text, targets: names.filter(name => text.includes(name)).map(target), hasPersonMention: true });
+      });
+      routes.set('/api/research', async init => {
+        const input = JSON.parse(String(init.body)) as ResearchInput;
+        const name = names.find(name => input.text.includes(name))!;
+        return new Response(`${JSON.stringify({ type: 'result', result: namedResult(input, name) })}\n`, { headers: { 'Content-Type': 'application/x-ndjson' } });
+      });
+    }
+    async function start() { fixtures(); await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush(); }
+    async function say(index: number, item = `speech-${index}`) { devices.streaming!.options.onFinal(item, names[index]!); await flush(); }
+    async function action(value: 'primary' | 'secondary' | 'next' | 'previous') { devices.g2!.options.onAction?.(value); await flush(); }
+
+    it('appends in recognition order and keeps selected questions and excerpts while other people arrive, with no extra search or ASR reset', async () => {
+      await start(); const voice = devices.streaming!;
+      await say(0); await say(1); await say(1, 'repeated');
+      expect(people()).toHaveLength(2); expect(people()[0]!.textContent).toContain(names[0]); expect(people()[1]!.textContent).toContain(names[1]);
+      expect(requests('/api/research')).toHaveLength(2);
+      people()[0]!.click(); await flush();
+      expect(element('hud-target').textContent).toBe(names[0]); expect(element('sources').textContent).toContain(names[0]);
+      await action('next'); expect(view().footer).toContain('出典へ進む？');
+      await say(2); expect(view().footer).toContain('出典へ進む？');
+      await action('secondary'); expect(view().header).toContain(names[0]);
+      expect(people()).toHaveLength(3); expect(view().header).toContain(names[0]); expect(view().content).not.toContain(names[2]);
+      await action('next'); await action('primary'); const excerpt = view().content;
+      expect(view().header).toContain('該当文');
+      await say(3);
+      expect(view().header).toContain('該当文'); expect(view().content).toBe(excerpt); expect(element('sources').textContent).toContain(names[0]);
+      expect(requests('/api/research')).toHaveLength(4); expect(requests('/api/conversation/reset')).toHaveLength(0);
+      expect(voice.cancel).not.toHaveBeenCalled(); expect(devices.g2!.startAudio).toHaveBeenCalledOnce(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+      click('show-latest'); await flush(); expect(view().header).toContain(names[3]);
+    });
+
+    it('pages through the person list, preserves focus on new arrivals, opens with one tap and returns source → questions → list with double taps', async () => {
+      await start(); for (let index = 0; index < 5; index++) await say(index);
+      await action('secondary'); expect(view().header).toBe('認識した人物 1/5');
+      expect(view().content).toContain(names[0]); expect(view().content).not.toContain(names[4]);
+      await action('previous'); expect(view().header).toBe('認識した人物 1/5');
+      for (let index = 0; index < 4; index++) await action('next');
+      expect(view().header).toBe('認識した人物 5/5'); expect(view().content).toContain(names[4]);
+      await say(5); expect(view().header).toBe('認識した人物 5/6');
+      await action('secondary'); expect(view().header).toBe('認識した人物 5/6');
+      await action('primary'); expect(view().header).toContain(names[4]);
+      await action('next'); expect(view().footer).toContain('出典へ進む？');
+      await action('secondary'); expect(view().header).toContain(names[4]); expect(view().header).not.toContain('認識した人物');
+      await action('next'); await action('primary'); expect(view().header).toContain('該当文');
+      await action('secondary'); expect(view().header).toContain(names[4]); expect(view().header).not.toContain('該当文');
+      await action('previous'); expect(view().footer).toContain('人物を聞き直す？');
+      await action('secondary'); expect(view().header).toContain(names[4]);
+      await action('secondary'); expect(view().header).toBe('認識した人物 5/6');
+      expect(requests('/api/conversation/reset')).toHaveLength(0); expect(requests('/api/research')).toHaveLength(6);
+      expect(devices.streaming!.cancel).not.toHaveBeenCalled();
+    });
+
+    it('lists every extracted ambiguous person without invented questions or launching research on selection', async () => {
+      await start(); devices.streaming!.options.onFinal('both', `${names[0]}と${names[1]}`); await flush();
+      expect(people()).toHaveLength(2); expect(people()[0]!.textContent).toContain('未確認'); expect(requests('/api/research')).toHaveLength(0);
+      people()[1]!.click(); await flush(); expect(element('hud-target').textContent).toBe(names[1]);
+      expect(element('sources').textContent).toBe(''); expect(element('card-board').querySelectorAll('.topic-card:not(.empty)')).toHaveLength(0);
+      expect(view().content).toContain('未確認'); expect(view().header).toBe(names[1]);
+      await action('secondary'); await action('primary'); expect(view().header).toBe(names[1]);
+      expect(requests('/api/research')).toHaveLength(0); expect(requests('/api/conversation/reset')).toHaveLength(0);
+    });
+
+    it('does not select the latest search candidates from an unconfirmed historical person', async () => {
+      await start(); devices.streaming!.options.onFinal('both', `${names[0]}と${names[1]}`); await flush();
+      people()[0]!.click(); await flush();
+      const choices = [{ id: 'latest-candidate', label: '別の候補', query: names[2], target: target(names[2]!) }];
+      routes.set('/api/conversation/identify', async () => jsonResponse({ text: names[2], targets: [], hasPersonMention: true, searchCandidates: choices }));
+      await say(2); await action('next'); await action('primary');
+      expect(view().header).toBe(names[0]); expect(view().footer).not.toContain('候補を選ぶ');
+      expect(requests('/api/conversation/search-choice')).toHaveLength(0); expect(requests('/api/research')).toHaveLength(0);
+    });
+
+    it('keeps the list visible during progressive updates and opens the selected person’s final snapshot', async () => {
+      await start(); const streams = openResearchStreams(); await say(0);
+      await action('secondary'); expect(view().header).toContain('認識した人物');
+      pushResearchEvent(streams[0]!.body, { type: 'update', result: namedResult(streams[0]!.input, names[0]!) }); await flush();
+      expect(view().header).toContain('認識した人物'); expect(view().content).toContain('質問あり');
+      const final = namedResult(streams[0]!.input, names[0]!); final.cards[0]!.fact = '追加確認した架空の事実です。'; final.cards[0]!.excerpt = final.cards[0]!.fact;
+      pushResearchEvent(streams[0]!.body, { type: 'result', result: final }); streams[0]!.body.close(); await flush();
+      expect(view().header).toContain('認識した人物'); await action('primary'); expect(element('fact').textContent).toBe(final.cards[0]!.fact);
+    });
+
+    it('does not label a historical person as fixed or save a rejected mismatched result while another person is locked', async () => {
+      await start(); await say(0); const streams = openResearchStreams(); await say(1);
+      const work = streams[0]!; pushResearchEvent(work.body, { type: 'update', result: namedResult(work.input, names[1]!) }); await flush();
+      click('lock-person'); await flush(); expect(element('hud-target').textContent).toContain('固定：');
+      people()[0]!.click(); await flush(); expect(element('hud-target').textContent).toBe(names[0]); expect(view().header).not.toContain('固定');
+      expect(element<HTMLButtonElement>('lock-person').disabled).toBe(true);
+      pushResearchEvent(work.body, { type: 'result', result: namedResult(work.input, names[2]!) }); work.body.close(); await flush();
+      expect(people()).toHaveLength(2); expect(element('people-list').textContent).not.toContain(names[2]); expect(view().header).toContain(names[0]);
+      click('show-latest'); await flush(); expect(element('hud-target').textContent).toBe(`固定：${names[1]}`);
+    });
+
+    it('discards expired card content and pending source navigation while retaining the unconfirmed person entry', async () => {
+      await start(); await say(0); people()[0]!.click(); await flush(); await action('next'); await action('primary');
+      expect(view().header).toContain('該当文'); await action('next');
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(people()).toHaveLength(1); expect(people()[0]!.textContent).toContain('有効な質問なし');
+      expect(element('sources').textContent).toBe(''); expect(element('card-board').textContent).not.toContain(names[0]);
+      expect(view().header).toBe(names[0]); expect(view().footer).not.toContain('出典へ進む？');
+      await action('primary'); expect(view().header).not.toContain('該当文');
+    });
+
+    it('removes a selected person at the fixed retention deadline without leaving stale question or source DOM', async () => {
+      await start();
+      routes.set('/api/research', async init => {
+        const value = namedResult(JSON.parse(String(init.body)) as ResearchInput, names[0]!);
+        for (const card of value.cards) card.expiresAt = new Date(Date.now() + 1_800_000).toISOString();
+        return new Response(`${JSON.stringify({ type: 'result', result: value })}\n`);
+      });
+      await say(0); people()[0]!.click(); await flush(); expect(element('sources').textContent).toContain(names[0]);
+      await vi.advanceTimersByTimeAsync(900_000);
+      expect(people()).toHaveLength(0); expect(view().header).toContain('認識した人物 0/0');
+      expect(element('sources').textContent).toBe(''); expect(element('card-board').textContent).not.toContain(names[0]);
+      expect(devices.streaming!.cancel).not.toHaveBeenCalled();
+    });
+
+    it.each(['cancel', 'background', 'pagehide', 'end', 'g2-background', 'g2-disconnected', 'g2-error', 'auth-expired', 'asr-error'] as const)('clears selected history on %s and rejects late identification and research', async stop => {
+      await start(); await say(0); people()[0]!.click(); await flush();
+      const streams = openResearchStreams(); await say(1);
+      const delayed = deferred<Response>(); routes.set('/api/conversation/identify', () => delayed.promise);
+      await say(2); const oldVoice = devices.streaming!;
+      if (stop === 'background') { vi.spyOn(document, 'hidden', 'get').mockReturnValue(true); document.dispatchEvent(new Event('visibilitychange')); }
+      else if (stop === 'pagehide') window.dispatchEvent(new Event('pagehide'));
+      else if (stop.startsWith('g2-')) devices.g2!.options.onStatus?.({ state: stop === 'g2-background' ? 'background' : stop === 'g2-error' ? 'error' : 'disconnected' });
+      else if (stop === 'asr-error') oldVoice.options.onError(new Error('音声の接続が切れました。'));
+      else if (stop === 'auth-expired') { routes.set('/api/conversation/keepalive', async () => new Response('{}', { status: 401 })); await vi.advanceTimersByTimeAsync(60_000); }
+      else click(stop);
+      await flush();
+      delayed.resolve(jsonResponse({ text: names[2], targets: [target(names[2]!)], hasPersonMention: true }));
+      pushResearchEvent(streams[0]!.body, { type: 'result', result: namedResult(streams[0]!.input, names[1]!) }); streams[0]!.body.close();
+      oldVoice.options.onFinal('too-late', names[3]!); await flush();
+      expect(people()).toHaveLength(0); expect(element('sources').textContent).toBe(''); expect(element('card-board').textContent).not.toContain(names[0]);
+    });
+
+    it.each(['background', 'disconnected'] as const)('clears history and rejects late identification when G2 becomes %s while using the phone microphone', async state => {
+      await start(); click('cancel'); await flush(); element<HTMLSelectElement>('microphone').value = 'phone'; click('conversation'); await flush();
+      await say(0); people()[0]!.click(); await flush();
+      const delayed = deferred<Response>(); routes.set('/api/conversation/identify', () => delayed.promise); await say(1);
+      devices.g2!.options.onStatus?.({ state }); await flush();
+      delayed.resolve(jsonResponse({ text: names[1], targets: [target(names[1]!)], hasPersonMention: true })); await flush();
+      expect(people()).toHaveLength(0); expect(element('sources').textContent).toBe(''); expect(devices.phone!.recording).toBe(false);
+    });
+  });
+
   it('renders four verified updates on phone and G2 before the research stream closes, then replaces them with final cards', async () => {
     const streams = openResearchStreams();
     await boot(); chooseLive(); click('connect'); await flush();
@@ -779,11 +937,11 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('card-board').textContent).not.toContain('古い無効'); expect(stream.cancel).not.toHaveBeenCalled();
   });
 
-  it.each(['glasses-double', 'phone-button'] as const)('locks the current person using %s while ASR continues, and an explicit audio confirmation permits a fresh identity', async action => {
+  it('locks the current person using the phone button while ASR continues, and an explicit audio confirmation permits a fresh identity', async () => {
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!;
     stream.options.onFinal('first', '架空の検証参加者です'); await flush();
-    if (action === 'glasses-double') devices.g2!.options.onAction?.('secondary'); else click('lock-person');
+    click('lock-person');
     await flush();
     expect(element('person-state').textContent).toContain('架空の検証参加者さんを固定中');
     expect(element('hud-target').textContent).toContain('固定：');
@@ -809,7 +967,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     const delayed = deferred<Response>(); routes.set('/api/conversation/identify', () => delayed.promise);
     stream.options.onFinal('late', '次の別人の話です'); await flush();
     const pending = requests('/api/conversation/identify').at(-1)!;
-    devices.g2!.options.onAction?.('secondary'); await flush();
+    click('lock-person'); await flush();
     expect(pending.signal!.aborted).toBe(true); expect(streams[0]!.signal.aborted).toBe(false);
     delayed.resolve(jsonResponse({ text: '別人', targets: [{ personName: '別人', companyName: '' }], hasPersonMention: true })); await flush();
     pushResearchEvent(streams[0]!.body, { type: 'result', result: fourCardResult(streams[0]!.input, '追加確認', 'COMPLETE') }); streams[0]!.body.close(); await flush();
@@ -820,7 +978,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
 
   it('cannot lock an unverified target and clears the lock on session end', async () => {
     await boot(); chooseLive(); click('conversation'); await flush();
-    devices.g2!.options.onAction?.('secondary'); await flush();
+    click('lock-person'); await flush();
     expect(element('person-state').textContent).not.toContain('固定中');
     devices.streaming!.options.onFinal('first', '架空の検証参加者です'); await flush();
     click('lock-person'); await flush(); expect(element('person-state').textContent).toContain('固定中');
@@ -1398,7 +1556,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(view().header).toContain('該当文'); expect(view().content.replaceAll('\n', '')).toBe(FACT);
     expect(requests('/api/conversation/reset')).toHaveLength(0);
     devices.g2!.options.onAction?.('next'); await flush();
-    expect(view().content.replaceAll('\n', '')).toBe(FACT); expect(view().footer).toContain('一覧に戻る？');
+    expect(view().content.replaceAll('\n', '')).toBe(FACT); expect(view().footer).toContain('質問に戻る？');
     devices.g2!.options.onAction?.('primary'); await flush();
     expect(view().content).toBe(original);
   });
