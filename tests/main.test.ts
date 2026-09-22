@@ -121,6 +121,7 @@ async function recordPhone() {
   expect(devices.phone!.start).toHaveBeenCalledOnce();
   devices.phone!.options.onAudio(new Uint8Array([0, 0, 255, 127]));
 }
+async function selectLatestPerson() { click('show-latest'); await flush(); }
 async function confirmGlassesAudioAction() {
   devices.g2!.options.onAction?.('previous'); await flush();
   devices.g2!.options.onAction?.('primary'); await flush();
@@ -200,6 +201,62 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     async function say(index: number, item = `speech-${index}`) { devices.streaming!.options.onFinal(item, names[index]!); await flush(); }
     async function action(value: 'primary' | 'secondary' | 'next' | 'previous') { devices.g2!.options.onAction?.(value); await flush(); }
 
+    it('starts on an empty list and keeps recognition and results there until a person is explicitly selected', async () => {
+      await start(); const voice = devices.streaming!;
+      expect(view().header).toContain('認識した人物 0/0');
+      expect(people()).toHaveLength(0); expect(element('sources').children).toHaveLength(0);
+      expect(element('card-count').textContent).toBe('0 / 0');
+      await say(0); await say(1);
+      expect(people()).toHaveLength(2);
+      expect(view().header).toContain('認識した人物');
+      expect(view().content).toContain(names[0]); expect(view().content).toContain(names[1]);
+      expect(view().content).not.toContain('推奨質問:');
+      expect(element('sources').children).toHaveLength(0); expect(element('card-count').textContent).toBe('0 / 0');
+      const paid = requests('/api/research').length; const identifies = requests('/api/conversation/identify').length;
+      await action('next'); expect(view().content).toContain(`→ 2 ${names[1]}`);
+      await action('previous'); expect(view().content).toContain(`→ 1 ${names[0]}`);
+      await action('next'); await action('primary');
+      expect(view().header).toContain(names[1]); expect(element('hud-target').textContent).toBe(names[1]);
+      expect(view().content).toContain('推奨質問:');
+      await action('secondary'); expect(view().header).toContain('認識した人物');
+      expect(element('sources').children).toHaveLength(0); expect(element('card-count').textContent).toBe('0 / 0');
+      expect(requests('/api/research')).toHaveLength(paid); expect(requests('/api/conversation/identify')).toHaveLength(identifies);
+      await say(2);
+      expect(people()).toHaveLength(3); expect(view().header).toContain('認識した人物');
+      expect(element('sources').children).toHaveLength(0); expect(element('card-count').textContent).toBe('0 / 0');
+      expect(requests('/api/research')).toHaveLength(paid + 1);
+      expect(requests('/api/conversation/reset')).toHaveLength(0); expect(requests('/api/conversation')).toHaveLength(1);
+      expect(voice.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+      devices.g2!.options.onAudio?.(new Uint8Array([1, 2])); expect(voice.append).toHaveBeenCalled();
+    });
+
+    it('selects the latest person only on an explicit click and never follows the next recognized person', async () => {
+      await start(); await say(0); click('show-latest'); await flush();
+      expect(element('hud-target').textContent).toBe(names[0]);
+      await say(1);
+      expect(element('hud-target').textContent).toBe(names[0]); expect(view().header).toContain(names[0]);
+      click('show-latest'); await flush(); expect(element('hud-target').textContent).toBe(names[1]);
+      await say(2);
+      expect(element('hud-target').textContent).toBe(names[1]); expect(view().header).toContain(names[1]);
+      expect(requests('/api/research')).toHaveLength(3); expect(requests('/api/conversation/reset')).toHaveLength(0);
+      expect(devices.streaming!.cancel).not.toHaveBeenCalled();
+    });
+
+    it('keeps the selected person after an explicit audio retry until another person is selected', async () => {
+      await start(); await say(0); people()[0]!.click(); await flush();
+      const voice = devices.streaming!; const original = view().content;
+      await confirmGlassesAudioAction();
+      expect(requests('/api/conversation/reset')).toHaveLength(1);
+      expect(view().header).toContain(names[0]); expect(view().content).toBe(original);
+      await say(1);
+      expect(people()).toHaveLength(2); expect(requests('/api/research')).toHaveLength(2);
+      expect(view().header).toContain(names[0]); expect(view().content).toBe(original);
+      expect(element('hud-target').textContent).toBe(names[0]);
+      await selectLatestPerson(); expect(view().header).toContain(names[1]);
+      expect(requests('/api/research')).toHaveLength(2); expect(requests('/api/conversation')).toHaveLength(1);
+      expect(voice.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+    });
+
     it('appends in recognition order and keeps selected questions and excerpts while other people arrive, with no extra search or ASR reset', async () => {
       await start(); const voice = devices.streaming!;
       await say(0); await say(1); await say(1, 'repeated');
@@ -274,6 +331,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     it('does not label a historical person as fixed or save a rejected mismatched result while another person is locked', async () => {
       await start(); await say(0); const streams = openResearchStreams(); await say(1);
       const work = streams[0]!; pushResearchEvent(work.body, { type: 'update', result: namedResult(work.input, names[1]!) }); await flush();
+      await selectLatestPerson();
       click('lock-person'); await flush(); expect(element('hud-target').textContent).toContain('固定：');
       people()[0]!.click(); await flush(); expect(element('hud-target').textContent).toBe(names[0]); expect(view().header).not.toContain('固定');
       expect(element<HTMLButtonElement>('lock-person').disabled).toBe(true);
@@ -384,6 +442,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     devices.streaming!.options.onFinal('first', '架空の検証参加者'); await flush();
     const stream = streams[0]!;
     pushResearchEvent(stream.body, { type: 'update', result: fourCardResult(stream.input, '確かな話題', 'PROGRESSIVE_ENRICHING') }); await flush();
+    await selectLatestPerson();
     if (outcome === 'error-event') pushResearchEvent(stream.body, { type: 'error', code: 'PROVIDER_TIMEOUT', message: '追加調査が時間切れでした。' });
     if (outcome === 'failed-result') {
       const failed = researchResult(stream.input.requestId, stream.input.subjectRevision);
@@ -417,6 +476,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const voice = devices.streaming!; voice.options.onFinal('first', '架空の検証参加者'); await flush();
     const stream = streams[0]!; pushResearchEvent(stream.body, { type: 'update', result: fourCardResult(stream.input) }); await flush();
+    await selectLatestPerson();
     voice.options.onFinal('same', '架空の検証参加者'); await flush();
     routes.set('/api/conversation/identify', async () => jsonResponse({ text: '良い天気ですね', targets: [], hasPersonMention: false }));
     voice.options.onFinal('ordinary', '良い天気ですね'); await flush();
@@ -427,24 +487,28 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('fact').textContent).toBe('架空の最終1です。');
   });
 
-  it('switches to a new spoken person before enrichment finishes and rejects old updates and the old final result', async () => {
+  it('researches a new person before enrichment finishes, displays them only on selection, and rejects old updates and the old final result', async () => {
     const streams = openResearchStreams();
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const voice = devices.streaming!; voice.options.onFinal('first', '架空の検証参加者'); await flush();
     const first = streams[0]!; pushResearchEvent(first.body, { type: 'update', result: fourCardResult(first.input) }); await flush();
+    await selectLatestPerson();
     routes.set('/api/conversation/identify', async () => jsonResponse({ text: '別の架空人物です', targets: [{ personName: '別の架空人物', companyName: '' }], hasPersonMention: true }));
     voice.options.onFinal('new-person', '別の架空人物です'); await flush();
-    expect(streams).toHaveLength(2); expect(first.signal.aborted).toBe(true); expect(element('fact').textContent).toBe('未確認');
+    expect(streams).toHaveLength(2); expect(first.signal.aborted).toBe(true); expect(element('fact').textContent).toBe('架空の速報1です。');
     const next = streams[1]!;
     expect(next.input.subjectRevision).toBeGreaterThan(first.input.subjectRevision);
     expect(next.input.requestId).not.toBe(first.input.requestId);
-    pushResearchEvent(next.body, { type: 'update', result: fourCardResult(next.input, '次の人物') }); await flush();
+    const nextResult = fourCardResult(next.input, '次の人物'); nextResult.target = { personName: '別の架空人物', companyName: '' };
+    pushResearchEvent(next.body, { type: 'update', result: nextResult }); await flush();
+    expect(element('fact').textContent).toBe('架空の速報1です。');
+    await selectLatestPerson();
     devices.g2!.render.mockClear();
     pushResearchEvent(first.body, { type: 'update', result: fourCardResult(first.input, '以前の人物') });
     pushResearchEvent(first.body, { type: 'result', result: fourCardResult(first.input, '以前の人物', 'EVIDENCE_VERIFIED') }); first.body.close(); await flush();
     expect(element('fact').textContent).toBe('架空の次の人物1です。');
     expect(devices.g2!.render.mock.calls.some(([view]) => (view as GlassesView).content.includes('以前の人物'))).toBe(false);
-    pushResearchEvent(next.body, { type: 'result', result: fourCardResult(next.input, '次の人物', 'EVIDENCE_VERIFIED') }); next.body.close(); await flush();
+    pushResearchEvent(next.body, { type: 'result', result: { ...nextResult, reasonCode: 'EVIDENCE_VERIFIED' } }); next.body.close(); await flush();
     expect(devices.streaming!.cancel).not.toHaveBeenCalled();
   });
 
@@ -513,6 +577,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(requests('/api/conversation/identify')).toHaveLength(0);
     expect(requests('/api/research')).toHaveLength(0);
     stream.options.onFinal('first', text.text); await flush();
+    await selectLatestPerson();
     expect(requests('/api/transcribe')).toHaveLength(0);
     expect(requests('/api/conversation/identify')).toHaveLength(1);
     expect(requests('/api/research')).toHaveLength(1);
@@ -532,7 +597,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('card-board').textContent).toContain(FACT);
     text = { text: '別の会社の架空さんも参加します。', targets: [], hasPersonMention: true };
     stream.options.onFinal('other', text.text); await flush();
-    expect(element('card-board').textContent).not.toContain(FACT);
+    expect(element('card-board').textContent).toContain(FACT); // A selected person stays visible while another is unresolved.
     click('record'); await flush();
     expect(devices.phone!.recording).toBe(false);
     expect(stream.cancel).toHaveBeenCalledOnce();
@@ -556,6 +621,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLive(); click('conversation'); await flush();
     const stream = devices.streaming!;
     stream.options.onFinal('initial', '架空検証社の架空の検証参加者です。'); await flush();
+    await selectLatestPerson();
     expect(element('card-board').textContent).toContain('架空テスト資料1');
 
     for (const [index, [spoken, canonical]] of [
@@ -572,6 +638,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
       expect(researchInput.text).toContain('所属は未指定');
       expect(researchInput.text).not.toContain('会社名「');
       expect(researchInput.text).not.toContain('架空検証社');
+      await selectLatestPerson();
       expect(element('card-board').textContent).toContain(`架空テスト資料${index + 2}`);
     }
     const visibleCards = element('card-board').textContent;
@@ -588,12 +655,13 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!;
     const lastView = () => devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
-    expect(lastView().footer).toContain('G2 聞取中');
-    expect(lastView().footer).toContain('発話待ち');
+    expect(lastView().header).toContain('認識した人物 0/0');
+    expect(lastView().footer).toContain('聞取中');
     stream.options.onDelta('first', '架空検証社の');
     await vi.advanceTimersByTimeAsync(500);
     expect(lastView().footer).toContain('架空検証社の');
     stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
+    await selectLatestPerson();
     await vi.advanceTimersByTimeAsync(500);
     const board = lastView().content;
     expect(board.split('\n\n')).toHaveLength(4);
@@ -625,7 +693,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('conversation').textContent).toBe('会話モードを再開');
     expect(element<HTMLButtonElement>('conversation').disabled).toBe(false);
     click('conversation'); await flush();
-    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('G2 聞取中');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('聞取中');
   });
 
   it('waits for ASR readiness before starting the G2 microphone and clearly displays preparation', async () => {
@@ -642,7 +710,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(devices.g2!.startAudio).not.toHaveBeenCalled();
     ready.resolve(true); await flush();
     expect(devices.g2!.startAudio).toHaveBeenCalledExactlyOnceWith({ continuous: true });
-    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('G2 聞取中');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('聞取中');
     expect(element('status').textContent).toContain('ストリーミング認識中');
     devices.g2!.options.onStatus?.({ state: 'connected' }); await flush();
     expect(devices.streaming!.cancel).toHaveBeenCalledOnce();
@@ -711,7 +779,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     ready.resolve(true); await flush();
     expect(devices.g2!.startAudio).toHaveBeenCalledOnce(); expect(devices.g2!.stopAudio).toHaveBeenCalledTimes(stops);
     expect(current.cancel).not.toHaveBeenCalled();
-    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('G2 聞取中');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('聞取中');
   });
 
   it.each(['false', 'throw'] as const)('closes the ready ASR connection if the G2 microphone fails with %s', async failure => {
@@ -743,12 +811,13 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('card-board').textContent).not.toContain(FACT);
     expect(requests('/api/conversation/identify')).toHaveLength(1);
     (element('candidates').firstElementChild as HTMLButtonElement).click(); await flush();
+    await selectLatestPerson();
     expect(requests('/api/research')).toHaveLength(2);
     expect(JSON.parse(String(requests('/api/research')[1]!.body))).toMatchObject({ selectedCandidateId: 'candidate-a', conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab' });
     expect(element('card-board').textContent).toContain(FACT);
   });
 
-  it('shows an uncertain correction candidate on phone and glasses, then researches a named correction with its success hint', async () => {
+  it('keeps the list visible while showing an uncertain correction on the phone, then researches a named correction with its success hint', async () => {
     routes.set('/api/conversation/identify', async init => {
       const { text } = JSON.parse(String(init.body));
       return jsonResponse(text === '広行について' ? { text, targets: [], hasPersonMention: true, correctionHint: '聞き取った名前の候補です。まだ本人とは確認できていません。', correctionCandidate: { personName: 'ひろゆき', companyName: '' } }
@@ -759,10 +828,11 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     stream.options.onFinal('uncertain', '広行について'); await flush();
     expect(element('correction-hint').textContent).toContain('候補：ひろゆき');
     expect(element('correction-hint').textContent).toContain('まだ本人とは確認できていません');
-    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain('候補：ひろゆき');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).header).toContain('認識した人物');
     expect(element('card-board').textContent).not.toContain(FACT); expect(requests('/api/research')).toHaveLength(0);
     expect(stream.cancel).not.toHaveBeenCalled();
     stream.options.onFinal('corrected', 'ひろゆきです'); await flush();
+    await selectLatestPerson();
     expect(requests('/api/research')).toHaveLength(1);
     expect(JSON.parse(String(requests('/api/research')[0]!.body)).text).toContain('西村博之');
     expect(element('correction-hint').textContent).toContain('言い直した名前');
@@ -775,11 +845,13 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!; stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
     expect(element('status').textContent).toContain('聞き取りは続いています');
-    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain('調査サービスに接続できませんでした');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).header).toContain('認識した人物');
+    expect(element('status').textContent).toContain('調査サービスに接続できませんでした');
     expect(element('status').textContent).not.toContain('名前や所属を言い直してください');
     expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
     const sent = requests(path).length; await vi.advanceTimersByTimeAsync(5000); expect(requests(path)).toHaveLength(sent);
     routes.delete(path); stream.options.onFinal('retry', '架空検証社の架空の検証参加者です。'); await flush();
+    await selectLatestPerson();
     expect(requests(path)).toHaveLength(sent + 1); expect(element('card-board').textContent).toContain(FACT);
     expect(devices.g2!.startAudio).toHaveBeenCalledOnce();
   });
@@ -802,12 +874,14 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!; stream.options.onFinal('failure', '架空検証社の架空の検証参加者です。'); await flush();
     const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
-    expect(view.content).toContain(expectedMessage); expect(view.content).toContain('同じ名前');
+    expect(view.header).toContain('認識した人物');
+    expect(element('status').textContent).toContain('同じ名前');
     expect(element('status').textContent).toContain(expectedMessage);
     expect(element('status').textContent).toContain('聞き取りは続いています');
     expect(element('status').textContent).not.toContain('名前や所属を言い直');
     expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
     routes.delete('/api/research'); stream.options.onFinal('retry', '架空検証社の架空の検証参加者です。'); await flush();
+    await selectLatestPerson();
     expect(requests('/api/research')).toHaveLength(2); expect(element('card-board').textContent).toContain(FACT);
   });
 
@@ -820,7 +894,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!; stream.options.onFinal('failure', '架空検証社の架空の検証参加者です。'); await flush();
     expect(element('status').textContent).toContain(expectedMessage);
-    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain(expectedMessage);
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).header).toContain('認識した人物');
     expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
   });
 
@@ -856,8 +930,8 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!; stream.options.onFinal('failure', '架空検証社の架空の検証参加者です。'); await flush();
     const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
-    expect(view.content).toContain('画面で調査結果を読み込めませんでした');
-    expect(view.content).toContain('同じQRを読み直して');
+    expect(view.header).toContain('認識した人物');
+    expect(element('status').textContent).toContain('画面で調査結果を読み込めませんでした');
     expect(element('status').textContent).toContain('同じQRを読み直して');
     expect(element('status').textContent).not.toMatch(/unexpectedField|unrecognized_keys|private-validator-fixture|Zod/);
     expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
@@ -889,6 +963,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
     expect(element('card-board').textContent).not.toContain(FACT);
     stream.options.onFinal('correction', '違います。架空検証社の架空の検証参加者です。'); await flush();
+    await selectLatestPerson();
     expect(requests('/api/conversation/identify')).toHaveLength(2); expect(requests('/api/research')).toHaveLength(2);
     expect(element('card-board').textContent).toContain(FACT);
     expect(devices.phone!.recording).toBe(true); expect(devices.phone!.start).toHaveBeenCalledOnce(); expect(stream.cancel).not.toHaveBeenCalled();
@@ -896,27 +971,29 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
 
   it.each(['phone-button', 'glasses-tap'] as const)('clears the subject for new speech via %s and ignores old partial/final and delayed identification', async action => {
     const old = deferred<Response>();
-    routes.set('/api/conversation/identify', () => old.promise);
     await boot(); chooseLive(); click('conversation'); await flush();
     const stream = devices.streaming!;
+    stream.options.onFinal('initial', '架空の検証参加者です。'); await flush();
+    await selectLatestPerson();
+    routes.set('/api/conversation/identify', () => old.promise);
     expect(element<HTMLButtonElement>('retry-listening').disabled).toBe(false);
     stream.options.onFinal('old-final', '架空検証社の架空の検証参加者です。'); await flush();
-    const oldRequest = requests('/api/conversation/identify')[0]!;
+    const oldRequest = requests('/api/conversation/identify')[1]!;
     stream.options.onDelta('old-partial', '古い発話の途中');
     if (action === 'phone-button') click('retry-listening'); else await confirmGlassesAudioAction();
     await flush();
     expect(requests('/api/conversation/reset')).toHaveLength(1);
     expect(JSON.parse(String(requests('/api/conversation/reset')[0]!.body))).toEqual({ conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab' });
-    expect(oldRequest.signal!.aborted).toBe(true); expect(element('card-board').textContent).not.toContain(FACT);
+    expect(oldRequest.signal!.aborted).toBe(true); expect(element('card-board').textContent).toContain(FACT);
     expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.phone!.recording).toBe(true);
     expect(devices.phone!.start).toHaveBeenCalledOnce(); expect(devices.phone!.stop).not.toHaveBeenCalled();
     stream.options.onFinal('old-partial', '古い発話です'); await flush();
     routes.delete('/api/conversation/identify');
     stream.options.onFinal('fresh-final', '架空検証社の架空の検証参加者です。'); await flush();
-    expect(requests('/api/conversation/identify')).toHaveLength(2); expect(requests('/api/research')).toHaveLength(1);
-    expect(JSON.parse(String(requests('/api/research')[0]!.body)).subjectRevision).toBeGreaterThan(6);
+    expect(requests('/api/conversation/identify')).toHaveLength(3); expect(requests('/api/research')).toHaveLength(2);
+    expect(JSON.parse(String(requests('/api/research')[1]!.body)).subjectRevision).toBeGreaterThan(6);
     old.resolve(jsonResponse({ text: '古い別人の応答です', targets: [{ personName: '古い別人', companyName: '' }], hasPersonMention: true })); await flush();
-    expect(requests('/api/research')).toHaveLength(1); expect(element('card-board').textContent).toContain(FACT);
+    expect(requests('/api/research')).toHaveLength(2); expect(element('card-board').textContent).toContain(FACT);
     expect(element<HTMLTextAreaElement>('text').value).not.toContain('古い別人');
     expect(requests('/api/transcribe')).toHaveLength(0);
   });
@@ -941,6 +1018,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!;
     stream.options.onFinal('first', '架空の検証参加者です'); await flush();
+    await selectLatestPerson();
     click('lock-person');
     await flush();
     expect(element('person-state').textContent).toContain('架空の検証参加者さんを固定中');
@@ -964,6 +1042,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     const stream = devices.streaming!;
     stream.options.onFinal('first', '架空の検証参加者です'); await flush();
     pushResearchEvent(streams[0]!.body, { type: 'update', result: fourCardResult(streams[0]!.input) }); await flush();
+    await selectLatestPerson();
     const delayed = deferred<Response>(); routes.set('/api/conversation/identify', () => delayed.promise);
     stream.options.onFinal('late', '次の別人の話です'); await flush();
     const pending = requests('/api/conversation/identify').at(-1)!;
@@ -981,6 +1060,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     click('lock-person'); await flush();
     expect(element('person-state').textContent).not.toContain('固定中');
     devices.streaming!.options.onFinal('first', '架空の検証参加者です'); await flush();
+    await selectLatestPerson();
     click('lock-person'); await flush(); expect(element('person-state').textContent).toContain('固定中');
     click('end'); await flush();
     expect(element('person-state').textContent).not.toContain('固定中');
@@ -1153,6 +1233,9 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(requests('/api/session/restore')).toHaveLength(0);
     expect(requests('/api/research')).toHaveLength(0);
     expect(element('status').textContent).toContain('ストリーミング認識中');
+    expect(element('people-list').children).toHaveLength(0);
+    expect(element('sources').children).toHaveLength(0);
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).header).toContain('認識した人物 0/0');
     click('conversation'); click('connect'); await flush();
     expect(devices.g2!.startAudio).toHaveBeenCalledOnce();
     expect(requests('/api/conversation')).toHaveLength(1);
@@ -1507,6 +1590,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
   it('never turns a plain, repeated, or stale source tap into an audio reset', async () => {
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     devices.streaming!.options.onFinal('person', '架空の検証参加者です'); await flush();
+    await selectLatestPerson();
     devices.g2!.options.onAction?.('next'); await flush();
     devices.g2!.options.onAction?.('primary'); await flush();
     expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).header).toContain('該当文');
@@ -1519,6 +1603,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
   it('asks separately before retrying audio and lets a double tap cancel it without locking', async () => {
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     devices.streaming!.options.onFinal('person', '架空の検証参加者です'); await flush();
+    await selectLatestPerson();
     devices.g2!.options.onAction?.('previous'); await flush();
     expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('人物を聞き直す？');
     devices.g2!.options.onAction?.('secondary'); await flush();
@@ -1533,6 +1618,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
   it('does not restart stopped audio from a plain tap or an old source confirmation', async () => {
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     devices.streaming!.options.onFinal('person', '架空の検証参加者です'); await flush();
+    await selectLatestPerson();
     devices.g2!.options.onAction?.('next'); await flush();
     devices.streaming!.options.onError(new Error('音声接続が切れました。')); await flush();
     devices.g2!.options.onAction?.('primary'); await flush();
@@ -1564,6 +1650,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
   it('keeps the confirmation visible through an ASR delta and does not reset or lock the person on its answer', async () => {
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const stream = devices.streaming!; stream.options.onFinal('person', '架空の検証参加者です'); await flush();
+    await selectLatestPerson();
     devices.g2!.options.onAction?.('next'); await flush();
     stream.options.onDelta('talk', '会話を継続'); await vi.advanceTimersByTimeAsync(500);
     const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
@@ -1579,6 +1666,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     devices.streaming!.options.onFinal('person', '架空の検証参加者です'); await flush();
     const work = streams[0]!; const initial = fourCardResult(work.input, '最初');
     pushResearchEvent(work.body, { type: 'update', result: initial }); await flush();
+    await selectLatestPerson();
     const view = () => devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
     const initialBoard = view().content;
     devices.g2!.options.onAction?.('next'); await flush();
@@ -1604,6 +1692,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     const work = streams[0]!; const initial = fourCardResult(work.input);
     initial.cards[1]!.excerpt = 'B'.repeat(440); initial.sources[1]!.text = initial.cards[1]!.excerpt;
     pushResearchEvent(work.body, { type: 'update', result: initial }); await flush();
+    await selectLatestPerson();
     const view = () => devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
     for (let i = 0; i < 3; i++) {
       devices.g2!.options.onAction?.('next'); await flush();
@@ -1645,7 +1734,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     pushResearchEvent(streams[1]!.body, { type: 'result', result: researchResult(selectedId, 10) }); streams[1]!.body.close(); streams[0]!.body.close(); await flush();
   });
 
-  it.each(['candidate', 'audio'] as const)('keeps candidate and audio confirmations exclusive when switching to %s', async destination => {
+  it.each(['candidate', 'audio'] as const)('keeps an empty list gesture sequence inert before explicit phone %s action', async destination => {
     const choices = [{ id: 'candidate-one', label: '候補', query: '架空人物', target: { personName: '架空人物', companyName: '' } }];
     routes.set('/api/conversation/identify', async () => jsonResponse({ text: '架空人物', targets: [], hasPersonMention: true, searchCandidates: choices }));
     routes.set('/api/conversation/search-choice', async () => jsonResponse({ requestId: 'fea2e8bc-d39f-4292-bd94-0da29e641a70', subjectRevision: 10, revision: 9, ...choices[0] }));
@@ -1654,10 +1743,17 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     devices.g2!.options.onAction?.(destination === 'candidate' ? 'previous' : 'next'); await flush();
     devices.g2!.options.onAction?.(destination === 'candidate' ? 'next' : 'previous'); await flush();
     const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
-    expect(view.footer).toContain(destination === 'candidate' ? '候補を選ぶ？' : '人物を聞き直す？');
+    expect(view.header).toContain('認識した人物 0/0');
+    expect(view.footer).toContain('上下=選択');
     devices.g2!.options.onAction?.('primary'); await flush();
+    expect(requests('/api/conversation/reset')).toHaveLength(0);
+    expect(requests('/api/conversation/search-choice')).toHaveLength(0);
+    if (destination === 'candidate') (element('search-choices').children[0] as HTMLButtonElement).click();
+    else click('retry-listening');
+    await flush();
     expect(requests('/api/conversation/reset')).toHaveLength(destination === 'audio' ? 1 : 0);
     expect(requests('/api/conversation/search-choice')).toHaveLength(destination === 'candidate' ? 1 : 0);
+    expect(devices.streaming!.cancel).not.toHaveBeenCalled();
   });
 
   it('resynchronizes the visible board with its sources after cancelling audio confirmation during enrichment', async () => {
@@ -1666,6 +1762,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     devices.streaming!.options.onFinal('person', '架空の検証参加者です'); await flush();
     const work = streams[0]!; const initial = fourCardResult(work.input, '最初');
     pushResearchEvent(work.body, { type: 'update', result: initial }); await flush();
+    await selectLatestPerson();
     devices.g2!.options.onAction?.('previous'); await flush();
     const enriched = fourCardResult(work.input, '追加', 'COMPLETE');
     pushResearchEvent(work.body, { type: 'result', result: enriched }); work.body.close(); await flush();
@@ -1678,20 +1775,29 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(requests('/api/conversation/reset')).toHaveLength(0);
   });
 
-  it('offers search candidates on glasses without selecting them on scroll or double tap', async () => {
+  it('uses list gestures only for people while search alternatives remain explicitly selectable on the phone', async () => {
     const choices = [{ id: 'candidate-one', label: '候補', query: '架空人物 公式 プロフィール', target: { personName: '架空人物', companyName: '' } }];
-    routes.set('/api/conversation/identify', async () => jsonResponse({ text: '架空人物です', targets: [], hasPersonMention: true, searchCandidates: choices }));
+    routes.set('/api/conversation/identify', async () => jsonResponse({ text: '架空人物です', targets: [choices[0]!.target, { personName: '別の架空人物', companyName: '' }], hasPersonMention: true, searchCandidates: choices }));
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     devices.streaming!.options.onFinal('ambiguous', '架空人物です'); await flush();
     devices.g2!.options.onAction?.('next'); await flush();
     let view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
-    expect(view.content).toContain('架空人物 公式 プロフィール'); expect(view.footer).toContain('1回=選ぶ');
+    expect(view.header).toContain('認識した人物 2/2'); expect(view.content).toContain('→ 2 別の架空人物');
+    expect(view.content).not.toContain('公式 プロフィール');
+    devices.g2!.options.onAction?.('primary'); await flush();
+    view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(view.header).toBe('別の架空人物'); expect(view.content).toContain('未確認');
     expect(requests('/api/conversation/search-choice')).toHaveLength(0);
     devices.g2!.options.onAction?.('secondary'); await flush();
     expect(requests('/api/conversation/search-choice')).toHaveLength(0); expect(requests('/api/conversation/reset')).toHaveLength(0);
+    routes.set('/api/conversation/search-choice', async () => jsonResponse({ requestId: 'fea2e8bc-d39f-4292-bd94-0da29e641a70', subjectRevision: 10, revision: 9, ...choices[0] }));
+    (element('search-choices').children[0] as HTMLButtonElement).click(); await flush();
+    expect(requests('/api/conversation/search-choice')).toHaveLength(1);
+    expect(requests('/api/research')).toHaveLength(1); expect(requests('/api/conversation/reset')).toHaveLength(0);
+    expect(devices.streaming!.cancel).not.toHaveBeenCalled();
   });
 
-  it('lets an explicitly confirmed retry during selected-candidate research resume identification on new speech', async () => {
+  it('lets an explicit phone retry during selected-candidate research resume identification on new speech', async () => {
     const choices = [{ id: 'candidate-one', label: '候補', query: '架空人物', target: { personName: '架空人物', companyName: '' } }];
     routes.set('/api/conversation/identify', async () => jsonResponse({ text: '架空人物', targets: [], hasPersonMention: true, searchCandidates: choices }));
     routes.set('/api/conversation/search-choice', async () => jsonResponse({ requestId: 'fea2e8bc-d39f-4292-bd94-0da29e641a70', subjectRevision: 10, revision: 9, ...choices[0] }));
@@ -1699,7 +1805,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLive(); click('conversation'); await flush(); devices.streaming!.options.onFinal('ambiguous', '架空人物'); await flush();
     (element('search-choices').children[0] as HTMLButtonElement).click(); await flush();
     expect(streams).toHaveLength(1);
-    await confirmGlassesAudioAction();
+    click('retry-listening'); await flush();
     expect(requests('/api/conversation/reset')).toHaveLength(1); expect(streams[0]!.signal.aborted).toBe(true);
     devices.streaming!.options.onFinal('fresh-person', '架空人物です'); await flush();
     expect(requests('/api/conversation/identify')).toHaveLength(2);
@@ -1709,6 +1815,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
   it('clears a pending source confirmation on audio error and requires a separate restart confirmation', async () => {
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     devices.streaming!.options.onFinal('person', '架空の検証参加者です'); await flush();
+    await selectLatestPerson();
     devices.g2!.options.onAction?.('next'); await flush();
     devices.streaming!.options.onError(new Error('音声接続が切れました。')); await flush();
     const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
