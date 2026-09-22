@@ -70,7 +70,15 @@ export const AssessmentSchema = z.object({
 export type Assessment = z.infer<typeof AssessmentSchema>;
 export const CardSchema = ProposedCardSchema.extend({ cardId: z.string(), expiresAt: z.iso.datetime(), requestId: z.string(), subjectRevision: z.number().int(), topic: TopicSchema.optional() }).strict();
 export type Card = z.infer<typeof CardSchema>;
-export const TraceEventSchema = z.object({ eventId: z.number().int().positive(), step: z.string().max(60), message: z.string().max(800), at: z.iso.datetime() }).strict();
+export const SearchOperationSchema = z.object({
+  provider: z.enum(['web', 'x', 'instagram', 'facebook']),
+  query: z.string().min(1).max(300),
+  operation: z.enum(['web_search', 'account_lookup', 'recent_posts', 'archive_search', 'social_posts']),
+}).strict();
+export type SearchOperation = z.infer<typeof SearchOperationSchema>;
+export const SearchTraceSchema = SearchOperationSchema.extend({ stage: z.enum(['initial', 'additional', 'archive', 'social']) }).strict();
+export type SearchTrace = z.infer<typeof SearchTraceSchema>;
+export const TraceEventSchema = z.object({ eventId: z.number().int().positive(), step: z.string().max(60), message: z.string().max(800), at: z.iso.datetime(), search: SearchTraceSchema.optional() }).strict();
 export type TraceEvent = z.infer<typeof TraceEventSchema>;
 export const UsageSchema = z.object({ llm: z.number().int().nonnegative(), searches: z.number().int().nonnegative(), pages: z.number().int().nonnegative(), elapsedMs: z.number().nonnegative(), reservedUsd: z.number().nonnegative(), actualUsd: z.number().nonnegative().nullable(), costKnown: z.boolean(),
   reportedUsd: z.number().finite().nonnegative().optional(), reportedCostCalls: z.number().int().nonnegative().optional(),

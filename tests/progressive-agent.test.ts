@@ -121,6 +121,40 @@ async function fixture({ ignoreAbort = false, socialEnabled = true } = {}) {
 }
 
 describe('progressive evidence orchestration', () => {
+  it('labels actual quick, archive and social requests while keeping their observers isolated', async () => {
+    const test = await fixture();
+    const recent = test.provider.searchRecent!.bind(test.provider);
+    test.provider.searchRecent = async (query, signal, observe) => {
+      observe?.({ provider: 'x', operation: 'recent_posts', query: '@chomado' });
+      return recent(query, signal);
+    };
+    const archive = test.provider.searchArchive!.bind(test.provider);
+    test.provider.searchArchive = async (query, signal, observe) => {
+      observe?.({ provider: 'x', operation: 'archive_search', query: 'from:chomado -is:retweet -is:reply' });
+      return archive(query, signal);
+    };
+    const social = test.social.lookupPlatform.bind(test.social);
+    test.social.lookupPlatform = async (subject, platform, signal, observe) => {
+      observe?.({ provider: platform, operation: 'social_posts', query: `https://www.${platform}.com/chomado` });
+      return social(subject, platform, signal);
+    };
+    const pending = test.start();
+    await vi.waitFor(() => expect(test.snapshots).toHaveLength(1));
+    expect(test.snapshots[0]!.trace.flatMap(event => event.search ? [event.search] : []))
+      .toEqual([{ provider: 'x', operation: 'recent_posts', stage: 'initial', query: '@chomado' }]);
+    test.archive.resolve(result([])); test.instagram.resolve(result([])); test.facebook.resolve(result([]));
+    const final = await pending;
+    const searches = final.trace.flatMap(event => event.search ? [event.search] : []);
+    expect(searches).toHaveLength(4);
+    // Independent budget reservations need not finish in platform order.
+    expect(searches).toEqual(expect.arrayContaining([
+      { provider: 'x', operation: 'recent_posts', stage: 'initial', query: '@chomado' },
+      { provider: 'x', operation: 'archive_search', stage: 'archive', query: 'from:chomado -is:retweet -is:reply' },
+      { provider: 'facebook', operation: 'social_posts', stage: 'social', query: 'https://www.facebook.com/chomado' },
+      { provider: 'instagram', operation: 'social_posts', stage: 'social', query: 'https://www.instagram.com/chomado' },
+    ]));
+  });
+
   it('publishes QUICK while slow providers are unresolved, then updates independently for each arrival', async () => {
     const test = await fixture(); let completed = false;
     const pending = test.start().then(value => { completed = true; return value; });

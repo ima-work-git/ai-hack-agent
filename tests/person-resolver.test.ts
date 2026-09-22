@@ -45,6 +45,44 @@ describe('person-name correction without famous-person fallback', () => {
     expect(await resolvePersonTarget({ ...base, currentTranscript: `${company}の山田さん`, target: { personName: '西村博之', companyName: company } }, signal())).toEqual({ target: null, usedLuna: false });
   });
 
+  it.each(['かすなり', '数なり', 'かつなり', 'カスナリ'])('keeps %s selectable, including when the company matches or the planner canonicalizes it', async name => {
+    const correct = luna();
+    for (const companyName of ['', 'サードスコープ']) {
+      const currentTranscript = `${companyName ? `${companyName}の` : ''}${name}さんについて`;
+      for (const proposed of [null, { personName: name, companyName }, { personName: '伊東和成', companyName }]) {
+        const result = await resolvePersonTarget({ currentTranscript, previousTranscript: '', target: proposed, correct }, signal());
+        expect(result).toMatchObject({ target: null, candidate: { personName: '伊東和成', companyName }, usedLuna: false });
+      }
+      expect(extractHomophoneTarget(currentTranscript, '')).toEqual({ personName: name, companyName });
+    }
+    expect(correct).not.toHaveBeenCalled();
+  });
+
+  it('does not let model confidence bypass explicit confirmation for an uncertain Kazunari reading', async () => {
+    const correct = luna({ literalName: 'かずのり', correctedName: '伊東和成', companyName: 'サードスコープ',
+      publicFigureId: 'kazunari-ito', evidenceInTranscript: 'かずのりさんについて', confidence: 1, needsConfirmation: false });
+    expect(await resolvePersonTarget({ currentTranscript: 'かずのりさんについて', previousTranscript: 'サードスコープ',
+      target: { personName: 'かずのり', companyName: 'サードスコープ' }, correct }, signal()))
+      .toMatchObject({ target: null, candidate: { personName: '伊東和成', companyName: 'サードスコープ' }, usedLuna: true });
+    expect(correct).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { name: 'かずなり', canonical: '伊東和成', companyName: 'サードスコープ' },
+    { name: 'カズナリ', canonical: '伊東和成', companyName: '' },
+    { name: 'Taishi', canonical: '山崎大志', companyName: '' },
+    { name: 'たいし', canonical: '山崎大志', companyName: 'AlphaByte' },
+    { name: 'やまさきたいし', canonical: '山崎大志', companyName: 'AlphaByte' },
+    { name: 'うさみりょうじ', canonical: '宇佐美良治', companyName: '株式会社CyberACE' },
+    { name: '宇佐美良治', canonical: '宇佐美良治', companyName: 'サイバーエース' },
+  ])('resolves the sourced judge name $name without a correction call', async ({ name, canonical, companyName }) => {
+    const correct = luna();
+    expect(await resolvePersonTarget({ currentTranscript: `${companyName ? `${companyName}の` : ''}${name}さんについて`,
+      previousTranscript: '', target: { personName: name, companyName }, correct }, signal()))
+      .toMatchObject({ target: { personName: canonical, companyName }, usedLuna: false });
+    expect(correct).not.toHaveBeenCalled();
+  });
+
   it('does not turn a common homophone without a company into a verified public person', async () => {
     const correct = luna();
     const result = await resolvePersonTarget({ currentTranscript: '広行さんについて', previousTranscript: '', target: { personName: '広行', companyName: '' }, correct }, signal());
@@ -95,6 +133,19 @@ describe('person-name correction without famous-person fallback', () => {
 
   it('does not accept Latin aliases embedded in another name', async () => {
     expect(await resolvePersonTarget({ currentTranscript: 'notHiroyukiNishimuraName', previousTranscript: '', target: { personName: 'Hiroyuki Nishimura', companyName: '' } }, signal())).toEqual({ target: null, usedLuna: false });
+  });
+
+  it('does not extract a short kana name from ordinary speech', async () => {
+    for (const currentTranscript of ['たいしたことないです', 'たいして変わらないです', 'これをしたいし、あれもしたい']) {
+      for (const proposed of [null, { personName: '山崎大志', companyName: '' }]) {
+        expect(await resolvePersonTarget({ currentTranscript, previousTranscript: '', target: proposed }, signal())).toEqual({ target: null, usedLuna: false });
+      }
+    }
+  });
+
+  it('keeps whitespace as a Latin boundary when a spoken activity follows the name', async () => {
+    expect(await resolvePersonTarget({ currentTranscript: 'Taishi AI Language Learning App', previousTranscript: '',
+      target: { personName: 'Taishi', companyName: '' } }, signal())).toMatchObject({ target: { personName: '山崎大志', companyName: '' }, usedLuna: false });
   });
 
   it('falls back after a provider error but propagates cancellation and budget failures', async () => {

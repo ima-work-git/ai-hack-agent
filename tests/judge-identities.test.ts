@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { evidenceMatchesTarget, isTargetGroundedInTranscript, isVerifiedPublicSource, verifiedAliasForInputTarget, verifiedAliasForTarget, VERIFIED_IDENTITY_ALIASES } from '../src/shared/identity-aliases.ts';
-import { VERIFIED_SOCIAL_IDENTITIES } from '../src/shared/social-accounts.ts';
+import { VERIFIED_SOCIAL_IDENTITIES, verifiedSocialIdentityForTarget } from '../src/shared/social-accounts.ts';
+import { PUBLIC_FIGURE_CATALOG } from '../src/shared/public-figure-catalog.ts';
 
 const judges = [
   { input: '山崎 大志さん', canonical: '山崎大志', handle: 'taishiyade', company: 'AlphaByte', canonicalCompany: '株式会社AlphaByte', source: 'https://taishiyade.com/' },
@@ -43,16 +44,64 @@ describe('source-backed judge identities', () => {
     for (const companyName of social.companyNames) expect(verifiedAliasForTarget({ personName: social.canonicalName, companyName })?.xHandle).toBe('taishiyade');
   });
 
-  it('accepts only primary-source readings, normalized kana, and full published Latin names', () => {
+  it('accepts primary-source readings, normalized kana, and published Latin names', () => {
     expect(verifiedAliasForTarget({ personName: 'イトウ カズナリさん', companyName: '' })?.xHandle).toBe('macopeninsutaba');
     expect(verifiedAliasForTarget({ personName: 'カズナリ', companyName: '' })?.target.personName).toBe('伊東和成');
     expect(verifiedAliasForTarget({ personName: 'Taishi Yamasaki', companyName: '' })?.xHandle).toBe('taishiyade');
-    for (const personName of ['Taishi', 'やまさきたいし', 'やまざきたいし', 'うさみりょうじ', '伊藤和成', '知らない人物']) {
+    for (const personName of ['Taishi', 'たいし', 'タイシ', 'やまさきたいし', 'ヤマサキ タイシ']) {
+      expect(verifiedAliasForTarget({ personName, companyName: '' })?.xHandle).toBe('taishiyade');
+      expect(verifiedSocialIdentityForTarget({ personName, companyName: '' })?.id).toBe('taishi-yamasaki');
+    }
+    expect(verifiedAliasForTarget({ personName: 'うさみりょうじ', companyName: '' })?.xHandle).toBe('tre_conigli');
+    expect(verifiedAliasForTarget({ personName: 'ウサミ リョウジ', companyName: '株式会社CyberACE' })?.target).toEqual({ personName: '宇佐美良治', companyName: '株式会社CyberACE' });
+    for (const personName of ['やまざきたいし', 'Ryoji Usami', '伊藤和成', '知らない人物', 'かすなり', '数なり', 'かつなり']) {
       expect(verifiedAliasForTarget({ personName, companyName: '' })).toBeUndefined();
     }
     const alias = verifiedAliasForTarget({ personName: 'いとうかずなり', companyName: '' })!;
     expect(alias.sourceUrls).toContain('https://ai-reskilling.jp/');
     expect(verifiedAliasForInputTarget('NotTaishiYamasakiです', { personName: '山崎大志', companyName: '' })).toBeUndefined();
+    expect(verifiedAliasForInputTarget('NotTaishiです', { personName: '山崎大志', companyName: '' })).toBeUndefined();
+  });
+
+  it('records primary reading evidence and separates product descriptions from companies', () => {
+    expect(PUBLIC_FIGURE_CATALOG.find(record => record.id === 'kazunari-ito')).toMatchObject({
+      kana: 'いとうかずなり', commonASRHomophones: ['かすなり', '数なり', 'かつなり'], asrCorrectionRequiresConfirmation: true,
+      readingSourceUrl: 'https://ai-reskilling.jp/', readingBasis: 'kana-primary-source',
+    });
+    expect(PUBLIC_FIGURE_CATALOG.find(record => record.id === 'taishi-yamasaki')).toMatchObject({
+      kana: 'やまさきたいし', readingSourceUrl: 'https://gist.github.com/Taishi-Y', readingBasis: 'romanized-primary-source',
+    });
+    expect(PUBLIC_FIGURE_CATALOG.find(record => record.id === 'tre-conigli')).toMatchObject({
+      kana: 'うさみりょうじ', readingSourceUrl: 'https://www.wantedly.com/companies/company_5212273/post_articles/889192', readingBasis: 'kana-primary-source',
+    });
+    expect(verifiedAliasForTarget({ personName: 'Taishi', companyName: 'AI Language Learning App' })).toBeUndefined();
+    expect(verifiedSocialIdentityForTarget({ personName: 'Taishi', companyName: 'AI Language Learning App' })).toBeUndefined();
+    expect(VERIFIED_SOCIAL_IDENTITIES.some(record => ['kazunari-ito', 'tre-conigli'].includes(record.id))).toBe(false);
+  });
+
+  it.each([
+    { personName: '伊東和成', companyName: 'サードスコープ', primary: 'https://third-scope.com/about/', accountLink: 'https://qiita.com/KNR109', reading: 'https://ai-reskilling.jp/' },
+    { personName: '山崎大志', companyName: 'AlphaByte', primary: 'https://taishiyade.com/', accountLink: 'https://note.com/taishiyade/n/n64b013945dfc', reading: 'https://gist.github.com/Taishi-Y' },
+  ])('keeps public activity and the self-published account link in the two-page allowance for $personName', ({ personName, companyName, primary, accountLink, reading }) => {
+    for (const company of ['', companyName]) {
+      const alias = verifiedAliasForTarget({ personName, companyName: company })!;
+      expect(alias.sourceUrls.slice(0, 2)).toEqual([primary, accountLink]);
+      expect(alias.sourceUrls.slice(2)).toContain(reading);
+      expect(new Set(alias.sourceUrls).size).toBe(alias.sourceUrls.length);
+    }
+  });
+
+  it('requires a short kana name boundary in speech and fetched evidence', () => {
+    const target = { personName: '山崎大志', companyName: '' };
+    for (const text of ['たいしたことないです', 'たいして変わらないです', 'これをしたいし、あれもしたい']) {
+      expect(verifiedAliasForInputTarget(text, target)).toBeUndefined();
+      expect(isTargetGroundedInTranscript(text, '', target)).toBe(false);
+      expect(evidenceMatchesTarget(text, target, 'https://taishiyade.com/')).toBe(false);
+    }
+    for (const text of ['たいし', 'タイシさん', 'AlphaByteのたいしさん', 'たいしのアプリ', 'たいしです']) {
+      expect(verifiedAliasForInputTarget(text, target)?.xHandle).toBe('taishiyade');
+      expect(isTargetGroundedInTranscript(text, '', target)).toBe(true);
+    }
   });
 
   it('requires fetched name/company evidence and rejects an unrelated account with an alias mention', () => {

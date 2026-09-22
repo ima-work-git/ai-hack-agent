@@ -30,6 +30,70 @@ function pageResponse(text = '株式会社灯の山田花子は、公式ブロ�
 
 afterEach(() => { vi.useRealTimers(); });
 
+describe('explicit assessment identity context', () => {
+  // Known public identity only for the account guard; all activity prose is fictional.
+  const publicTarget = { personName: '山崎大志', companyName: '' };
+  const profile = (sourceId: string, url: string, text = 'Taishi は模擬の開発展示で試作品を紹介しています。', kind: 'web' | 'x' = 'web'): EvidenceSource => ({
+    sourceId, url, text, kind, title: '試験用プロフィール', retrievedAt: '2026-09-22T00:00:00.000Z', topic: 'profile',
+  });
+  async function requestFor(sources: EvidenceSource[], subject = publicTarget, output: Record<string, unknown> = {}) {
+    const api = mockFetch(completion({ ...assessment, identityVerified: false, publicPersonVerified: false,
+      publicIdentitySourceIds: [], needsConfirmation: true, ...output }));
+    const response = await createLiveProvider(config, { fetch: api }).assess(subject, sources, signal());
+    const payload = JSON.parse(String(api.mock.calls[0]![1]!.body));
+    return { payload, data: JSON.parse(payload.messages[1].content), response };
+  }
+
+  it('makes company-free mode explicit and points only to actual matching primary profiles, not posts or lookalikes', async () => {
+    const sources = [
+      profile('official', 'https://taishiyade.com/'),
+      profile('x-profile', 'https://x.com/taishiyade', undefined, 'x'),
+      profile('x-post', 'https://x.com/taishiyade/status/123', undefined, 'x'),
+      profile('other-person', 'https://x.com/someone_else', '山崎大志の模擬プロフィールです。', 'x'),
+      profile('missing-name', 'https://taishiyade.com/', '模擬の公開活動だけが掲載されています。'),
+      profile('lookalike', 'https://taishiyade.com.evil.example/', '山崎大志の模擬プロフィールです。'),
+    ];
+    const { data, payload, response } = await requestFor(sources);
+    expect(data.identityAssessmentContext).toEqual({ mode: 'name_only_public_person', companyRequired: false,
+      curatedRetrievedPrimaryCandidates: sources.slice(0, 2).map(({ sourceId, url, kind }) => ({ sourceId, url, kind })),
+      candidateLocationsAreNotProof: true, candidateListIsExhaustive: false });
+    expect(data.verifiedIdentityAliases.personNames).toContain('Taishi');
+    expect(payload.messages.at(-1)).toMatchObject({ role: 'system' });
+    const reminder = payload.messages.at(-1).content;
+    expect(reminder).toContain('empty companyName is intentional');
+    expect(reminder).toContain('listed activity name instead of the canonical legal name');
+    expect(reminder).toContain('inspect those bodies');
+    expect(reminder).toContain('assess every conflicting source');
+    // Navigation hints cannot override a negative model assessment.
+    expect(response.value).toMatchObject({ identityVerified: false, publicPersonVerified: false, needsConfirmation: true, publicIdentitySourceIds: [] });
+  });
+
+  it('requires the supplied company relationship and never treats the mode as permission to invent an affiliation', async () => {
+    const source = profile('company-profile', 'https://taishiyade.com/', '山崎大志はAlphaByteの模擬の公開紹介に登場します。');
+    const { data, payload } = await requestFor([source], { ...publicTarget, companyName: 'AlphaByte' });
+    expect(data.identityAssessmentContext.mode).toBe('person_and_company');
+    expect(data.identityAssessmentContext.companyRequired).toBe(true);
+    expect(payload.messages.at(-1).content).toContain('still require the explicit supplied company connection');
+    const absent = await requestFor([profile('no-company', 'https://taishiyade.com/')], { ...publicTarget, companyName: 'AlphaByte' });
+    expect(absent.data.identityAssessmentContext.curatedRetrievedPrimaryCandidates).toEqual([]);
+  });
+
+  it('does not advertise a name outside the actually supplied text window as a retrieved identity clue', async () => {
+    const { data } = await requestFor([profile('too-late', 'https://taishiyade.com/', `${'模擬資料。'.repeat(2200)}山崎大志です。`)]);
+    expect(data.sources[0].text).not.toContain('山崎大志');
+    expect(data.identityAssessmentContext.curatedRetrievedPrimaryCandidates).toEqual([]);
+  });
+
+  it('allows assessment of unregistered public profiles without implying that an empty curated list disproves them', async () => {
+    const source = profile('unknown-profile', 'https://author.example.org/', '架空作家は模擬の創作活動を公開しています。');
+    const { data, payload, response } = await requestFor([source], { personName: '架空作家', companyName: '' },
+      { identityVerified: true, publicPersonVerified: true, needsConfirmation: false, publicIdentitySourceIds: ['unknown-profile'] });
+    expect(data.identityAssessmentContext.curatedRetrievedPrimaryCandidates).toEqual([]);
+    expect(payload.messages.at(-1).content).toContain('empty list does not disqualify an unregistered public person');
+    expect(response.value).toMatchObject({ identityVerified: true, publicPersonVerified: true, publicIdentitySourceIds: ['unknown-profile'] });
+  });
+});
+
 describe('bounded OrcaRouter adapter', () => {
   it('does not contact a provider with missing keys or model configuration', async () => {
     const api = mockFetch();

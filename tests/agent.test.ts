@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runAgent } from '../server/agent.ts';
 import { createFixtureProvider, DEMO_TEXT, DEMO_TARGET } from '../server/fixtures.ts';
 import { createLiveProvider } from '../server/providers.ts';
-import type { ResearchInput, Assessment } from '../src/shared/contracts.ts';
+import type { ResearchInput, Assessment, SearchOperation, TraceEvent } from '../src/shared/contracts.ts';
 import type { ResearchProvider } from '../server/provider-contract.ts';
 import { BudgetLedger } from '../server/budget.ts';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -13,6 +13,39 @@ const input = (extra: Partial<ResearchInput> = {}): ResearchInput => ({ text: DE
 afterEach(() => { vi.useRealTimers(); });
 
 describe('bounded evidence research', () => {
+  it('reports only provider-observed actual queries and labels initial versus autonomous follow-up requests', async () => {
+    const provider = createFixtureProvider('normal'); const original = provider.search.bind(provider);
+    const actual: string[] = []; const events: TraceEvent[] = [];
+    provider.search = async (query, signal, onSearch) => {
+      // A provider may normalize input further; the displayed query comes
+      // from that operation, not from the agent plan or private transcript.
+      const normalized = `${query} provider-filter`; actual.push(normalized);
+      onSearch?.({ provider: 'web', operation: 'web_search', query: normalized });
+      return original(query, signal);
+    };
+    const response = await runAgent(input({ text: `${DEMO_TEXT} private-conversation-marker` }), provider, { onEvent: event => { events.push(event); } });
+    const searches = response.trace.flatMap(event => event.search ? [event.search] : []);
+    expect(searches.map(search => search.query)).toEqual(actual);
+    expect(searches.map(search => search.stage)).toEqual(['initial', 'additional']);
+    expect(JSON.stringify(searches)).not.toContain('private-conversation-marker');
+    expect(events.filter(event => event.search)).toHaveLength(2);
+    expect(response.status).toBe('ready');
+  });
+
+  it('ignores invalid and late cancelled provider traces', async () => {
+    const controller = new AbortController(); const provider = createFixtureProvider('normal'); const events: TraceEvent[] = [];
+    provider.search = async (_query, _signal, observe) => {
+      observe?.({ provider: 'web', operation: 'web_search', query: 'x'.repeat(301) });
+      observe?.({ provider: 'web', operation: 'web_search', query: 'safe', token: 'unexpected' } as SearchOperation);
+      controller.abort();
+      observe?.({ provider: 'x', operation: 'archive_search', query: 'late fixture query' });
+      return { value: [], actualUsd: 0 };
+    };
+    const response = await runAgent(input(), provider, { signal: controller.signal, onEvent: event => { events.push(event); } });
+    expect(response.status).toBe('cancelled');
+    expect(events.some(event => event.search)).toBe(false);
+  });
+
   it.each(['fact', 'suggestedQuestion'] as const)('independently rejects a health-related %s from an alternate provider', async field => {
     const provider = createFixtureProvider('normal');
     const assess = provider.assess.bind(provider);
@@ -425,7 +458,7 @@ describe('person-only public-profile research', () => {
     const provider = publicProvider();
     const result = await runAgent(input({ text: '架空作家さんについて' }), provider);
     expect(result.status).toBe('ready'); expect(result.target?.companyName).toBe(''); expect(result.cards).toHaveLength(1);
-    expect(provider.search).toHaveBeenCalledWith('架空作家 公式', expect.any(AbortSignal));
+    expect(provider.search).toHaveBeenCalledWith('架空作家 公式', expect.any(AbortSignal), expect.any(Function));
     expect(result.usage).toMatchObject({ llm: 2, searches: 1, pages: 1 });
   });
 
@@ -449,7 +482,7 @@ describe('person-only public-profile research', () => {
   it('routes a verified kana nickname to its grounded account without adding API calls', async () => {
     const provider = publicProvider({}, '西村博之');
     const result = await runAgent(input({ text: 'ヒロユキについて' }), provider);
-    expect(result.status).toBe('ready'); expect(provider.search).toHaveBeenCalledWith('西村博之 公式 @hirox246', expect.any(AbortSignal));
+    expect(result.status).toBe('ready'); expect(provider.search).toHaveBeenCalledWith('西村博之 公式 @hirox246', expect.any(AbortSignal), expect.any(Function));
     expect(result.target).toEqual({ personName: '西村博之', companyName: '' });
   });
   it.each(['verified', 'missing', 'ambiguous', 'few_cards'] as const)('uses a single Web follow-up for insufficient X-only public identity, but preserves ambiguity: %s', async outcome => {
@@ -481,7 +514,7 @@ describe('person-only public-profile research', () => {
       expect(result.status).toBe('awaiting_confirmation'); expect(result.candidates).toHaveLength(2);
       expect(result.usage).toMatchObject({ llm: 2, searches: 1, pages: 2 });
     } else {
-      expect(provider.search).toHaveBeenNthCalledWith(2, '西村博之 公式 プロフィール', expect.any(AbortSignal));
+      expect(provider.search).toHaveBeenNthCalledWith(2, '西村博之 公式 プロフィール', expect.any(AbortSignal), expect.any(Function));
       expect(result.usage).toMatchObject({ llm: 3, searches: 2, pages: 4 });
       expect(vi.mocked(provider.fetchPage).mock.calls.slice(2).map(([hit]) => hit.url)).toEqual(['https://guild.to/', 'https://guild.to/news/弊社のメンバー達がノンタイトルで激突すること/']);
       expect(result.trace.some(event => event.message.includes('公式Webプロフィール'))).toBe(true);

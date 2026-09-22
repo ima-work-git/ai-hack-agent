@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { EvidenceSourceSchema, type EvidenceSource, type Target } from '../src/shared/contracts.ts';
 import { verifiedSocialIdentityForTarget, type VerifiedSocialAccount, type VerifiedSocialIdentity } from '../src/shared/social-accounts.ts';
-import { ProviderError, type ProviderResult } from './provider-contract.ts';
+import { notifySearch, ProviderError, type ProviderResult, type SearchObserver } from './provider-contract.ts';
 
 const API_ORIGIN = 'https://api.apify.com';
 const MAX_JSON_BYTES = 2_000_000;
@@ -18,8 +18,8 @@ const ACTORS = {
 
 export interface SocialProvider {
   hasTarget(target: Target): boolean;
-  lookupPlatform(target: Target, platform: VerifiedSocialAccount['platform'], signal: AbortSignal): Promise<ProviderResult<EvidenceSource[]>>;
-  lookup(target: Target, signal: AbortSignal): Promise<ProviderResult<EvidenceSource[]>>;
+  lookupPlatform(target: Target, platform: VerifiedSocialAccount['platform'], signal: AbortSignal, onSearch?: SearchObserver): Promise<ProviderResult<EvidenceSource[]>>;
+  lookup(target: Target, signal: AbortSignal, onSearch?: SearchObserver): Promise<ProviderResult<EvidenceSource[]>>;
 }
 export interface SocialProviderDependencies {
   fetch?: typeof fetch;
@@ -159,7 +159,7 @@ export function createSocialProvider(config: { apiToken: string; maximumChargeUs
     } finally { clearTimeout(timer); }
   }
 
-  async function run(identity: VerifiedSocialIdentity, account: VerifiedSocialAccount, signal: AbortSignal): Promise<ActorResult> {
+  async function run(identity: VerifiedSocialIdentity, account: VerifiedSocialAccount, signal: AbortSignal, onSearch?: SearchObserver): Promise<ActorResult> {
     let active: Run | undefined;
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), 75_000);
@@ -170,6 +170,8 @@ export function createSocialProvider(config: { apiToken: string; maximumChargeUs
       const query = new URLSearchParams({ timeout: '60', maxItems: String(MAX_POSTS), maxTotalChargeUsd: String(Math.min(0.10, maximum / 2)), restartOnError: 'false', waitForFinish: '0' });
       // Await run creation even on cancellation so its returned ID can be aborted.
       // An uncertain POST is never retried; its remote 60-second timeout remains.
+      notifySearch(onSearch, { provider: account.platform, operation: 'social_posts', query: account.profileUrl });
+      combined.throwIfAborted();
       const created = await api(`/v2/actors/${actor.id}/runs?${query}`, new AbortController().signal, actor.input(account.profileUrl));
       const raw = object(object(created)?.data);
       if (raw && identifier(raw.id)) active = { id: raw.id, status: 'RUNNING' };
@@ -197,7 +199,7 @@ export function createSocialProvider(config: { apiToken: string; maximumChargeUs
     }
   }
 
-  const lookupPlatform: SocialProvider['lookupPlatform'] = async (target, platform, signal) => {
+  const lookupPlatform: SocialProvider['lookupPlatform'] = async (target, platform, signal, onSearch) => {
       signal.throwIfAborted();
       const identity = verifiedSocialIdentityForTarget(target);
       const account = identity?.accounts.find(value => value.platform === platform);
@@ -207,7 +209,7 @@ export function createSocialProvider(config: { apiToken: string; maximumChargeUs
       const key = `${identity.id}:${platform}`;
       const existing = cache.get(key);
       if (existing) { cache.delete(key); cache.set(key, existing); return { value: structuredClone(existing.value), actualUsd: 0 }; }
-      const outcome = await run(identity, account, signal);
+      const outcome = await run(identity, account, signal, onSearch);
       signal.throwIfAborted();
       const value = outcome.source ? [outcome.source] : [];
       const ttl = value.length ? 300_000 : 30_000;
@@ -222,9 +224,9 @@ export function createSocialProvider(config: { apiToken: string; maximumChargeUs
   return {
     hasTarget: target => Boolean(verifiedSocialIdentityForTarget(target)),
     lookupPlatform,
-    async lookup(target, signal) {
+    async lookup(target, signal, onSearch) {
       // Wait for every platform's cancellation cleanup before surfacing abort.
-      const settled = await Promise.allSettled((['instagram', 'facebook'] as const).map(platform => lookupPlatform(target, platform, signal)));
+      const settled = await Promise.allSettled((['instagram', 'facebook'] as const).map(platform => lookupPlatform(target, platform, signal, onSearch)));
       signal.throwIfAborted();
       const outcomes = settled.flatMap(result => result.status === 'fulfilled' ? [result.value] : []);
       const reports = outcomes.flatMap(outcome => outcome.reportedUsd === undefined ? [] : [outcome.reportedUsd]);

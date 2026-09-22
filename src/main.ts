@@ -5,6 +5,7 @@ import { PhoneAudio } from './phone-audio.ts';
 import { StreamingAudio } from './streaming-audio.ts';
 import { verifiedAliasForTarget } from './shared/identity-aliases.ts';
 import { TargetSchema } from './shared/contracts.ts';
+import { SearchCandidateSchema, type SearchCandidate } from './shared/search-candidates.ts';
 import { pcmToWav } from './audio.ts';
 
 // A short-lived QR grant is read once, then removed before any API request.
@@ -17,7 +18,7 @@ let pageLeaving = false;
 
 const DEMO_TEXT = '架空・みなもデザイン株式会社の星野あおいさんについて調べたい。';
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
-const BOARD_MARKUP = Array.from({ length: 4 }, (_, index) => `<button type="button" class="topic-card empty" id="topic-${index}" disabled aria-label="${index + 1}件目は未確認"><span class="topic-number">${index + 1} / 未確認</span><span class="topic-row"><span class="topic-caption">事実</span><span class="topic-fact"${index === 0 ? ' id="fact"' : ''}>未確認</span></span><span class="topic-row"><span class="topic-caption">質問</span><span class="topic-question"${index === 0 ? ' id="question"' : ''}>確認後に表示</span></span></button>`).join('');
+const BOARD_MARKUP = Array.from({ length: 4 }, (_, index) => `<button type="button" class="topic-card empty" id="topic-${index}" disabled aria-label="${index + 1}件目は未確認"><span class="topic-number">${index + 1} / 未確認</span><span class="topic-row"><span class="topic-caption">事実</span><span class="topic-fact"${index === 0 ? ' id="fact"' : ''}>未確認</span></span><span class="topic-row"><span class="topic-caption">推奨質問</span><span class="topic-question"${index === 0 ? ' id="question"' : ''}>確認後に表示</span></span></button>`).join('');
 const app = document.getElementById('app')!;
 app.innerHTML = `
 <header class="masthead"><div class="wordmark"><span class="mark" aria-hidden="true">◌</span><div><div class="eyebrow">AI HACK · EVEN G2</div><h1>これで誰でも雑談マスター</h1></div></div><span class="pill" id="connection">スマートフォン表示</span></header>
@@ -31,7 +32,7 @@ app.innerHTML = `
 <label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。会話モードは音声をOpenAIへ逐次送信して認識し、OrcaRouterで調査します。音声は保存しません。短い録音は最大30秒です。</span></label>
 <label for="microphone">使うマイク</label><select id="microphone"><option value="g2" ${conversationLaunch ? 'selected' : ''}>Even G2のマイク</option><option value="phone" ${conversationLaunch ? '' : 'selected'}>スマートフォンのマイク</option></select>
 <div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="retry-listening" disabled>聞き直す</button><button id="lock-person" disabled>この人物で固定</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
-<p class="muted" id="person-state" role="status">G2：1回タップで聞き直し・2回で人物固定。スクロールで出典、最後の次は4件一覧。</p><div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><p class="status hidden" id="correction-hint" role="status"></p><div id="candidates" class="candidates"></div>
+<p class="muted" id="person-state" role="status">G2：1回タップで聞き直し・2回で人物固定。スクロールは移動確認。1回で進む・2回でそのまま。</p><div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><section id="search-panel" class="search-panel hidden" aria-label="検索キーワード"><h3>検索キーワード</h3><p id="current-search" role="status"></p><p class="muted">別候補を選ぶと、今の調査を止めてその語で調べ直します。候補は本人確認済みという意味ではありません。</p><div id="search-choices" class="candidates"></div></section><p class="status hidden" id="correction-hint" role="status"></p><div id="candidates" class="candidates"></div>
 </section><section class="panel"><div class="section-head"><h2>エージェントの判断</h2><span class="section-number">02 / PROCESS</span></div><p id="trace-empty" class="empty-trace">調査中の判断と復旧の記録がここに表示されます。</p><ol id="trace" class="trace" aria-label="調査の処理履歴"></ol><details><summary>実APIの設定状況</summary><p class="muted" id="configuration"></p><p class="muted">APIキーと費用上限はサーバー側で設定します。</p></details></section></div>
 <div><div class="section-head"><h2>調査結果と質問 · 4件一覧</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="4件の調査結果と質問"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="topic-board" id="card-board">${BOARD_MARKUP}</div><div class="hud-foot"><span id="hud-source">各カードを押すと原文・出典を表示</span><span id="hud-expiry">0 / 4件確認</span></div></section><nav class="card-nav" aria-label="出典詳細の選択"><button id="previous" aria-label="前の出典" disabled>← 前の出典</button><span id="card-count">0 / 0</span><button id="next" aria-label="次の出典" disabled>次の出典 →</button></nav>
 <div class="notice" id="result-note">体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。</div><div class="metrics"><div class="metric"><strong id="metric-time">—</strong><span>調査にかかった時間</span></div><div class="metric"><strong id="metric-calls">—</strong><span>AI / 検索 / 本文</span></div><div class="metric"><strong id="metric-cost">—</strong><span id="cost-label">実費は未計測</span></div></div><section class="panel evidence-panel" id="evidence-panel" tabindex="-1"><div class="section-head"><h2>情報の根拠</h2><span class="section-number">04 / EVIDENCE</span></div><p class="muted" id="source-empty">本文の引用・出典・取得時刻を、カードごとに確認できます。</p><div id="sources"></div></section></div></div></main>
@@ -47,6 +48,15 @@ let viewToken = 'initial';
 let result: ResearchResult | null = null;
 let cardIndex = 0;
 let sourcePage = -1;
+type SourcePosition = { cardId: string; sourceId: string; excerpt: string; page: number };
+let sourcePosition: SourcePosition | null = null;
+let pendingNavigation: { page: number; position: SourcePosition | null; view: string } | null = null;
+let pendingSearchChoice: string | null = null;
+let searchCandidateIndex = -1;
+let searchCandidates: SearchCandidate[] = [];
+let currentSearch = '';
+let choosingSearch = false;
+
 let lockedPerson: ResearchResult['target'] = null;
 let lastInput: ResearchInput | null = null;
 let running = false;
@@ -100,12 +110,13 @@ function refreshControls() {
   $('retry-listening').toggleAttribute('disabled', !conversationRunning || !conversationId || resettingConversation);
   $('lock-person').toggleAttribute('disabled', !conversationRunning || resettingConversation || !hasCurrentCards() || !result?.target);
   $('lock-person').textContent = lockedPerson ? '固定を解除して聞き直す' : 'この人物で固定';
-  $('person-state').textContent = lockedPerson ? `${lockedPerson.personName}さんを固定中。聞き取りは継続。1回タップで解除・聞き直し。` : 'G2：1回タップで聞き直し・2回で人物固定。スクロールで出典、最後の次は4件一覧。';
+  $('person-state').textContent = lockedPerson ? `${lockedPerson.personName}さんを固定中。聞き取りは継続。1回タップで解除・聞き直し。` : 'G2：1回タップで聞き直し・2回で人物固定。スクロールは移動確認。1回で進む・2回でそのまま。';
+  renderSearchCandidates();
   $('conversation').textContent = voicePhase === 'error' ? '会話モードを再開' : '会話モードを開始';
   $('record').textContent = recording ? conversationRunning ? '会話モードを終了' : '録音を止めて調べる' : '音声で入力';
   if (voicePhase !== 'off') queueVoiceDisplay();
 }
-function newViewToken() { lockedPerson = null; sourcePage = -1; viewToken = `${currentId}:${revision}`; glassesView = emptyGlassesView(); g2?.invalidateViews(viewToken); }
+function newViewToken() { lockedPerson = null; sourcePage = -1; sourcePosition = null; pendingNavigation = null; pendingSearchChoice = null; viewToken = `${currentId}:${revision}`; glassesView = emptyGlassesView(); g2?.invalidateViews(viewToken); }
 // Count wide characters conservatively and preserve complete Unicode characters.
 function shortText(text: string, maximumWidth: number): string {
   const characters = Array.from(text.replace(/\s+/g, ' ').trim());
@@ -146,14 +157,82 @@ function excerptPages(text: string): string[] {
   for (let i = 0; i < lines.length; i += 6) pages.push(lines.slice(i, i + 6).join('\n'));
   return pages.length ? pages : ['該当文はありません'];
 }
+function positionAt(cards: Card[], index: number): SourcePosition | null {
+  if (index < 0) return null;
+  for (const card of cards) {
+    const count = excerptPages(card.excerpt).length;
+    if (index < count) return { cardId: card.cardId, sourceId: card.sourceId, excerpt: card.excerpt, page: index };
+    index -= count;
+  }
+  return null;
+}
+function pageAt(cards: Card[], position: SourcePosition | null): number {
+  if (!position) return -1;
+  // Reassessment regenerates card IDs. An unchanged source and exact excerpt
+  // can still anchor the same passage; a substituted source never can.
+  const index = cards.findIndex(card => card.cardId === position.cardId && card.sourceId === position.sourceId);
+  const match = index >= 0 ? index : cards.findIndex(card => card.sourceId === position.sourceId && card.excerpt === position.excerpt);
+  if (match < 0) return -1;
+  const count = excerptPages(cards[match]!.excerpt).length;
+  return cards.slice(0, match).reduce((total, card) => total + excerptPages(card.excerpt).length, 0) + Math.min(position.page, count - 1);
+}
 function navigateGlassesSource(direction: 1 | -1) {
   const cards = result?.cards.filter(card => Date.parse(card.expiresAt) > Date.now()).slice(0, 4) ?? [];
-  const total = cards.reduce((count, card) => count + excerptPages(card.excerpt).length, 0);
-  if (!total) return;
-  sourcePage += direction;
-  if (sourcePage >= total) sourcePage = -1;
-  if (sourcePage < -1) sourcePage = total - 1;
+  if (!cards.length && searchCandidates.length && conversationRunning && !choosingSearch) {
+    searchCandidateIndex = (searchCandidateIndex + direction + searchCandidates.length) % searchCandidates.length;
+    pendingSearchChoice = searchCandidates[searchCandidateIndex]!.id;
+    renderSearchView(); return;
+  }
+  const pages = cards.flatMap(card => excerptPages(card.excerpt).map(() => card.cardId));
+  if (!pages.length || pendingNavigation) return;
+  let page = sourcePage + direction;
+  if (page >= pages.length) page = -1;
+  if (page < -1) page = pages.length - 1;
+  pendingNavigation = { page, position: positionAt(cards, page), view: viewToken };
+  // Keep the current content and its native scroll position. Only the footer
+  // asks for permission; neither scrolling nor a double tap changes the page.
+  void renderGlassesView();
+}
+function settleNavigation(accept: boolean): boolean {
+  if (pendingSearchChoice) {
+    const id = pendingSearchChoice; pendingSearchChoice = null;
+    if (accept) void chooseSearchCandidate(id); else if (hasCurrentCards()) renderCard(); else renderSearchView();
+    return true;
+  }
+  if (!pendingNavigation) return false;
+  const choice = pendingNavigation; pendingNavigation = null;
+  const cards = result?.cards.filter(card => Date.parse(card.expiresAt) > Date.now()).slice(0, 4) ?? [];
+  const destination = pageAt(cards, choice.position);
+  if (accept && choice.view === viewToken && (choice.page === -1 || destination >= 0)) {
+    sourcePage = choice.page === -1 ? -1 : destination; sourcePosition = choice.position;
+  }
+  // Staying on the current screen still applies any completed enrichment, so
+  // the visible card and its next source navigation always use the same data.
   renderCard();
+  return true;
+}
+function renderSearchCandidates(values: SearchCandidate[] = searchCandidates) {
+  searchCandidates = values;
+  if (pendingSearchChoice && !values.some(candidate => candidate.id === pendingSearchChoice)) pendingSearchChoice = null;
+  $('search-panel').classList.toggle('hidden', !currentSearch && !values.length);
+  $('current-search').textContent = currentSearch || '検索を準備しています。選択できる検索候補：';
+  $('search-choices').replaceChildren();
+  for (const [index, candidate] of values.entries()) {
+    const button = document.createElement('button'); button.type = 'button'; button.disabled = choosingSearch || resettingConversation || !conversationRunning;
+    button.textContent = `${index + 1}. ${candidate.label}：${candidate.query}`;
+    button.onclick = () => { void chooseSearchCandidate(candidate.id); };
+    $('search-choices').append(button);
+  }
+}
+function clearSearch() {
+  currentSearch = ''; pendingSearchChoice = null; searchCandidateIndex = -1;
+  renderSearchCandidates([]);
+}
+function renderSearchView() {
+  if (hasCurrentCards() || !conversationRunning) return;
+  const selected = searchCandidates.find(candidate => candidate.id === pendingSearchChoice);
+  const choices = searchCandidates.map((candidate, index) => `${candidate.id === pendingSearchChoice ? '→' : ''}${index + 1} ${candidate.query}`).join('\n\n');
+  void sendView(selected ? 'この検索候補に変更しますか？' : '公開情報を検索中', `${currentSearch || '検索を準備中'}\n\n${choices}${choices ? '\n候補選択はスクロール' : ''}`, '1回=選択 2回=そのまま');
 }
 function isProgressive(value: ResearchResult | null): boolean {
   return value?.reasonCode === 'PROGRESSIVE_QUICK' || value?.reasonCode === 'PROGRESSIVE_ENRICHING';
@@ -176,7 +255,7 @@ function renderBoard(cards: Card[]) {
   }
 }
 function clearResult(preserveSelection = false) {
-  if (!preserveSelection) { lockedPerson = null; sourcePage = -1; }
+  if (!preserveSelection) { lockedPerson = null; sourcePage = -1; sourcePosition = null; pendingNavigation = null; }
   result = null; cardIndex = 0;
   $('candidates').replaceChildren(); $('sources').replaceChildren(); $('source-empty').classList.remove('hidden');
   renderBoard([]);
@@ -204,6 +283,8 @@ async function renderGlassesView() {
     }
     footer = shortText(footer, 46);
   }
+  if (pendingNavigation) footer = `${pendingNavigation.page === -1 ? '一覧に戻る' : '出典へ進む'}？ 1回=進む 2回=そのまま`;
+  else if (pendingSearchChoice) footer = '候補を選ぶ？ 1回=選ぶ 2回=そのまま';
   await g2.render({ ...glassesView, footer }, viewToken);
 }
 function queueVoiceDisplay(immediate = false) {
@@ -293,9 +374,11 @@ function renderCard() {
   const rows = Array.from({ length: 4 }, (_, index) => {
     const entry = cards[index];
     const label = entry ? cardLabel(entry) : '';
-    return entry ? `${index + 1}${label ? ` ${label}` : ''} 事:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')} 問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事:未確認 問:—`;
+    return entry ? `${index + 1}${label ? ` ${label}` : ''} 事実:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')}\n推奨質問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事実:未確認\n推奨質問:—`;
   });
   refreshControls();
+  if (pendingNavigation || pendingSearchChoice) { void renderGlassesView(); return; }
+  if (sourcePosition) sourcePage = pageAt(cards, sourcePosition);
   if (sourcePage >= 0) {
     const pages = cards.flatMap((entry, index) => {
       const sections = excerptPages(entry.excerpt);
@@ -303,16 +386,24 @@ function renderCard() {
     });
     sourcePage = Math.min(sourcePage, pages.length - 1);
     const page = pages[sourcePage]!;
+    sourcePosition = positionAt(cards, sourcePage);
     void sendView(`${lockedPerson ? '固定 ' : ''}${page.index + 1} ${cardLabel(page.entry) || '出典'} 該当文 ${page.page + 1}/${page.count}`, page.content, 'スクロールで続き・最後の次は一覧');
     return;
   }
-  void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${lockedPerson ? '固定 ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件${isProgressive(result) ? ' 速報・追加調査中' : ''}`, rows.join('\n'), 'スクロール=出典 / 1回=再認識 2回=固定');
+  sourcePosition = null;
+  void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${lockedPerson ? '固定 ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件${isProgressive(result) ? ' 速報・追加調査中' : ''}`, rows.join('\n\n'), 'スクロールで移動確認 / 1回=再認識 2回=固定');
 }
 function addTrace(event: TraceEvent) {
+  if (event.search) {
+    const platforms = { web: 'Web', x: 'X', instagram: 'Instagram', facebook: 'Facebook' };
+    const actions = { web_search: '検索', account_lookup: 'アカウント照会', recent_posts: '最近の投稿取得', archive_search: '過去投稿検索', social_posts: '投稿取得' };
+    currentSearch = `${platforms[event.search.provider]}・${actions[event.search.operation]}：${event.search.query}`;
+    renderSearchCandidates(); renderSearchView();
+  }
   if ($('trace').children.length >= 60) return;
   $('trace-empty').classList.add('hidden');
   const li = document.createElement('li'); const time = document.createElement('time'); time.textContent = new Date(event.at).toLocaleTimeString('ja-JP');
-  li.append(time, document.createTextNode(event.message)); $('trace').append(li); $('trace').scrollTop = $('trace').scrollHeight;
+  li.append(time, document.createTextNode(event.search ? `${event.message} ${event.search.query}` : event.message)); $('trace').append(li); $('trace').scrollTop = $('trace').scrollHeight;
 }
 function showResult(value: ResearchResult) {
   const failure = value.status === 'failed' ? researchFailure({ code: value.reasonCode, message: value.message }) : undefined;
@@ -341,7 +432,7 @@ function showResult(value: ResearchResult) {
   if (!value.cards.length) {
     renderBoard([]); $('hud-target').textContent = value.target?.personName || '対象未確認'; $('hud-expiry').textContent = '0 / 4件確認';
     void sendView(failure ? '調査を一時停止' : value.status === 'awaiting_confirmation' ? '相手の確認が必要です' : '確認できた情報はありません',
-      failure ? failure.message : Array.from({ length: 4 }, (_, index) => `${index + 1} 事:未確認 問:—`).join('\n'), failure?.action ?? 'スマートフォンで確認');
+      failure ? failure.message : Array.from({ length: 4 }, (_, index) => `${index + 1} 事実:未確認\n推奨質問:—`).join('\n\n'), failure?.action ?? 'スマートフォンで確認');
   }
   renderCard();
 }
@@ -421,6 +512,7 @@ async function redeemQrLogin(): Promise<boolean> {
   } finally { clearTimeout(timeout); setAuthBusy(false); }
 }
 function clearConversation() {
+  clearSearch();
   $('correction-hint').textContent = ''; $('correction-hint').classList.add('hidden');
   clearResult(); lastInput = null; $<HTMLTextAreaElement>('text').value = '';
   $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
@@ -437,6 +529,7 @@ async function research(selectedCandidateId?: string, preparedId?: string, activ
   const text = $<HTMLTextAreaElement>('text').value.trim(); if (!text) { status('人物名、または会話を入力してください。'); return; }
   if (running || recording && !activeConversationId || audioBusy || !token) return;
   $('resume-notice').classList.add('hidden');
+  currentSearch = ''; if (!activeConversationId) renderSearchCandidates([]); else renderSearchCandidates();
   currentId = preparedId || crypto.randomUUID(); revision += 1; newViewToken(); clearResult();
   if (activeConversationId) conversationRequestRevision = revision;
   $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
@@ -485,6 +578,7 @@ async function research(selectedCandidateId?: string, preparedId?: string, activ
   finally { if (controller === ownController) { running = false; controller = null; refreshControls(); } }
 }
 async function cancel() {
+  clearSearch();
   const wasConversation = conversationRunning;
   const oldId = currentId; const oldRevision = revision; abortConversation(); controller?.abort(); controller = null; running = false;
   currentId = crypto.randomUUID(); revision += 1; newViewToken(); clearResult();
@@ -509,14 +603,15 @@ g2 = new G2Runtime({ onStatus: g2Status, onAudio: acceptAudio, onAction: action 
   if (action === 'next') navigateGlassesSource(1);
   else if (action === 'previous') navigateGlassesSource(-1);
   else if (action === 'retry') {
+    if (settleNavigation(true)) return;
     if (conversationRunning) void retryConversation();
     else if (voicePhase === 'error' && token && !document.hidden && !pageLeaving) void startConversation();
-  } else if (action === 'lock') lockCurrentPerson();
+  } else if (action === 'lock') { if (!settleNavigation(false)) lockCurrentPerson(); }
   else if (action === 'exit') void cancel();
 } });
 function lockCurrentPerson() {
   if (!conversationRunning || resettingConversation || !hasCurrentCards() || !result?.target || document.hidden || pageLeaving) return;
-  lockedPerson = { ...result.target };
+  lockedPerson = { ...result.target }; choosingSearch = false;
   // Leave the current person's additional sources running, but reject an
   // identification response that was already in flight when the user locked.
   conversationSubjectGeneration++; transcriptDrainId++; identifyingTranscript = false;
@@ -526,6 +621,8 @@ function lockCurrentPerson() {
 }
 const phone = new PhoneAudio({ onAudio: acceptAudio, onStopped: reason => { if (recording && audioSource === 'phone') { if (conversationRunning) void cancel(); else void stopRecording(reason !== 'error'); } }, onError: message => status(message, true) });
 function abortConversation() {
+  pendingNavigation = null; pendingSearchChoice = null;
+  choosingSearch = false;
   lockedPerson = null;
   const wasActive = conversationRunning;
   const group = conversationId;
@@ -593,7 +690,7 @@ async function waitForNextUtterance(error: unknown) {
 async function processConversationTranscript(text: string, generation: number) {
   const subjectGeneration = conversationSubjectGeneration;
   const own = new AbortController();
-  const valid = () => !own.signal.aborted && subjectGeneration === conversationSubjectGeneration && !resettingConversation && !lockedPerson && generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
+  const valid = () => !own.signal.aborted && subjectGeneration === conversationSubjectGeneration && !resettingConversation && !choosingSearch && !lockedPerson && generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
   if (!valid()) return;
   const id = crypto.randomUUID(); const identifyRevision = revision + 1;
   identifyController = own; identifyingRequest = { requestId: id, subjectRevision: identifyRevision }; audioBusy = true; refreshControls();
@@ -601,6 +698,8 @@ async function processConversationTranscript(text: string, generation: number) {
     const response = await api('/api/conversation/identify', { ...json({ text, requestId: id, subjectRevision: identifyRevision, conversationId }), signal: own.signal });
     const data = await response.json(); if (!valid()) return;
     $<HTMLTextAreaElement>('text').value = typeof data.text === 'string' ? data.text : '';
+    const choices = SearchCandidateSchema.array().max(4).safeParse(data.searchCandidates);
+    if (choices.success) renderSearchCandidates(choices.data);
     const parsed = TargetSchema.array().max(3).safeParse(data.targets);
     const targets = parsed.success ? parsed.data : [];
     const correctionHint = typeof data.correctionHint === 'string' ? data.correctionHint.trim().slice(0, 400) : '';
@@ -636,7 +735,7 @@ async function processConversationTranscript(text: string, generation: number) {
   } finally { if (identifyController === own) { identifyController = null; identifyingRequest = null; } if (subjectGeneration === conversationSubjectGeneration && generation === audioGeneration) audioBusy = false; refreshControls(); }
 }
 async function drainTranscripts(generation: number) {
-  if (identifyingTranscript || resettingConversation || lockedPerson) return;
+  if (identifyingTranscript || resettingConversation || choosingSearch || lockedPerson) return;
   const drainId = ++transcriptDrainId;
   identifyingTranscript = true;
   try {
@@ -671,6 +770,7 @@ async function keepConversationAlive() {
 async function retryConversation() {
   if (!conversationRunning || !conversationId || resettingConversation || !token || document.hidden || pageLeaving) return;
   const group = conversationId; const generation = audioGeneration; const subjectGeneration = ++conversationSubjectGeneration;
+  clearSearch(); choosingSearch = false;
   resettingConversation = true; transcriptDrainId++; identifyingTranscript = false;
   for (const itemId of partialTranscripts.keys()) ignoredTranscriptItems.add(itemId);
   if (pendingTranscript) ignoredTranscriptItems.add(pendingTranscript.itemId);
@@ -700,6 +800,39 @@ async function retryConversation() {
     refreshControls();
   }
 }
+async function chooseSearchCandidate(choiceId: string) {
+  if (choosingSearch || resettingConversation || !conversationRunning || !conversationId || !token || document.hidden || pageLeaving || !$<HTMLInputElement>('consent').checked) return;
+  const choice = searchCandidates.find(candidate => candidate.id === choiceId); if (!choice) return;
+  const group = conversationId; const generation = audioGeneration; const subjectGeneration = ++conversationSubjectGeneration;
+  choosingSearch = true; resettingConversation = true; transcriptDrainId++; identifyingTranscript = false;
+  for (const itemId of partialTranscripts.keys()) ignoredTranscriptItems.add(itemId);
+  if (pendingTranscript) ignoredTranscriptItems.add(pendingTranscript.itemId);
+  while (ignoredTranscriptItems.size > 64) ignoredTranscriptItems.delete(ignoredTranscriptItems.values().next().value!);
+  pendingTranscript = null; partialTranscripts.clear(); completedTranscript = ''; voicePreview = '';
+  identifyController?.abort(); identifyController = null; identifyingRequest = null;
+  controller?.abort(); running = false; audioBusy = true;
+  currentId = crypto.randomUUID(); newViewToken(); clearResult(); currentSearch = '';
+  const own = new AbortController(); controller = own;
+  const valid = () => generation === audioGeneration && subjectGeneration === conversationSubjectGeneration && conversationRunning && conversationId === group && !own.signal.aborted && !!token && !document.hidden && !pageLeaving;
+  renderSearchCandidates(); status(`検索候補「${choice.query}」へ切り替えています。`); refreshControls();
+  try {
+    const data = await (await api('/api/conversation/search-choice', { ...json({ conversationId: group, choiceId }), signal: own.signal })).json();
+    if (!valid()) return;
+    const target = TargetSchema.parse(data.target);
+    if (typeof data.requestId !== 'string' || !/^[a-f0-9-]{36}$/i.test(data.requestId) || !Number.isSafeInteger(data.subjectRevision) || data.subjectRevision <= revision || typeof data.query !== 'string' || data.query.length > 300) throw new Error('検索候補の応答を確認できませんでした。');
+    revision = data.subjectRevision - 1;
+    conversationLastKey = `${target.companyName}|${target.personName}`.normalize('NFKC').replace(/\s+/g, '').toLowerCase(); conversationLastAt = Date.now();
+    $<HTMLTextAreaElement>('text').value = data.query;
+    resettingConversation = false; audioBusy = false; controller = null;
+    await research(undefined, data.requestId, group);
+  } catch (error) {
+    if (valid()) { status(error instanceof Error ? error.message : '検索候補を変更できませんでした。', true); void sendView('候補を選び直してください', '変更を完了できませんでした', '音声認識は継続中'); }
+  } finally {
+    if (subjectGeneration === conversationSubjectGeneration) { resettingConversation = false; audioBusy = false; choosingSearch = false; }
+    if (controller === own) controller = null;
+    renderSearchCandidates(); refreshControls();
+  }
+}
 async function startConversation() {
   if (stoppingAudio) {
     const generation = audioGeneration;
@@ -709,6 +842,7 @@ async function startConversation() {
   }
   if (!runtimeStatus.streamingEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || recording || audioBusy || conversationRunning || microphoneConnecting) return;
   if ($<HTMLSelectElement>('microphone').value === 'g2' && !connected) { if (await prepareGlassesMicrophone()) void startConversation(); return; }
+  clearSearch();
   const generation = ++audioGeneration; conversationRunning = true; recording = true;
   conversationId = ''; conversationRequestRevision = 0; conversationLastKey = ''; conversationLastAt = 0;
   completedTranscript = ''; partialTranscripts.clear(); pendingTranscript = null; ignoredTranscriptItems.clear(); resettingConversation = false; conversationSubjectGeneration++;
@@ -731,7 +865,7 @@ async function startConversation() {
       partialTranscripts.delete(itemId); completedTranscript = `${completedTranscript}\n${text}`.trim().slice(-1200);
       voicePreview = text; queueVoiceDisplay();
       $<HTMLTextAreaElement>('text').value = completedTranscript;
-      if (!lockedPerson) { pendingTranscript = { itemId, text: text.slice(0, 2000) }; void drainTranscripts(generation); }
+      if (!lockedPerson && !choosingSearch) { pendingTranscript = { itemId, text: text.slice(0, 2000) }; void drainTranscripts(generation); }
     },
     onError: error => { if (generation === audioGeneration) { void stopRecording(false); reportVoiceError(error.message); } },
     onClose: () => { if (generation === audioGeneration && conversationRunning) { void stopRecording(false); reportVoiceError('音声接続が終了しました。会話モードを再開してください。'); } },

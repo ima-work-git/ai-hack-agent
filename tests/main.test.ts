@@ -436,7 +436,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
     await vi.advanceTimersByTimeAsync(500);
     const board = lastView().content;
-    expect(board.split('\n')).toHaveLength(4);
+    expect(board.split('\n\n')).toHaveLength(4);
     stream.options.onDelta('next', 'こんにちは');
     await vi.advanceTimersByTimeAsync(500);
     expect(lastView().content).toBe(board);
@@ -1135,7 +1135,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('card-board').querySelectorAll('button:disabled')).toHaveLength(0);
     expect(element('hud-expiry').textContent).toBe('4 / 4件確認');
     const initialView = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
-    expect(initialView.content.split('\n')).toEqual(words.map((word, index) => `${index + 1} 事:公開事実${word}。 問:質問${word}？`));
+    expect(initialView.content.split('\n\n')).toEqual(words.map((word, index) => `${index + 1} 事実:公開事実${word}。\n推奨質問:質問${word}？`));
     click('next'); await flush();
     expect(element('card-count').textContent).toBe('2 / 4');
     expect(element('sources').querySelector('.source-fact')!.textContent).toBe('事実（全文）：公開事実に。');
@@ -1163,7 +1163,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect([...element('card-board').querySelectorAll('.topic-number')].map(node => node.textContent))
       .toEqual(labels.map((label, index) => `${index + 1} / ${label} · 原文・出典 ↗`));
     const board = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
-    expect(board.content.split('\n')).toEqual(labels.map((label, index) => `${index + 1} ${label} 事:公開事実${index + 1}です。 問:活動${index + 1}の工夫は？`));
+    expect(board.content.split('\n\n')).toEqual(labels.map((label, index) => `${index + 1} ${label} 事実:公開事実${index + 1}です。\n推奨質問:活動${index + 1}の工夫は？`));
     expect(board.content).not.toContain('…');
     expect(element('sources').querySelector('.source-post-date')!.textContent).toContain('2026/9/20');
     expect(element('sources').querySelector('.source-post-metrics')!.textContent).toBe('取得時の反響：いいね 1,200 / リポスト 34 / 返信 5 / 引用 6');
@@ -1208,6 +1208,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     let complete = '';
     for (let i = 0; i < 10; i++) {
       devices.g2!.options.onAction?.('next'); await flush();
+      devices.g2!.options.onAction?.('retry'); await flush();
       const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
       if (!view.header.includes('該当文')) { expect(view.content).toBe(board.content); break; }
       expect(view.content).not.toContain('…');
@@ -1215,6 +1216,161 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
       complete += view.content.replaceAll('\n', '');
     }
     expect(complete).toBe(value.cards[0]!.excerpt);
+  });
+
+  it('asks in the footer before leaving the question board; double tap stays and single tap enters the source', async () => {
+    routes.set('/api/session/resume', async () => jsonResponse({ result: researchResult() }));
+    await boot(); click('connect'); await flush(); click('resume'); await flush();
+    const view = () => devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    const original = view().content;
+    devices.g2!.options.onAction?.('next'); await flush();
+    expect(view().content).toBe(original); expect(view().footer).toContain('1回=進む 2回=そのまま');
+    devices.g2!.options.onAction?.('lock'); await flush();
+    expect(view().content).toBe(original); expect(view().footer).not.toContain('進む？');
+    expect(requests('/api/conversation/reset')).toHaveLength(0);
+    devices.g2!.options.onAction?.('next'); await flush();
+    devices.g2!.options.onAction?.('retry'); await flush();
+    expect(view().header).toContain('該当文'); expect(view().content.replaceAll('\n', '')).toBe(FACT);
+    expect(requests('/api/conversation/reset')).toHaveLength(0);
+    devices.g2!.options.onAction?.('next'); await flush();
+    expect(view().content.replaceAll('\n', '')).toBe(FACT); expect(view().footer).toContain('一覧に戻る？');
+    devices.g2!.options.onAction?.('retry'); await flush();
+    expect(view().content).toBe(original);
+  });
+
+  it('keeps the confirmation visible through an ASR delta and does not reset or lock the person on its answer', async () => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!; stream.options.onFinal('person', '架空の検証参加者です'); await flush();
+    devices.g2!.options.onAction?.('next'); await flush();
+    stream.options.onDelta('talk', '会話を継続'); await vi.advanceTimersByTimeAsync(500);
+    const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(view.footer).toContain('2回=そのまま');
+    devices.g2!.options.onAction?.('lock'); await flush();
+    expect(element('person-state').textContent).not.toContain('固定中');
+    expect(requests('/api/conversation/reset')).toHaveLength(0); expect(stream.cancel).not.toHaveBeenCalled();
+  });
+
+  it.each(['lock', 'retry'] as const)('aligns a board and its sources after %s dismisses a confirmation whose source was replaced', async action => {
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    devices.streaming!.options.onFinal('person', '架空の検証参加者です'); await flush();
+    const work = streams[0]!; const initial = fourCardResult(work.input, '最初');
+    pushResearchEvent(work.body, { type: 'update', result: initial }); await flush();
+    const view = () => devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    const initialBoard = view().content;
+    devices.g2!.options.onAction?.('next'); await flush();
+    const enriched = fourCardResult(work.input, '追加', 'COMPLETE');
+    enriched.cards = enriched.cards.map((card, index) => ({ ...card, cardId: `new-card-${index}`, sourceId: `new-source-${index}` }));
+    enriched.sources = enriched.sources.map((source, index) => ({ ...source, sourceId: `new-source-${index}` }));
+    pushResearchEvent(work.body, { type: 'result', result: enriched }); work.body.close(); await flush();
+    expect(view().content).toBe(initialBoard); expect(view().footer).toContain('2回=そのまま');
+    devices.g2!.options.onAction?.(action); await flush();
+    expect(view().content).toContain(enriched.cards[0]!.fact);
+    expect(view().content).not.toContain(initial.cards[0]!.fact);
+    expect(view().header).not.toContain('該当文');
+    devices.g2!.options.onAction?.('next'); await flush();
+    devices.g2!.options.onAction?.('retry'); await flush();
+    expect(view().content.replaceAll('\n', '')).toBe(enriched.cards[0]!.excerpt);
+    expect(requests('/api/conversation/reset')).toHaveLength(0);
+  });
+
+  it.each(['lock', 'retry'] as const)('remaps the same source passage and page offset after progressive reordering on %s', async action => {
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    devices.streaming!.options.onFinal('person', '架空の検証参加者です'); await flush();
+    const work = streams[0]!; const initial = fourCardResult(work.input);
+    initial.cards[1]!.excerpt = 'B'.repeat(440); initial.sources[1]!.text = initial.cards[1]!.excerpt;
+    pushResearchEvent(work.body, { type: 'update', result: initial }); await flush();
+    const view = () => devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    for (let i = 0; i < 3; i++) {
+      devices.g2!.options.onAction?.('next'); await flush();
+      devices.g2!.options.onAction?.('retry'); await flush();
+    }
+    expect(view().header).toContain('2/3'); const shown = view().content;
+    devices.g2!.options.onAction?.('next'); await flush();
+    const enriched = structuredClone(initial); enriched.reasonCode = 'COMPLETE';
+    enriched.cards = [enriched.cards[1]!, enriched.cards[0]!, ...enriched.cards.slice(2)].map((card, index) => ({ ...card, cardId: `regenerated-${index}` }));
+    pushResearchEvent(work.body, { type: 'result', result: enriched }); work.body.close(); await flush();
+    expect(view().content).toBe(shown);
+    devices.g2!.options.onAction?.(action); await flush();
+    expect(view().header).toMatch(/^1 .*該当文/u);
+    expect(view().header).toContain(action === 'lock' ? '2/3' : '3/3');
+    expect(view().content.replaceAll('\n', '')).toBe('B'.repeat(action === 'lock' ? 216 : 8));
+  });
+
+  it('displays the actual search operation and allows a stored alternative to research in the same conversation', async () => {
+    const choices = [
+      { id: 'search-first', label: '第一候補', query: '架空の検証参加者 公式 プロフィール', target: { personName: '架空の検証参加者', companyName: '' } },
+      { id: 'search-second', label: '別の候補', query: '別の架空人物 公開活動 登壇', target: { personName: '別の架空人物', companyName: '' } },
+    ];
+    routes.set('/api/conversation/identify', async () => jsonResponse({ text: '架空の検証参加者です', targets: [choices[0]!.target], hasPersonMention: true, searchCandidates: choices }));
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!; stream.options.onFinal('person', '架空の検証参加者です'); await flush();
+    pushResearchEvent(streams[0]!.body, { type: 'trace', event: { eventId: 1, step: 'search', at: new Date().toISOString(), message: '公開情報を検索', search: { provider: 'x', query: 'from:fixture_user -is:retweet -is:reply', operation: 'archive_search', stage: 'archive' } } }); await flush();
+    expect(element('current-search').textContent).toBe('X・過去投稿検索：from:fixture_user -is:retweet -is:reply');
+    expect(element('search-choices').children).toHaveLength(2);
+    const selectedId = 'fea2e8bc-d39f-4292-bd94-0da29e641a70';
+    routes.set('/api/conversation/search-choice', async () => jsonResponse({ requestId: selectedId, subjectRevision: 10, revision: 9, ...choices[1] }));
+    (element('search-choices').children[1] as HTMLButtonElement).click(); await flush();
+    expect(requests('/api/conversation/search-choice')).toHaveLength(1);
+    expect(JSON.parse(String(requests('/api/conversation/search-choice')[0]!.body))).toEqual({ conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab', choiceId: 'search-second' });
+    expect(streams[0]!.signal.aborted).toBe(true);
+    expect(streams[1]!.input).toMatchObject({ requestId: selectedId, subjectRevision: 10, text: choices[1]!.query, conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab' });
+    stream.options.onFinal('while-manual', '元の人物です'); await flush();
+    expect(requests('/api/conversation/identify')).toHaveLength(1); expect(stream.cancel).not.toHaveBeenCalled();
+    pushResearchEvent(streams[1]!.body, { type: 'result', result: researchResult(selectedId, 10) }); streams[1]!.body.close(); streams[0]!.body.close(); await flush();
+  });
+
+  it('offers search candidates on glasses without selecting them on scroll or double tap', async () => {
+    const choices = [{ id: 'candidate-one', label: '候補', query: '架空人物 公式 プロフィール', target: { personName: '架空人物', companyName: '' } }];
+    routes.set('/api/conversation/identify', async () => jsonResponse({ text: '架空人物です', targets: [], hasPersonMention: true, searchCandidates: choices }));
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    devices.streaming!.options.onFinal('ambiguous', '架空人物です'); await flush();
+    devices.g2!.options.onAction?.('next'); await flush();
+    let view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(view.content).toContain('架空人物 公式 プロフィール'); expect(view.footer).toContain('1回=選ぶ');
+    expect(requests('/api/conversation/search-choice')).toHaveLength(0);
+    devices.g2!.options.onAction?.('lock'); await flush();
+    expect(requests('/api/conversation/search-choice')).toHaveLength(0); expect(requests('/api/conversation/reset')).toHaveLength(0);
+  });
+
+  it('lets a single-tap retry during selected-candidate research resume identification on new speech', async () => {
+    const choices = [{ id: 'candidate-one', label: '候補', query: '架空人物', target: { personName: '架空人物', companyName: '' } }];
+    routes.set('/api/conversation/identify', async () => jsonResponse({ text: '架空人物', targets: [], hasPersonMention: true, searchCandidates: choices }));
+    routes.set('/api/conversation/search-choice', async () => jsonResponse({ requestId: 'fea2e8bc-d39f-4292-bd94-0da29e641a70', subjectRevision: 10, revision: 9, ...choices[0] }));
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush(); devices.streaming!.options.onFinal('ambiguous', '架空人物'); await flush();
+    (element('search-choices').children[0] as HTMLButtonElement).click(); await flush();
+    expect(streams).toHaveLength(1);
+    devices.g2!.options.onAction?.('retry'); await flush();
+    expect(requests('/api/conversation/reset')).toHaveLength(1); expect(streams[0]!.signal.aborted).toBe(true);
+    devices.streaming!.options.onFinal('fresh-person', '架空人物です'); await flush();
+    expect(requests('/api/conversation/identify')).toHaveLength(2);
+    streams[0]!.body.close(); await flush();
+  });
+
+  it('clears a pending source confirmation on audio error so a single tap really restarts', async () => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    devices.streaming!.options.onFinal('person', '架空の検証参加者です'); await flush();
+    devices.g2!.options.onAction?.('next'); await flush();
+    devices.streaming!.options.onError(new Error('音声接続が切れました。')); await flush();
+    const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(view.footer).not.toContain('2回=そのまま');
+    devices.g2!.options.onAction?.('retry'); await flush();
+    expect(requests('/api/conversation')).toHaveLength(2);
+    expect(devices.g2!.startAudio).toHaveBeenCalledTimes(2);
+  });
+
+  it('discards a search-choice response after consent withdrawal without paid research', async () => {
+    const choices = [{ id: 'candidate-one', label: '候補', query: '架空人物', target: { personName: '架空人物', companyName: '' } }];
+    routes.set('/api/conversation/identify', async () => jsonResponse({ text: '架空人物', targets: [], hasPersonMention: true, searchCandidates: choices }));
+    const response = deferred<Response>(); routes.set('/api/conversation/search-choice', () => response.promise);
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush(); devices.streaming!.options.onFinal('ambiguous', '架空人物'); await flush();
+    (element('search-choices').children[0] as HTMLButtonElement).click(); await flush();
+    element<HTMLInputElement>('consent').checked = false; element('consent').dispatchEvent(new Event('change')); await flush();
+    response.resolve(jsonResponse({ requestId: 'fea2e8bc-d39f-4292-bd94-0da29e641a70', subjectRevision: 10, revision: 9, ...choices[0] })); await flush();
+    expect(requests('/api/research')).toHaveLength(0);
   });
 
   it('keeps the real category when a profile fills a missing past-X slot, including source-only metadata', async () => {
@@ -1244,9 +1400,9 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
       expect(slot.querySelector('.topic-fact')!.textContent).toBe('未確認');
       expect(slot.querySelector('.topic-question')!.textContent).toBe('確認後に表示');
     }
-    const rows = (devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content.split('\n');
+    const rows = (devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content.split('\n\n');
     expect(rows).toHaveLength(4);
-    expect(rows.filter(row => row.includes('事:未確認'))).toHaveLength(4 - count);
+    expect(rows.filter(row => row.includes('事実:未確認'))).toHaveLength(4 - count);
   });
 
   it('shows complete concise pairs without ellipses and retains the full original in source details', async () => {
@@ -1262,10 +1418,10 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('question').textContent).toBe(displayQuestion);
     expect(element('sources').querySelector('.source-fact')!.textContent).toBe(`事実（全文）：${fact}`);
     expect(element('sources').querySelector('blockquote')!.textContent).toBe(fact);
-    const firstRow = (devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content.split('\n')[0]!;
-    expect(firstRow).toContain(`事:${displayFact}`); expect(firstRow).toContain(`問:${displayQuestion}`); expect(firstRow).not.toContain('…');
+    const firstRow = (devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content.split('\n\n')[0]!;
+    expect(firstRow).toContain(`事実:${displayFact}`); expect(firstRow).toContain(`推奨質問:${displayQuestion}`); expect(firstRow).not.toContain('…');
     expect(firstRow).not.toContain('\ufffd');
-    const width = Array.from(firstRow).reduce((sum, character) => sum + (/^[\x20-\x7e]$/.test(character) ? 1 : 2), 0);
+    const width = Math.max(...firstRow.split('\n').map(line => Array.from(line).reduce((sum, character) => sum + (/^[\x20-\x7e]$/.test(character) ? 1 : 2), 0)));
     expect(width).toBeLessThanOrEqual(45);
   });
 

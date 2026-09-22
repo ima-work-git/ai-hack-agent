@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import {
-  AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, ResearchInputSchema, ResearchResultSchema, SearchHitSchema, validatedCardDisplay,
+  AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, ResearchInputSchema, ResearchResultSchema, SearchHitSchema, SearchOperationSchema, validatedCardDisplay,
 } from '../src/shared/contracts.ts';
-import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, Target, TraceEvent } from '../src/shared/contracts.ts';
+import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, SearchTrace, Target, TraceEvent } from '../src/shared/contracts.ts';
 import { extractExplicitXHandles } from '../src/shared/x-account.ts';
 import { evidenceMatchesCard, selectBalancedCards } from '../src/shared/card-balance.ts';
 import { isAllowedConversationTopic } from '../src/shared/topic-policy.ts';
 import { evidenceMatchesTarget, normalizeIdentity, verifiedAliasForInputTarget, verifiedAliasForTarget } from '../src/shared/identity-aliases.ts';
-import type { ProviderResult, ResearchProvider } from './provider-contract.ts';
+import type { ProviderResult, ResearchProvider, SearchObserver } from './provider-contract.ts';
 import { ProviderError } from './provider-contract.ts';
 import { BudgetError, BudgetLedger } from './budget.ts';
 import type { BudgetReservation } from './budget.ts';
@@ -60,11 +60,18 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
   let reportedCostCalls = 0;
   let knownCost = true;
   const limits = { llm: 3, search: 2, page: 4 };
-  const emit = (step: string, message: string) => {
+  const emit = (step: string, message: string, search?: SearchTrace) => {
     if (trace.length >= 60) return;
-    const event = { eventId: trace.length + 1, step, message: `${input.mode === 'demo' ? '模擬：' : ''}${message}`, at: new Date(now()).toISOString() };
+    const event: TraceEvent = { eventId: trace.length + 1, step, message: `${input.mode === 'demo' ? '模擬：' : ''}${message}`, at: new Date(now()).toISOString(), ...(search ? { search } : {}) };
     trace.push(event);
     try { options.onEvent?.(event); } catch { /* An observer must not alter the research outcome. */ }
+  };
+  const observeSearch = (stage: SearchTrace['stage'], signal: AbortSignal): SearchObserver => search => {
+    if (signal.aborted || options.signal?.aborted || now() >= deadline) return;
+    const parsed = SearchOperationSchema.safeParse(search);
+    if (!parsed.success) return;
+    const labels = { web_search: 'Webの公開情報を検索します。', account_lookup: 'Xの公開アカウントを照会します。', recent_posts: 'Xの最近の投稿を取得します。', archive_search: 'Xの過去投稿を全期間から検索します。', social_posts: 'SNSの公開投稿を取得します。' };
+    emit('search', labels[parsed.data.operation], { ...parsed.data, stage: parsed.data.operation === 'archive_search' ? 'archive' : stage });
   };
   const check = () => {
     if (options.signal?.aborted) throw new StopError('CANCELLED');
@@ -157,7 +164,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     let pageCeiling = initialSearch ? Math.min(limits.page, counts.page + 2) : limits.page;
     emit('search', target?.companyName ? '対象の氏名と会社名に絞って公開情報を検索します。' : '氏名から公式プロフィールと公開活動の根拠を検索します。');
     let hits;
-    try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => initialSearch && progressive ? provider.searchRecent!(queryForTarget(query, true), signal) : provider.search(queryForTarget(query, initialSearch), signal))); }
+    try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => initialSearch && progressive ? provider.searchRecent!(queryForTarget(query, true), signal, observeSearch('initial', signal)) : provider.search(queryForTarget(query, initialSearch), signal, observeSearch(initialSearch ? 'initial' : 'additional', signal)))); }
     catch (error) { if (fatal(error)) throw error; hadFailure = true; emit('recovery', '検索を取得できませんでした。別の検索か検証済みの情報へ縮退します。'); return; }
     if (initialSearch && hits.some(hit => hit.topic)) {
       balancedTopics = true; limits.page = 6; pageCeiling = 4;
@@ -254,7 +261,10 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       tasks.push(operation(stop.signal).then(sources => ({ id, sources }), error => ({ id, sources: [], error })));
     };
     if (handles.length === 1 && provider.searchArchive) add(async extraSignal => {
-      const hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.searchArchive!(queryForTarget('公開活動', true), AbortSignal.any([signal, extraSignal]))));
+      const hits = SearchHitSchema.array().max(10).parse(await call('search', signal => {
+        const combined = AbortSignal.any([signal, extraSignal]);
+        return provider.searchArchive!(queryForTarget('公開活動', true), combined, observeSearch('archive', combined));
+      }));
       const result: EvidenceSource[] = [];
       for (const hit of hits.slice(0, 1)) {
         if (!sourceUrlIsPublicShape(hit.url)) continue;
@@ -263,7 +273,10 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       return result;
     });
     if (options.social?.hasTarget(target!)) for (const platform of ['facebook', 'instagram'] as const) add(async extraSignal =>
-      EvidenceSourceSchema.array().max(2).parse(await call('search', signal => options.social!.lookupPlatform(target!, platform, AbortSignal.any([signal, extraSignal])), 68_000, 0.10)));
+      EvidenceSourceSchema.array().max(2).parse(await call('search', signal => {
+        const combined = AbortSignal.any([signal, extraSignal]);
+        return options.social!.lookupPlatform(target!, platform, combined, observeSearch('social', combined));
+      }, 68_000, 0.10)));
     const remaining = new Map(tasks.map((task, id) => [id, task]));
     const pool = new Map(sources.map(source => [source.sourceId, source]));
     try {

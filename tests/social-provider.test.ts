@@ -59,6 +59,35 @@ describe('verified public social account selection', () => {
 });
 
 describe('bounded public social adapter', () => {
+  it('observes only the exact public profile sent to each actor before starting, and does not report cached work', async () => {
+    const observed = vi.fn(); const api = apiMock(); const base = api.getMockImplementation()!;
+    api.mockImplementation(async (input, options) => {
+      const url = new URL(String(input));
+      if (url.pathname.startsWith('/v2/actors/')) {
+        const body = JSON.parse(String(options?.body));
+        const platform = url.pathname.includes('instagram') ? 'instagram' : 'facebook';
+        const profile = platform === 'instagram' ? body.directUrls[0] : body.startUrls[0].url;
+        expect(observed).toHaveBeenCalledWith({ provider: platform, operation: 'social_posts', query: profile });
+      }
+      return base(input, options);
+    });
+    const live = provider(api);
+    await live.lookup(target, signal(), observed);
+    expect(observed).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(observed.mock.calls)).not.toContain('fixture-social');
+    await live.lookup(target, signal(), observed);
+    expect(observed).toHaveBeenCalledTimes(2); expect(api).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not notify for a cancelled social call, and observer failures never break a live operation', async () => {
+    const api = apiMock(); const live = provider(api); const observed = vi.fn();
+    const controller = new AbortController(); controller.abort();
+    await expect(live.lookupPlatform(target, 'instagram', controller.signal, observed)).rejects.toBeDefined();
+    expect(observed).not.toHaveBeenCalled(); expect(api).not.toHaveBeenCalled();
+    const response = await live.lookupPlatform(target, 'instagram', signal(), () => { throw new Error('display unavailable'); });
+    expect(response.value).toHaveLength(1);
+  });
+
   it('starts both official actors with explicit charge/time/post caps and uses Bearer headers only', async () => {
     const api = apiMock();
     const result = await provider(api).lookup(target, signal());
