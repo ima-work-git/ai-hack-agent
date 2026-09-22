@@ -7,17 +7,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createApiHandler } from '../server/http.ts';
+import type { AgentOptions, runAgent } from '../server/agent.ts';
 import { readConfig } from '../server/config.ts';
 import type { AppConfig } from '../server/config.ts';
 import { SessionStore } from '../server/sessions.ts';
-import { createFixtureProvider, DEMO_TEXT } from '../server/fixtures.ts';
+import { createFixtureProvider, DEMO_TARGET, DEMO_TEXT } from '../server/fixtures.ts';
 import type { ResearchProvider } from '../server/provider-contract.ts';
 import { pcmToWav } from '../server/providers.ts';
-import type { ResearchInput } from '../src/shared/contracts.ts';
+import type { ResearchInput, ResearchResult, Target } from '../src/shared/contracts.ts';
 import * as streamingRelay from '../server/ws-relay.ts';
 
 const cleanups: (() => Promise<void>)[] = [];
-async function fixture(options: { config?: Partial<AppConfig>; provider?: (input: ResearchInput) => ResearchProvider; liveProvider?: ResearchProvider; live?: boolean } = {}) {
+async function fixture(options: { config?: Partial<AppConfig>; provider?: (input: ResearchInput) => ResearchProvider; liveProvider?: ResearchProvider; live?: boolean; runAgent?: typeof runAgent } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'ai-hack-http-'));
   let now = Date.now();
   const config = { ...readConfig({ PRIVATE_DIR: directory, APP_ACCESS_CODE: 'test-access-code-123', ...(options.live ? {
@@ -27,7 +28,7 @@ async function fixture(options: { config?: Partial<AppConfig>; provider?: (input
     STT_API_KEY: 'test-not-a-key', STT_API_BASE_URL: 'https://example.invalid/v1', STT_MODEL: 'test-model',
   } : {}) }), ...options.config };
   let store = new SessionStore(directory, () => now);
-  const createHandler = () => createApiHandler(config, { store, now: () => now, provider: options.provider, liveProvider: options.liveProvider });
+  const createHandler = () => createApiHandler(config, { store, now: () => now, provider: options.provider, liveProvider: options.liveProvider, runAgent: options.runAgent });
   let api = createHandler();
   cleanups.push(async () => { api.close(); await rm(directory, { recursive: true, force: true }); });
   const request = async (path: string, init: { method?: string; headers?: Record<string, string>; body?: string | Uint8Array } = {}) => {
@@ -50,7 +51,7 @@ async function fixture(options: { config?: Partial<AppConfig>; provider?: (input
     });
     void api.handle(req, res as unknown as ServerResponse).then(handled => { if (!handled) res.writeHead(404).end(); });
     await headersDone;
-    return { status: res.statusCode, headers: responseHeaders, text: () => bodyDone, json: async () => JSON.parse(await bodyDone) };
+    return { status: res.statusCode, headers: responseHeaders, text: () => bodyDone, json: async () => JSON.parse(await bodyDone), peek: () => chunks.join(''), get ended() { return res.writableEnded; } };
   };
   const login = async (cookie?: string, accessCode = 'test-access-code-123', rememberDevice = false) => {
     const response = await request('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) }, body: JSON.stringify({ accessCode, rememberDevice }) });
@@ -723,5 +724,199 @@ describe('continuous conversation correction and recovery', () => {
     expect((await f.research(auth.body.token, f.body(data.revision + 1, { mode: 'live', conversationId: group.conversationId, requestId: oldId }))).response.status).toBe(409);
     grant.onFinal('広行さん'); const fresh = await identify('広行さん', data.revision + 1);
     expect(fresh.status).toBe(200); expect((await fresh.json()).targets[0].personName).toBe('西村博之');
+  });
+});
+
+describe('progressive conversation research', () => {
+  type PendingResearch = { input: ResearchInput; options: AgentOptions; finish: (result: ResearchResult) => void };
+  const events = (text: string) => text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  function snapshot(input: ResearchInput, target: Target = DEMO_TARGET, reasonCode = 'PROGRESSIVE_QUICK'): ResearchResult {
+    const fact = `${target.personName}は架空の公開勉強会に登壇しました。`;
+    return {
+      requestId: input.requestId, subjectRevision: input.subjectRevision, mode: input.mode, status: 'partial', target,
+      candidates: [], cards: [{ cardId: 'fixture-card', fact, suggestedQuestion: '勉強会の話題を教えていただけますか？',
+        sourceId: 'fixture-source', excerpt: fact, requestId: input.requestId, subjectRevision: input.subjectRevision,
+        expiresAt: new Date(Date.now() + 300_000).toISOString() }],
+      sources: [{ sourceId: 'fixture-source', url: 'https://example.invalid/fictional/event', title: '架空の公開勉強会',
+        retrievedAt: new Date().toISOString(), text: fact, kind: 'fixture' }],
+      trace: [], reasonCode, message: '架空の資料を使った検証です。',
+      usage: { llm: 0, searches: 0, pages: 0, elapsedMs: 1, reservedUsd: 0, actualUsd: 0, costKnown: true },
+    };
+  }
+  async function setup() {
+    let takeTicket!: (ticket: string) => streamingRelay.StreamGrant;
+    const reset = vi.fn(() => true); const closeConversation = vi.fn();
+    const spy = vi.spyOn(streamingRelay, 'createStreamingRelay').mockImplementation(options => {
+      takeTicket = options.takeTicket;
+      return { upgrade: () => false, closeConversation, close: vi.fn(), resetConversation: reset, updateKeywordsConversation: vi.fn(() => true) };
+    });
+    cleanups.push(async () => { spy.mockRestore(); });
+    const normal = createFixtureProvider('normal');
+    const plan = vi.fn<ResearchProvider['plan']>(normal.plan);
+    const runs: PendingResearch[] = [];
+    const runner = vi.fn<typeof runAgent>((input, _provider, options = {}) => new Promise(resolve => {
+      runs.push({ input, options, finish: resolve });
+    }));
+    const f = await fixture({ live: true, liveProvider: { ...normal, mode: 'live', plan }, runAgent: runner,
+      config: { maximumCosts: { llm: 0.001, search: 0.001, page: 0 }, streamingApiKey: 'fake', streamingAudioMaxPerMinute: 0.01 } });
+    f.config.status.streamingEnabled = true;
+    const auth = await f.login();
+    const post = (path: string, data: unknown) => f.request(path, { method: 'POST', headers: {
+      Authorization: `Bearer ${auth.body.token}`, 'Content-Type': 'application/json',
+    }, body: JSON.stringify(data) });
+    const group = await (await post('/api/conversation', {})).json();
+    const issued = await (await post('/api/conversation/stream', { conversationId: group.conversationId })).json();
+    const grant = takeTicket(issued.ticket);
+    const identify = (text: string, revision = 1, requestId = randomUUID()) => post('/api/conversation/identify', {
+      conversationId: group.conversationId, requestId, subjectRevision: revision, text,
+    });
+    const begin = async () => {
+      const requestId = randomUUID(); grant.onFinal(DEMO_TEXT);
+      expect((await identify(DEMO_TEXT, 1, requestId)).status).toBe(200);
+      const response = await post('/api/research', f.body(1, { mode: 'live', conversationId: group.conversationId, requestId }));
+      expect(response.status).toBe(200); expect(runs).toHaveLength(1);
+      const run = runs[0]!; const quick = snapshot(run.input); run.options.onSnapshot!(quick);
+      return { response, run, quick };
+    };
+    return { f, auth, post, group, grant, identify, plan, runs, runner, begin, reset, closeConversation };
+  }
+
+  it('streams a snapshot before completion and resumes the same saved cards while enrichment stays open', async () => {
+    const { f, auth, post, begin } = await setup();
+    const { response, run, quick } = await begin();
+    expect(response.ended).toBe(false);
+    expect(events(response.peek())).toEqual([{ type: 'update', result: quick }]);
+    expect((await (await post('/api/session/resume', {})).json()).result).toEqual(quick);
+    const session = f.store.authenticate(auth.body.token)!;
+    expect(session.running).toBe(true); expect(session.result).toEqual(quick);
+    const final = { ...quick, status: 'ready' as const, reasonCode: 'COMPLETE' };
+    run.finish(final);
+    expect(events(await response.text())).toEqual([{ type: 'update', result: quick }, { type: 'result', result: final }]);
+    expect((await (await post('/api/session/resume', {})).json()).result).toEqual(final);
+    expect(session.running).toBe(false);
+  });
+
+  it('identifies ordinary speech during enrichment without interrupting research or replacing its saved result', async () => {
+    const { f, auth, post, grant, identify, plan, begin } = await setup();
+    const { response, run, quick } = await begin();
+    plan.mockResolvedValueOnce({ value: { target: null, needsConfirmation: false, candidates: [], query: '', reason: '人物への言及なし', hasPersonMention: false }, actualUsd: 0 });
+    const text = '今日は良い天気ですね。'; grant.onFinal(text);
+    const identified = await identify(text, 2);
+    expect(identified.status).toBe(200); expect(await identified.json()).toMatchObject({ targets: [], hasPersonMention: false });
+    expect(run.options.signal!.aborted).toBe(false); expect(response.ended).toBe(false);
+    expect(f.store.authenticate(auth.body.token)).toMatchObject({ running: true, revision: 1, result: quick });
+    expect((await (await post('/api/session/resume', {})).json()).result).toEqual(quick);
+    const enriched = snapshot(run.input, DEMO_TARGET, 'PROGRESSIVE_ENRICHING');
+    run.options.onSnapshot!(enriched);
+    expect(events(response.peek()).at(-1)).toEqual({ type: 'update', result: enriched });
+    run.finish({ ...enriched, reasonCode: 'COMPLETE' });
+    expect(events(await response.text()).map(event => event.type)).toEqual(['update', 'update', 'result']);
+  });
+
+  it('accepts research for an identified window while a later revision is still being identified', async () => {
+    const { f, post, group, grant, identify, plan, runs } = await setup();
+    const requestId = randomUUID(); grant.onFinal(DEMO_TEXT);
+    expect((await identify(DEMO_TEXT, 1, requestId)).status).toBe(200);
+    let identifySignal!: AbortSignal;
+    let finishIdentify!: (value: Awaited<ReturnType<ResearchProvider['plan']>>) => void;
+    let started!: () => void; const planStarted = new Promise<void>(resolve => { started = resolve; });
+    plan.mockImplementationOnce((_input, signal) => {
+      identifySignal = signal; started(); return new Promise(resolve => { finishIdentify = resolve; });
+    });
+    const text = '今日は良い天気ですね。'; grant.onFinal(text);
+    const pending = identify(text, 2); await planStarted;
+    const response = await post('/api/research', f.body(1, { mode: 'live', conversationId: group.conversationId, requestId }));
+    expect(response.status).toBe(200); expect(runs).toHaveLength(1);
+    const run = runs[0]!; const quick = snapshot(run.input); run.options.onSnapshot!(quick);
+    expect(identifySignal.aborted).toBe(false); expect(run.options.signal!.aborted).toBe(false);
+    expect(events(response.peek())).toEqual([{ type: 'update', result: quick }]);
+    finishIdentify({ value: { target: null, needsConfirmation: false, candidates: [], query: '', reason: '人物への言及なし', hasPersonMention: false }, actualUsd: 0 });
+    const identified = await pending;
+    expect(identified.status).toBe(200); expect(await identified.json()).toMatchObject({ targets: [], hasPersonMention: false });
+    expect(run.options.signal!.aborted).toBe(false);
+    expect((await (await post('/api/session/resume', {})).json()).result).toEqual(quick);
+    run.finish({ ...quick, reasonCode: 'COMPLETE' });
+    expect(events(await response.text()).map(event => event.type)).toEqual(['update', 'result']);
+  });
+
+  it('cancels the whole conversation when the requested research just finished but later identification is pending', async () => {
+    const { post, group, grant, identify, plan, begin, closeConversation } = await setup();
+    const { response, run, quick } = await begin();
+    let identifySignal!: AbortSignal;
+    let finishIdentify!: (value: Awaited<ReturnType<ResearchProvider['plan']>>) => void;
+    let started!: () => void; const planStarted = new Promise<void>(resolve => { started = resolve; });
+    plan.mockImplementationOnce((_input, signal) => {
+      identifySignal = signal; started(); return new Promise(resolve => { finishIdentify = resolve; });
+    });
+    const text = '今日は良い天気ですね。'; grant.onFinal(text);
+    const pending = identify(text, 2); await planStarted;
+    run.finish({ ...quick, reasonCode: 'COMPLETE' });
+    expect(events(await response.text()).map(event => event.type)).toEqual(['update', 'result']);
+    const cancellation = { conversationId: group.conversationId, requestId: run.input.requestId, subjectRevision: run.input.subjectRevision };
+    expect((await post('/api/cancel', { ...cancellation, subjectRevision: 3 })).status).toBe(409);
+    expect(identifySignal.aborted).toBe(false);
+    const cancelled = await post('/api/cancel', cancellation);
+    expect(cancelled.status).toBe(200); expect(await cancelled.json()).toEqual({ cancelled: true });
+    expect(identifySignal.aborted).toBe(true); expect(closeConversation).toHaveBeenCalledWith(group.conversationId);
+    expect(grant.valid()).toBe(false);
+    finishIdentify({ value: { target: null, needsConfirmation: false, candidates: [], query: '', reason: '人物への言及なし', hasPersonMention: false }, actualUsd: 0 });
+    expect((await pending).status).toBe(409);
+    expect((await (await post('/api/session/resume', {})).json()).result).toBeNull();
+  });
+
+  it('supersedes old research only when a new identified subject starts and discards its late updates and result', async () => {
+    const { f, post, group, grant, identify, plan, runs, begin } = await setup();
+    const { response: oldResponse, run: oldRun, quick } = await begin();
+    const target = { personName: '架空花子', companyName: '架空研究所' };
+    plan.mockResolvedValueOnce({ value: { target, needsConfirmation: false, candidates: [], query: '', reason: '発話中の別人物', hasPersonMention: true }, actualUsd: 0 });
+    const text = '架空研究所の架空花子さんについて'; const requestId = randomUUID(); grant.onFinal(text);
+    const identified = await identify(text, 2, requestId);
+    expect(identified.status).toBe(200); expect((await identified.json()).targets).toEqual([target]);
+    expect(oldRun.options.signal!.aborted).toBe(false);
+    const freshResponse = await post('/api/research', f.body(2, { mode: 'live', conversationId: group.conversationId, requestId, text }));
+    expect(freshResponse.status).toBe(200); expect(runs).toHaveLength(2);
+    expect(oldRun.options.signal!.aborted).toBe(true);
+    const freshRun = runs[1]!; const freshSnapshot = snapshot(freshRun.input, target);
+    freshRun.options.onSnapshot!(freshSnapshot);
+    oldRun.options.onSnapshot!(snapshot(oldRun.input, DEMO_TARGET, 'LATE_OLD_UPDATE'));
+    expect(events(oldResponse.peek())).toEqual([{ type: 'update', result: quick }]);
+    oldRun.finish({ ...quick, reasonCode: 'LATE_OLD_RESULT' });
+    expect(events(await oldResponse.text()).map(event => event.type)).toEqual(['update', 'error']);
+    expect(freshRun.options.signal!.aborted).toBe(false);
+    expect((await (await post('/api/session/resume', {})).json()).result).toEqual(freshSnapshot);
+    freshRun.finish({ ...freshSnapshot, reasonCode: 'COMPLETE' });
+    expect(events(await freshResponse.text()).map(event => event.type)).toEqual(['update', 'result']);
+  });
+
+  it.each(['reset', 'end'] as const)('%s aborts independent identification and research and prevents either from restoring discarded cards', async operation => {
+    const { f, auth, post, group, grant, identify, plan, begin, reset, closeConversation } = await setup();
+    const { response, run, quick } = await begin();
+    let identifySignal!: AbortSignal;
+    let finishIdentify!: (value: Awaited<ReturnType<ResearchProvider['plan']>>) => void;
+    let started!: () => void; const planStarted = new Promise<void>(resolve => { started = resolve; });
+    plan.mockImplementationOnce((_input, signal) => {
+      identifySignal = signal; started(); return new Promise(resolve => { finishIdentify = resolve; });
+    });
+    const text = '今日は良い天気ですね。'; grant.onFinal(text);
+    const pending = identify(text, 2); await planStarted;
+    expect(identifySignal).not.toBe(run.options.signal);
+    expect(identifySignal.aborted).toBe(false); expect(run.options.signal!.aborted).toBe(false);
+    const stopped = operation === 'reset' ? await post('/api/conversation/reset', { conversationId: group.conversationId })
+      : await f.request('/api/session', { method: 'DELETE', headers: { Authorization: `Bearer ${auth.body.token}` } });
+    expect(stopped.status).toBe(200);
+    expect(identifySignal.aborted).toBe(true); expect(run.options.signal!.aborted).toBe(true);
+    run.options.onSnapshot!({ ...quick, reasonCode: 'DISCARDED_UPDATE' });
+    run.finish({ ...quick, reasonCode: 'DISCARDED_RESULT' });
+    finishIdentify({ value: { target: null, needsConfirmation: false, candidates: [], query: '', reason: '人物への言及なし', hasPersonMention: false }, actualUsd: 0 });
+    expect((await pending).status).toBe(409);
+    expect(events(await response.text()).map(event => event.type)).toEqual(['update', 'error']);
+    if (operation === 'reset') {
+      expect(reset).toHaveBeenCalledWith(group.conversationId); expect(closeConversation).not.toHaveBeenCalled();
+      expect(grant.valid()).toBe(true);
+      expect((await (await post('/api/session/resume', {})).json()).result).toBeNull();
+    } else {
+      expect(closeConversation).toHaveBeenCalledWith(group.conversationId); expect(grant.valid()).toBe(false);
+      expect((await post('/api/session/resume', {})).status).toBe(401);
+    }
   });
 });

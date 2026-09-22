@@ -11,10 +11,13 @@ import type { ProviderResult, ResearchProvider } from './provider-contract.ts';
 import { ProviderError } from './provider-contract.ts';
 import { BudgetError, BudgetLedger } from './budget.ts';
 import type { BudgetReservation } from './budget.ts';
+import type { SocialProvider } from './social-provider.ts';
 
 export interface AgentOptions {
   signal?: AbortSignal;
   onEvent?: (event: TraceEvent) => void;
+  onSnapshot?: (result: ResearchResult) => void;
+  social?: SocialProvider;
   budget?: BudgetLedger;
   maximumCosts?: { llm: number; search: number; page: number };
   now?: () => number;
@@ -36,7 +39,8 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
   const input = ResearchInputSchema.parse(rawInput);
   const now = options.now ?? Date.now;
   const started = now();
-  const deadline = started + 20_000;
+  let deadline = started + 20_000;
+  const progressive = input.mode === 'live' && !!options.onSnapshot && !!provider.searchRecent;
   const budgetRunId = options.budgetRunId ?? randomUUID();
   const handles = extractExplicitXHandles(input.text);
   const trace: TraceEvent[] = [];
@@ -48,6 +52,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
   let hadFailure = false;
   let publicIdentityVerified = false;
   let balancedTopics = false;
+  let enriching = false;
   let counts = { llm: 0, search: 0, page: 0 };
   let observedCost = 0;
   let reservedCost = 0;
@@ -65,7 +70,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     if (options.signal?.aborted) throw new StopError('CANCELLED');
     if (now() >= deadline) throw new StopError('DEADLINE_EXCEEDED');
   };
-  const call = async <T>(kind: keyof typeof counts, operation: (signal: AbortSignal) => Promise<ProviderResult<T>>, operationTimeoutMs = 8_000): Promise<T> => {
+  const call = async <T>(kind: keyof typeof counts, operation: (signal: AbortSignal) => Promise<ProviderResult<T>>, operationTimeoutMs = 8_000, maximumUsd = options.maximumCosts?.[kind] ?? 0): Promise<T> => {
     check();
     if (counts[kind] >= limits[kind]) throw new StopError('CALL_LIMIT');
     let reservation: BudgetReservation | undefined;
@@ -82,15 +87,15 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     if (options.signal?.aborted) abort();
     const pending = Promise.resolve().then(async () => {
       if (input.mode === 'live') {
-        reservation = await options.budget!.reserve(budgetRunId, options.maximumCosts![kind]);
-        reservedCost += options.maximumCosts![kind];
+        reservation = await options.budget!.reserve(budgetRunId, maximumUsd);
+        reservedCost += maximumUsd;
       }
       try {
         check();
         if (controller.signal.aborted) throw new StopError('OPERATION_TIMEOUT');
       } catch (error) {
         // Nothing has been sent: this reservation can be released without guessing a charge.
-        if (reservation) { await options.budget!.settle(reservation, 0); reservedCost -= options.maximumCosts![kind]; }
+        if (reservation) { await options.budget!.settle(reservation, 0); reservedCost -= maximumUsd; }
         throw error;
       }
       counts[kind] += 1;
@@ -105,7 +110,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       if (actual !== undefined && (!Number.isFinite(actual) || actual < 0)) throw new ProviderError('INVALID_COST', '費用応答が不正です。');
       if (reservation) {
         await options.budget!.settle(reservation, actual ?? null);
-        if (actual !== undefined) reservedCost -= options.maximumCosts![kind];
+        if (actual !== undefined) reservedCost -= maximumUsd;
       }
       if (actual === undefined) knownCost = false; else observedCost += actual;
       return result.value;
@@ -152,7 +157,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     let pageCeiling = initialSearch ? Math.min(limits.page, counts.page + 2) : limits.page;
     emit('search', target?.companyName ? '対象の氏名と会社名に絞って公開情報を検索します。' : '氏名から公式プロフィールと公開活動の根拠を検索します。');
     let hits;
-    try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.search(queryForTarget(query, initialSearch), signal))); }
+    try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => initialSearch && progressive ? provider.searchRecent!(queryForTarget(query, true), signal) : provider.search(queryForTarget(query, initialSearch), signal))); }
     catch (error) { if (fatal(error)) throw error; hadFailure = true; emit('recovery', '検索を取得できませんでした。別の検索か検証済みの情報へ縮退します。'); return; }
     if (initialSearch && hits.some(hit => hit.topic)) {
       balancedTopics = true; limits.page = 6; pageCeiling = 4;
@@ -211,17 +216,91 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
         emit('discard', '健康や私生活に関わる話題を含むため、カード全体を除外しました。'); continue;
       }
       const source = sources.find(s => s.sourceId === proposal.sourceId);
-      if (!source || !contains(source.text, proposal.excerpt) || !evidenceMatchesCard(proposal.excerpt, target, source, sources) || !contains(proposal.excerpt, proposal.fact) || source.xPost && !contains(source.xPost.text, proposal.fact)) {
+      if (!source || !contains(source.text, proposal.excerpt) || !evidenceMatchesCard(proposal.excerpt, target, source, sources) || !contains(proposal.excerpt, proposal.fact) || source.xPost && !contains(source.xPost.text, proposal.fact) || source.socialPost && !contains(source.socialPost.text, proposal.fact)) {
         emit('discard', '出典、対象名・所属、本文引用の検査に通らないカードを棄却しました。'); continue;
       }
       if (cards.some(c => normalize(c.fact) === normalize(proposal.fact)) || cards.length >= 8) continue;
       const { displayFact, displayQuestion, ...verifiedProposal } = proposal;
       cards.push({ ...verifiedProposal, ...validatedCardDisplay(proposal.fact, proposal.excerpt, displayFact, displayQuestion), cardId: randomUUID(), expiresAt: new Date(now() + 300_000).toISOString(), requestId: input.requestId, subjectRevision: input.subjectRevision });
     }
-    if (balancedTopics) cards = selectBalancedCards(cards, sources);
+    if (balancedTopics) cards = selectBalancedCards(cards, sources, enriching);
     else cards = cards.slice(0, 4);
     emit('verify', `${cards.length}件のカードが本文引用と対象照合の検査を通りました。`);
     return true;
+  };
+
+  const publish = async (reasonCode: string) => {
+    if (!cards.length || options.signal?.aborted) return;
+    const result = await finish('partial', reasonCode, '確認できた話題を先に表示しています。追加の公開情報を調査中です。');
+    try { options.onSnapshot?.(result); } catch { /* Display failures cannot change verified facts. */ }
+  };
+  const invalidateIdentity = async () => {
+    cards = [];
+    const result = await finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '追加資料で人物を絞れなくなったため話題の表示を止めました。名前や所属を確認してください。');
+    if (!options.signal?.aborted) try { options.onSnapshot?.(result); } catch { /* The final result also invalidates the display. */ }
+    return false;
+  };
+  const enrich = async (): Promise<boolean> => {
+    // Slow sources have a separate time allowance AFTER the first verified
+    // result. The request remains cancellable and never extends an ASR session.
+    deadline = started + 90_000;
+    enriching = true;
+    limits.llm = 6; limits.search = 5; limits.page = 9;
+    const stop = new AbortController();
+    type Arrival = { id: number; sources: EvidenceSource[]; error?: unknown };
+    const tasks: Array<Promise<Arrival>> = [];
+    const add = (operation: (signal: AbortSignal) => Promise<EvidenceSource[]>) => {
+      const id = tasks.length;
+      tasks.push(operation(stop.signal).then(sources => ({ id, sources }), error => ({ id, sources: [], error })));
+    };
+    if (handles.length === 1 && provider.searchArchive) add(async extraSignal => {
+      const hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.searchArchive!(queryForTarget('公開活動', true), AbortSignal.any([signal, extraSignal]))));
+      const result: EvidenceSource[] = [];
+      for (const hit of hits.slice(0, 1)) {
+        if (!sourceUrlIsPublicShape(hit.url)) continue;
+        result.push(EvidenceSourceSchema.parse(await call('page', signal => provider.fetchPage(hit, AbortSignal.any([signal, extraSignal])))));
+      }
+      return result;
+    });
+    if (options.social?.hasTarget(target!)) for (const platform of ['facebook', 'instagram'] as const) add(async extraSignal =>
+      EvidenceSourceSchema.array().max(2).parse(await call('search', signal => options.social!.lookupPlatform(target!, platform, AbortSignal.any([signal, extraSignal])), 68_000, 0.10)));
+    const remaining = new Map(tasks.map((task, id) => [id, task]));
+    const pool = new Map(sources.map(source => [source.sourceId, source]));
+    try {
+      while (remaining.size && counts.llm < limits.llm) {
+        const arrived = await Promise.race(remaining.values()); remaining.delete(arrived.id); check();
+        if (arrived.error) {
+          if (fatal(arrived.error)) throw arrived.error;
+          hadFailure = true; emit('recovery', '追加情報を取得できませんでした。先に確認できた話題を維持します。'); continue;
+        }
+        if (!arrived.sources.length) continue;
+        for (const source of arrived.sources) if (source.kind !== 'fixture' && sourceUrlIsPublicShape(source.url)) pool.set(source.sourceId, source);
+        const all = [...pool.values()];
+        const identity = all.find(source => (source.kind === 'web' || source.kind === 'x' && !source.xPost) && matches(source.text, target!, source.url));
+        const chosen: EvidenceSource[] = [];
+        const take = (items: EvidenceSource[]) => { for (const source of items) if (chosen.length < 6 && !chosen.some(item => item.sourceId === source.sourceId)) chosen.push(source); };
+        take(identity ? [identity] : []);
+        take(all.filter(source => source.topic === 'recent_x').slice(0, 2));
+        take(all.filter(source => source.topic === 'popular_x').slice(0, 1));
+        take(all.filter(source => source.kind === 'facebook' || source.kind === 'instagram').slice(0, 2));
+        take(all.filter(source => cards.some(card => card.sourceId === source.sourceId)));
+        take(all);
+        const priorSources = [...sources]; const priorCards = cards; const priorIdentity = publicIdentityVerified;
+        sources.splice(0, sources.length, ...chosen); cards = [];
+        try {
+          const evaluated = await assess();
+          if (!applyAssessment(evaluated)) return await invalidateIdentity();
+          if (!evaluated.identityVerified || !target!.companyName && !publicIdentityVerified) return await invalidateIdentity();
+          if (cards.length) await publish('PROGRESSIVE_ENRICHING');
+          else { sources.splice(0, sources.length, ...priorSources); cards = priorCards; publicIdentityVerified = priorIdentity; }
+        } catch (error) {
+          sources.splice(0, sources.length, ...priorSources); cards = priorCards; publicIdentityVerified = priorIdentity;
+          if (fatal(error)) throw error;
+          hadFailure = true; emit('recovery', '追加情報の検証に失敗しました。確認済みの話題はそのまま表示します。');
+        }
+      }
+      return true;
+    } finally { stop.abort(); await Promise.allSettled(tasks); }
   };
 
   try {
@@ -260,12 +339,13 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       return finish(hadFailure ? 'failed' : 'no_evidence', hadFailure ? 'SOURCES_UNAVAILABLE' : 'NO_VERIFIABLE_EVIDENCE',
         hadFailure ? '情報源を取得できず、根拠を確認できませんでした。入力または接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
     }
-    if (balancedTopics && counts.search < limits.search && counts.page < limits.page) {
+    if (balancedTopics && !progressive && counts.search < limits.search && counts.page < limits.page) {
       emit('replan', '人物・会社の公式情報を追加し、投稿者と所属の根拠を照合します。');
       await gather('公式 プロフィール 事業', false);
     }
     let assessment = await assess();
     const accepted = applyAssessment(assessment);
+    if (accepted && cards.length && options.onSnapshot) await publish('PROGRESSIVE_QUICK');
     // X may lack primary identity evidence or useful facts. A candidate
     // ambiguity still stops immediately; use only the existing Web allowance.
     const needsPublicWeb = (!target.companyName || !!verifiedAliasForTarget(target)) && assessment.candidates.length === 0 &&
@@ -285,11 +365,13 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       }
     }
     if (!target.companyName && !publicIdentityVerified) return finish('awaiting_confirmation', 'PUBLIC_IDENTITY_CONFIRMATION_REQUIRED', '公開プロフィールだけでは対象を一人に絞れませんでした。活動名、所属や公式URLなどの手掛かりを確認してください。');
+    if (progressive && cards.length && !await enrich()) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '追加資料で対象に曖昧さが見つかりました。候補を確認してください。');
     if (balancedTopics && cards.length) {
       const recent = cards.filter(card => card.topic === 'recent_x').length;
       const popular = cards.filter(card => card.topic === 'popular_x').length;
       const profile = cards.filter(card => card.topic === 'profile').length;
-      if (recent !== 2 || popular !== 1 || profile !== 1) {
+      const socialCount = cards.filter(card => card.topic === 'instagram' || card.topic === 'facebook').length;
+      if (recent !== 2 || popular !== 1 || (enriching && socialCount ? socialCount !== 1 : profile !== 1)) {
         emit('balance', `最近X${recent}件・過去の反響${popular}件・人物や会社${profile}件。取得・検証できない枠は別の確認済み話題で補います。`);
         return finish('partial', 'TOPIC_BALANCE_PARTIAL', '希望の配分に必要な投稿を確認できなかったため、取得した根拠のある話題を表示します。');
       }

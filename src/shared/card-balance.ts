@@ -1,5 +1,6 @@
-import { XPostSchema, type Card, type CardTopic, type EvidenceSource, type Target } from './contracts.ts';
+import { SocialPostSchema, XPostSchema, type Card, type CardTopic, type EvidenceSource, type Target } from './contracts.ts';
 import { evidenceMatchesTarget, normalizeIdentity, verifiedAliasForTarget } from './identity-aliases.ts';
+import { verifiedSocialIdentityForTarget } from './social-accounts.ts';
 
 /** Only the trusted adapter's source classification controls the displayed label. */
 export const sourceTopic = (source: EvidenceSource): CardTopic => source.topic ?? 'profile';
@@ -15,7 +16,7 @@ function postId(source: EvidenceSource): string | undefined {
 }
 
 /** Input cards must already pass evidence verification. Never manufacture a missing category. */
-export function selectBalancedCards<T extends Pick<Card, 'sourceId' | 'fact'>>(cards: T[], sources: EvidenceSource[]): Array<T & { topic: CardTopic }> {
+export function selectBalancedCards<T extends Pick<Card, 'sourceId' | 'fact'>>(cards: T[], sources: EvidenceSource[], preferSocial = false): Array<T & { topic: CardTopic }> {
   const sourceMap = new Map(sources.map(source => [source.sourceId, source]));
   const candidates = cards.flatMap(card => {
     const source = sourceMap.get(card.sourceId);
@@ -27,6 +28,11 @@ export function selectBalancedCards<T extends Pick<Card, 'sourceId' | 'fact'>>(c
     if (selected.length >= 4 || !fact || facts.has(fact) || post && posts.has(post)) return false;
     selected.push(candidate.card); facts.add(fact); if (post) posts.add(post); return true;
   };
+  if (preferSocial) {
+    const social = candidates.filter(candidate => candidate.source.socialPost)
+      .sort((a, b) => Date.parse(b.source.socialPost!.createdAt) - Date.parse(a.source.socialPost!.createdAt));
+    if (social[0]) add(social[0]);
+  }
   for (const [topic, wanted] of [['recent_x', 2], ['popular_x', 1], ['profile', 1]] as const) {
     let count = 0;
     for (const candidate of candidates) {
@@ -54,6 +60,23 @@ function aliasInExcerpt(excerpt: string, names: readonly string[]): boolean {
  * is not a new account mapping. Fact/excerpt inclusion remains the caller's check.
  */
 export function evidenceMatchesCard(excerpt: string, target: Target, source: EvidenceSource, sources: EvidenceSource[]): boolean {
+  if (source.kind === 'instagram' || source.kind === 'facebook') {
+    const post = SocialPostSchema.safeParse(source.socialPost);
+    const identity = verifiedSocialIdentityForTarget(target);
+    if (!post.success || !identity || post.data.platform !== source.kind) return false;
+    const account = identity.accounts.find(account => account.platform === source.kind);
+    if (!account || post.data.authorHandle.toLowerCase() !== account.handle.toLowerCase() ||
+        post.data.profileUrl !== account.profileUrl || post.data.identitySourceUrl !== account.identitySourceUrl) return false;
+    try {
+      const url = new URL(source.url);
+      const hosts = source.kind === 'instagram' ? ['instagram.com', 'www.instagram.com'] : ['facebook.com', 'www.facebook.com', 'm.facebook.com'];
+      if (url.protocol !== 'https:' || url.username || url.password || url.port || !hosts.includes(url.hostname)) return false;
+    } catch { return false; }
+    // Registry links identify a candidate account; live non-social evidence must
+    // still confirm the person before its public posts can become topic cards.
+    return sources.some(other => other.sourceId !== source.sourceId && (other.kind === 'web' || other.kind === 'x') &&
+      evidenceMatchesTarget(other.text, target, other.url)) && source.text.includes(excerpt);
+  }
   if (evidenceMatchesTarget(excerpt, target, source.url)) return true;
   if (source.kind !== 'x') return false;
   const parsed = XPostSchema.safeParse(source.xPost);

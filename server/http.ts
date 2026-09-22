@@ -17,6 +17,7 @@ import { createStreamingRelay } from './ws-relay.ts';
 import { createLunaCorrection } from './luna-correction.ts';
 import { resolvePersonTarget } from './person-resolver.ts';
 import { isTargetGroundedInTranscript } from '../src/shared/identity-aliases.ts';
+import { createSocialProvider, type SocialProvider } from './social-provider.ts';
 
 interface ConversationWindow { revision: number; transcribed: boolean; researchStarted: boolean; target?: Target }
 interface Conversation { id: string; expiresAt: number; dataExpiresAt: number; dataGeneration: number; companyClue: string; transcriptContext: string; finalTexts: string[]; requests: Map<string, ConversationWindow> }
@@ -30,6 +31,7 @@ interface HttpDependencies {
   runAgent?: typeof runAgent;
   now?: () => number;
   correctPerson?: ReturnType<typeof createLunaCorrection>;
+  socialProvider?: SocialProvider;
 }
 class HttpError extends Error {
   readonly status: number;
@@ -76,12 +78,14 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   const budget = dependencies.budget ?? (config.status.liveEnabled ? new BudgetLedger(config.budget) : undefined);
   const liveProvider = dependencies.liveProvider ?? createLiveProvider(config.providers);
   const research = dependencies.runAgent ?? runAgent;
+  const social = dependencies.socialProvider ?? (config.social.enabled && config.social.apiToken ? createSocialProvider({ apiToken: config.social.apiToken }) : undefined);
   const correctPerson = dependencies.correctPerson ?? (config.personCorrection.apiKey ? createLunaCorrection(config.personCorrection) : undefined);
   const configuredOrigin = new URL(config.origin);
   const origins = new Set([config.origin, `http://localhost:${config.port}`, `http://127.0.0.1:${config.port}`]);
   const hosts = new Set([...origins].map(origin => new URL(origin).host));
   const attempts = new Map<string, { count: number; until: number }>();
-  const active = new Map<string, { requestId: string; revision: number; controller: AbortController }>();
+  const active = new Map<string, { requestId: string; revision: number; controller: AbortController; conversationId?: string }>();
+  const identifying = new Map<string, { requestId: string; revision: number; controller: AbortController }>();
   const conversations = new Map<string, Conversation>();
   const pruneConversationData = (group: Conversation) => {
     if (group.dataExpiresAt > now()) return;
@@ -96,6 +100,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   };
   const streamTickets = new Map<string, { sessionId: string; conversationId: string; expiresAt: number }>();
   const dropConversation = (sessionId: string) => {
+    identifying.get(sessionId)?.controller.abort(); identifying.delete(sessionId);
     const group = conversations.get(sessionId);
     if (group) relay.closeConversation(group.id);
     conversations.delete(sessionId);
@@ -280,6 +285,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         const body = z.object({ conversationId: z.string().uuid() }).strict().parse(await jsonBody(req));
         const group = conversationFor(session.id, body.conversationId);
         session.revision = Math.max(session.revision, ...[...group.requests.values()].map(window => window.revision)) + 1;
+        identifying.get(session.id)?.controller.abort(); identifying.delete(session.id);
         store.cancel(session.id); active.delete(session.id);
         group.requests.clear(); group.finalTexts.length = 0;
         group.transcriptContext = group.companyClue;
@@ -303,14 +309,14 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         const body = z.object({ conversationId: z.string().uuid(), requestId: z.string().uuid(), subjectRevision: z.number().int().positive(), text: z.string().trim().min(1).max(2000) }).strict().parse(await jsonBody(req));
         if (!config.status.streamingEnabled || !budget) throw new HttpError(403, 'ストリーミング音声の設定が未完了です。');
         const group = conversationFor(session.id, body.conversationId);
-        if (session.running || body.subjectRevision <= session.revision || group.requests.has(body.requestId) || session.requestIds.includes(body.requestId)) throw new HttpError(409, 'この音声の処理を開始できません。');
+        if (identifying.has(session.id) || session.running && active.get(session.id)?.conversationId !== group.id || body.subjectRevision <= session.revision || group.requests.has(body.requestId) || session.requestIds.includes(body.requestId)) throw new HttpError(409, 'この音声の処理を開始できません。');
         const finalIndex = group.finalTexts.indexOf(body.text);
         if (finalIndex < 0) throw new HttpError(409, '確定した音声文字起こしと一致しません。');
         group.finalTexts.splice(finalIndex, 1);
         const window: ConversationWindow = { revision: body.subjectRevision, transcribed: false, researchStarted: false }; addWindow(group, body.requestId, window);
         const dataGeneration = group.dataGeneration;
         const previousContext = group.transcriptContext.endsWith(body.text) ? group.transcriptContext.slice(0, -body.text.length).trim() : group.transcriptContext;
-        const controller = store.start(session); active.set(session.id, { requestId: body.requestId, revision: body.subjectRevision, controller });
+        const controller = new AbortController(); identifying.set(session.id, { requestId: body.requestId, revision: body.subjectRevision, controller });
         const disconnected = () => { if (!res.writableEnded) controller.abort(); }; res.on('close', disconnected);
         const timer = setTimeout(() => controller.abort(), 16_000);
         try {
@@ -334,15 +340,18 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
             targets = corrected.target ? [corrected.target] : [];
             correctionHint = corrected.hint; correctionCandidate = corrected.candidate;
           }
-          if (controller.signal.aborted || conversations.get(session.id) !== group || group.dataGeneration !== dataGeneration || group.dataExpiresAt <= now() || group.requests.get(body.requestId) !== window || !store.finish(session.id, controller)) throw new HttpError(409, '停止または失効した解析です。');
+          if (controller.signal.aborted || identifying.get(session.id)?.controller !== controller || !store.get(session.id) || conversations.get(session.id) !== group || group.dataGeneration !== dataGeneration || group.dataExpiresAt <= now() || group.requests.get(body.requestId) !== window) throw new HttpError(409, '停止または失効した解析です。');
           if (targets.length === 1) {
             window.target = targets[0];
             if (targets[0]!.companyName) group.companyClue = targets[0]!.companyName;
             relay.updateKeywordsConversation?.(group.id, [targets[0]!.personName, targets[0]!.companyName].filter(Boolean));
           }
-          window.transcribed = true; session.running = false; store.save(session); active.delete(session.id);
+          window.transcribed = true; identifying.delete(session.id);
           sendJson(res, 200, { text: body.text, targets, hasPersonMention: targets.length > 0 || !!correctionCandidate || plan.hasPersonMention !== false, correctionHint, correctionCandidate });
-        } finally { clearTimeout(timer); res.off('close', disconnected); if (active.get(session.id)?.controller === controller) { store.cancel(session.id); active.delete(session.id); } }
+        } catch (error) {
+          if (controller.signal.aborted) throw new HttpError(409, '停止または失効した解析です。');
+          throw error;
+        } finally { clearTimeout(timer); res.off('close', disconnected); if (identifying.get(session.id)?.controller === controller) identifying.delete(session.id); }
         return true;
       }
       if (req.method === 'POST' && path === '/api/conversation') {
@@ -378,10 +387,11 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       }
       if (req.method === 'POST' && path === '/api/cancel') {
         const body = CancelSchema.parse(await jsonBody(req));
-        const current = active.get(session.id);
+        const current = active.get(session.id) ?? identifying.get(session.id);
         if (body.conversationId) {
           const conversation = conversationFor(session.id, body.conversationId);
-          if (current && (!conversation.requests.has(current.requestId) || current.requestId !== body.requestId || current.revision !== body.subjectRevision)) throw new HttpError(409, '現在の調査と一致しません。');
+          const window = conversation.requests.get(body.requestId);
+          if ((active.has(session.id) || identifying.has(session.id)) && (!window || window.revision !== body.subjectRevision)) throw new HttpError(409, '現在の調査と一致しません。');
         } else if (!current || current.requestId !== body.requestId || current.revision !== body.subjectRevision) throw new HttpError(409, '現在の調査と一致しません。');
         store.cancel(session.id); active.delete(session.id); dropConversation(session.id); delete session.result; store.save(session);
         sendJson(res, 200, { cancelled: true }); return true;
@@ -391,7 +401,9 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         if (!uuidPattern.test(input.requestId)) throw new HttpError(400, '調査の要求IDはUUIDで送信してください。');
         if (!store.get(session.id)) throw new HttpError(401, 'セッションが期限切れです。再ログインしてください。');
         if (input.mode === 'live' && !config.status.liveEnabled) throw new HttpError(403, '実APIの設定と費用上限が未完了です。');
-        if (session.running) throw new HttpError(409, '調査が進行中です。停止してから開始してください。');
+        const priorWork = active.get(session.id);
+        const nextIdentity = identifying.get(session.id);
+        if (nextIdentity && (!input.conversationId || nextIdentity.revision <= input.subjectRevision) || session.running && (!input.conversationId || priorWork?.conversationId !== input.conversationId)) throw new HttpError(409, '調査が進行中です。停止してから開始してください。');
         if (session.lastInput?.requestId === input.requestId || session.requestIds.includes(input.requestId)) throw new HttpError(409, 'この要求IDは処理済みです。');
         if (!input.conversationId && session.requestIds.length >= 100) throw new HttpError(429, 'このセッションの調査回数上限です。終了して新しいセッションを開始してください。');
         if (input.subjectRevision <= session.revision) throw new HttpError(409, '対象の版が古くなっています。状態を再取得してください。');
@@ -412,7 +424,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         session.revision = input.subjectRevision; session.lastInput = input; session.requestIds.push(input.requestId); if (session.requestIds.length > 100) session.requestIds.shift(); delete session.result;
         if (window) window.researchStarted = true;
         const controller = store.start(session);
-        active.set(session.id, { requestId: input.requestId, revision: input.subjectRevision, controller });
+        active.set(session.id, { requestId: input.requestId, revision: input.subjectRevision, controller, conversationId: input.conversationId });
         const stillCurrent = () => active.get(session.id)?.controller === controller && !controller.signal.aborted && !!store.get(session.id) && (!conversation || conversations.get(session.id) === conversation && conversation.expiresAt > now() && conversation.dataExpiresAt > now() && conversation.dataGeneration === dataGeneration);
         const disconnected = () => { if (!res.writableEnded && stillCurrent()) { session.interrupted = true; store.cancel(session.id); active.delete(session.id); } };
         res.on('close', disconnected);
@@ -435,7 +447,9 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
           const result = await research(input, provider, {
             signal: controller.signal, now, budget, maximumCosts: config.maximumCosts,
             budgetRunId: conversation?.id ?? input.requestId, confirmedTarget,
+            social,
             onEvent: event => { if (stillCurrent()) sendLine({ type: 'trace', event }); },
+            onSnapshot: result => { if (stillCurrent()) { session.result = result; store.save(session); sendLine({ type: 'update', result }); } },
           });
           if (stillCurrent() && store.finish(session.id, controller)) {
             session.running = false; session.result = result; store.save(session); active.delete(session.id);
@@ -452,7 +466,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       }
       if (req.method === 'POST' && path === '/api/transcribe') {
         if (!config.status.sttEnabled || !budget || !liveProvider.transcribe) throw new HttpError(403, '音声認識の設定と費用上限が未完了です。');
-        if (session.running) throw new HttpError(409, '別の処理が進行中です。');
+        if (session.running || identifying.has(session.id)) throw new HttpError(409, '別の処理が進行中です。');
         const requestId = req.headers['x-request-id'];
         if (typeof requestId !== 'string' || !uuidPattern.test(requestId)) throw new HttpError(400, '音声の要求IDが必要です。');
         const conversationId = req.headers['x-conversation-id'];
@@ -514,5 +528,5 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       return true;
     }
   }
-  return { handle, upgrade: relay.upgrade, close() { relay.close(); streamTickets.clear(); clearInterval(sweep); qrTickets.clear(); conversations.clear(); for (const id of active.keys()) { const session = store.get(id); if (session) { session.interrupted = true; store.save(session); } } store.close(); active.clear(); } };
+  return { handle, upgrade: relay.upgrade, close() { relay.close(); streamTickets.clear(); clearInterval(sweep); qrTickets.clear(); conversations.clear(); for (const work of identifying.values()) work.controller.abort(); identifying.clear(); for (const id of active.keys()) { const session = store.get(id); if (session) { session.interrupted = true; store.save(session); } } store.close(); active.clear(); } };
 }

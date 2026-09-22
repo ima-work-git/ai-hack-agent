@@ -72,6 +72,9 @@ const xBalancedResponseSchema = (maximum: number) => z.object({
 }).refine(value => !value.errors?.length && (value.data !== undefined || value.meta?.result_count === 0));
 const X_ARCHIVE_START = '2006-03-21T00:00:00Z';
 const X_RECENT_MS = 7 * 24 * 60 * 60_000;
+const X_HANDOFF_MS = 60_000;
+type XUser = z.infer<typeof XUserSchema>['data'];
+type XPost = z.infer<typeof XBalancedPostSchema>;
 const TranscriptSchema = z.object({ text: z.string().trim().min(1).max(2000), targets: z.array(TargetSchema).max(3).optional(), hasPersonMention: z.boolean().optional() }).strict();
 
 function checked<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -320,6 +323,110 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
   const fetchPage = dependencies.fetchPage ?? safeRequest;
   const now = dependencies.now ?? (() => new Date());
   const xEvidence = new Map<string, { source: EvidenceSource; expiresAt: number }>();
+  // A short, bounded handoff between the quick and archive phases avoids paying
+  // for a second public-account lookup/timeline. Rejected lookups never enter it.
+  const xRecentAccounts = new Map<string, { user: XUser; posts: XPost[]; expiresAt: number }>();
+
+  function rememberXEvidence(source: EvidenceSource): void {
+    const entry = { source, expiresAt: Date.now() + 30_000 };
+    xEvidence.delete(source.url);
+    xEvidence.set(source.url, entry);
+    while (xEvidence.size > 256) xEvidence.delete(xEvidence.keys().next().value!);
+    const timer = setTimeout(() => { if (xEvidence.get(source.url) === entry) xEvidence.delete(source.url); }, 30_000);
+    timer.unref();
+  }
+
+  function queryHandles(query: string): string[] {
+    if (!query.trim() || query.length > 300) throw new ProviderError('INVALID_QUERY', '検索語を確認してください。');
+    return [...new Set(Array.from(query.matchAll(/(?:^|\s)@([A-Za-z0-9_]{1,15})(?=$|\s|[、,。])/g), match => match[1]!.toLowerCase()))];
+  }
+
+  function validXPosts(items: unknown[], user: XUser, currentTime: number, archive = false): XPost[] {
+    const seen = new Set<string>();
+    return items.flatMap(item => {
+      const parsed = XBalancedPostSchema.safeParse(item);
+      if (!parsed.success) return [];
+      const post = parsed.data;
+      const createdAt = Date.parse(post.created_at);
+      if (post.author_id !== user.id || createdAt > currentTime ||
+        (archive && (createdAt >= currentTime - X_RECENT_MS || createdAt < Date.parse(X_ARCHIVE_START))) ||
+        seen.has(post.id) || !isAllowedConversationTopic(post.text)) return [];
+      seen.add(post.id);
+      return [post];
+    });
+  }
+
+  function balancedXHits(user: XUser, recentPosts: XPost[], popularPosts: XPost[], includeProfile = true): SearchHit[] {
+    const profile = `公開プロフィール: ${user.name} (@${user.username})\n${user.description ?? ''}`;
+    const hits: SearchHit[] = [];
+    const cache = (url: string, title: string, text: string, topic: 'recent_x' | 'popular_x' | 'profile', xPost?: EvidenceSource['xPost']) => {
+      const source = checked(EvidenceSourceSchema, { sourceId: sourceId(url), url, title, text,
+        retrievedAt: now().toISOString(), kind: 'x', topic, ...(xPost ? { xPost } : {}) });
+      rememberXEvidence(source);
+      hits.push(checked(SearchHitSchema, { url, title, snippet: text.slice(0, 3000), topic }));
+    };
+    const addPost = (post: XPost, topic: 'recent_x' | 'popular_x') => {
+      cache(`https://x.com/${user.username}/status/${post.id}`,
+        `${user.name} (@${user.username}) の${topic === 'recent_x' ? '直近の公開投稿' : '過去の公開投稿（全期間検索の取得候補）'}`,
+        `${profile}\n公開投稿: ${post.text}`, topic, {
+          id: post.id, authorId: post.author_id, username: user.username, createdAt: post.created_at,
+          text: post.text, likeCount: post.public_metrics.like_count,
+          repostCount: post.public_metrics.repost_count ?? post.public_metrics.retweet_count!,
+          replyCount: post.public_metrics.reply_count, quoteCount: post.public_metrics.quote_count,
+          ...(topic === 'popular_x' ? { selectionScope: 'full_archive_sample' as const } : {}),
+        });
+    };
+    if (includeProfile) cache(`https://x.com/${user.username}`, `${user.name} (@${user.username}) の公開プロフィール`, profile, 'profile');
+    recentPosts.slice(0, 2).forEach(post => addPost(post, 'recent_x'));
+    popularPosts.slice(0, 1).forEach(post => addPost(post, 'popular_x'));
+    recentPosts.slice(2, 5).forEach(post => addPost(post, 'recent_x'));
+    popularPosts.slice(1, 3).forEach(post => addPost(post, 'popular_x'));
+    return hits;
+  }
+
+  async function recentXAccount(username: string, signal: AbortSignal) {
+    if (signal.aborted) throw new ProviderError('CANCELLED', '処理を中止しました。');
+    const key = username.toLowerCase();
+    const cached = xRecentAccounts.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached;
+    xRecentAccounts.delete(key);
+    requireConfigured(config.xBearerToken, 'X Bearer Token');
+    const user = checked(XUserSchema, await apiJson(`${X_API}/users/by/username/${encodeURIComponent(username)}?user.fields=description,protected`, config.xBearerToken, signal)).data;
+    if (user.protected || user.username.toLowerCase() !== key) throw new ProviderError('X_PUBLIC_ONLY', '公開状態とアカウント一致を確認できませんでした。');
+    const url = new URL(`${X_API}/users/${user.id}/tweets`);
+    url.search = new URLSearchParams({ max_results: '5', exclude: 'retweets,replies',
+      'tweet.fields': 'created_at,public_metrics,author_id' }).toString();
+    const response = checked(xBalancedResponseSchema(5), await apiJson(url.toString(), config.xBearerToken, signal));
+    if (signal.aborted) throw new ProviderError('CANCELLED', '処理を中止しました。');
+    const posts = validXPosts(response.data ?? [], user, now().getTime())
+      .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at) || left.id.localeCompare(right.id)).slice(0, 5);
+    const entry = { user, posts, expiresAt: Date.now() + X_HANDOFF_MS };
+    xRecentAccounts.set(key, entry);
+    while (xRecentAccounts.size > 32) xRecentAccounts.delete(xRecentAccounts.keys().next().value!);
+    const timer = setTimeout(() => { if (xRecentAccounts.get(key) === entry) xRecentAccounts.delete(key); }, X_HANDOFF_MS);
+    timer.unref();
+    return entry;
+  }
+
+  async function searchArchiveX(username: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>> {
+    const recent = await recentXAccount(username, signal);
+    const currentTime = now().getTime();
+    const url = new URL(`${X_API}/tweets/search/all`);
+    url.search = new URLSearchParams({ query: `from:${recent.user.username} -is:retweet -is:reply`,
+      start_time: X_ARCHIVE_START, end_time: new Date(currentTime - X_RECENT_MS).toISOString(),
+      sort_order: 'relevancy', max_results: '20', 'tweet.fields': 'created_at,public_metrics,author_id' }).toString();
+    requireConfigured(config.xBearerToken, 'X Bearer Token');
+    const response = checked(xBalancedResponseSchema(20), await apiJson(url.toString(), config.xBearerToken, signal));
+    if (signal.aborted) throw new ProviderError('CANCELLED', '処理を中止しました。');
+    const recentIds = new Set(recent.posts.map(post => post.id));
+    const score = (post: XPost) => BigInt(post.public_metrics.like_count) +
+      BigInt(post.public_metrics.repost_count ?? post.public_metrics.retweet_count!) + BigInt(post.public_metrics.quote_count);
+    const posts = validXPosts(response.data ?? [], recent.user, currentTime, true)
+      .filter(post => !recentIds.has(post.id) && score(post) > 0n)
+      .sort((left, right) => score(left) > score(right) ? -1 : score(left) < score(right) ? 1 :
+        Date.parse(right.created_at) - Date.parse(left.created_at) || left.id.localeCompare(right.id)).slice(0, 3);
+    return { value: balancedXHits(recent.user, [], posts, false) };
+  }
 
   function requireConfigured(value: string | undefined, name: string): asserts value is string {
     if (!value?.trim()) throw new ProviderError('LIVE_DISABLED', `${name}が未設定のため接続しません。`);
@@ -380,11 +487,7 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
       const source = checked(EvidenceSourceSchema, {
         sourceId: sourceId(url), url, title, retrievedAt: now().toISOString(), kind: 'x', text,
       });
-      const entry = { source, expiresAt: Date.now() + 30_000 };
-      xEvidence.set(url, entry);
-      // This handoff cache never becomes durable personal-data storage.
-      const timer = setTimeout(() => { if (xEvidence.get(url) === entry) xEvidence.delete(url); }, 30_000);
-      timer.unref();
+      rememberXEvidence(source);
       hits.push({ url, title: source.title, snippet: text.slice(0, 3000) });
     };
     // The already-paid lookup response is itself public evidence, including
@@ -445,58 +548,33 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
         // Retain already retrieved profile/history. Never invent recent posts.
       }
     }
-    const parsePosts = (items: unknown[], recent: boolean) => {
-      const seen = new Set<string>();
-      return items.flatMap(item => {
-        const parsed = XBalancedPostSchema.safeParse(item);
-        if (!parsed.success) return [];
-        const post = parsed.data;
-        const createdAt = Date.parse(post.created_at);
-        if (post.author_id !== user.id || createdAt > currentTime ||
-          (!recent && (createdAt >= boundary || createdAt < Date.parse(X_ARCHIVE_START))) ||
-          seen.has(post.id) || !isAllowedConversationTopic(post.text)) return [];
-        seen.add(post.id);
-        return [post];
-      });
-    };
-    const recentPosts = parsePosts(recentItems, true)
+    const recentPosts = validXPosts(recentItems, user, currentTime)
       .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at) || left.id.localeCompare(right.id))
       .slice(0, 5);
     const recentIds = new Set(recentPosts.map(post => post.id));
     const score = (post: z.infer<typeof XBalancedPostSchema>) => BigInt(post.public_metrics.like_count) +
       BigInt(post.public_metrics.repost_count ?? post.public_metrics.retweet_count!) + BigInt(post.public_metrics.quote_count);
-    const popularPosts = parsePosts(archiveResult.status === 'fulfilled' ? archiveResult.value.data ?? [] : [], false)
+    const popularPosts = validXPosts(archiveResult.status === 'fulfilled' ? archiveResult.value.data ?? [] : [], user, currentTime, true)
       .filter(post => !recentIds.has(post.id) && score(post) > 0n)
       .sort((left, right) => score(left) > score(right) ? -1 : score(left) < score(right) ? 1 :
         Date.parse(right.created_at) - Date.parse(left.created_at) || left.id.localeCompare(right.id))
       .slice(0, 3);
-    const profile = `公開プロフィール: ${user.name} (@${user.username})\n${user.description ?? ''}`;
+    return { value: balancedXHits(user, recentPosts, popularPosts) };
+  }
+
+  async function searchWeb(query: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>> {
+    requireConfigured(config.tavilyApiKey, '検索APIキー');
+    const response = checked(TavilySchema, await apiJson(TAVILY_SEARCH, config.tavilyApiKey, signal, {
+      query, search_depth: 'basic', max_results: 5, topic: 'general', auto_parameters: false,
+      include_answer: false, include_raw_content: false, include_images: false,
+    }));
     const hits: SearchHit[] = [];
-    const cache = (url: string, title: string, text: string, topic: 'recent_x' | 'popular_x' | 'profile', xPost?: EvidenceSource['xPost']) => {
-      const source = checked(EvidenceSourceSchema, { sourceId: sourceId(url), url, title, text,
-        retrievedAt: now().toISOString(), kind: 'x', topic, ...(xPost ? { xPost } : {}) });
-      const entry = { source, expiresAt: Date.now() + 30_000 };
-      xEvidence.set(url, entry);
-      const timer = setTimeout(() => { if (xEvidence.get(url) === entry) xEvidence.delete(url); }, 30_000);
-      timer.unref();
-      hits.push(checked(SearchHitSchema, { url, title, snippet: text.slice(0, 3000), topic }));
-    };
-    const addPost = (post: z.infer<typeof XBalancedPostSchema>, topic: 'recent_x' | 'popular_x') => {
-      cache(`https://x.com/${user.username}/status/${post.id}`,
-        `${user.name} (@${user.username}) の${topic === 'recent_x' ? '直近の公開投稿' : '過去の公開投稿（全期間検索の取得候補）'}`,
-        `${profile}\n公開投稿: ${post.text}`, topic, {
-          id: post.id, authorId: post.author_id, username: user.username, createdAt: post.created_at,
-          text: post.text, likeCount: post.public_metrics.like_count,
-          repostCount: post.public_metrics.repost_count ?? post.public_metrics.retweet_count!,
-          replyCount: post.public_metrics.reply_count, quoteCount: post.public_metrics.quote_count,
-          ...(topic === 'popular_x' ? { selectionScope: 'full_archive_sample' as const } : {}),
-        });
-    };
-    cache(`https://x.com/${user.username}`, `${user.name} (@${user.username}) の公開プロフィール`, profile, 'profile');
-    recentPosts.slice(0, 2).forEach(post => addPost(post, 'recent_x'));
-    popularPosts.slice(0, 1).forEach(post => addPost(post, 'popular_x'));
-    recentPosts.slice(2).forEach(post => addPost(post, 'recent_x'));
-    popularPosts.slice(1).forEach(post => addPost(post, 'popular_x'));
+    for (const hit of response.results.slice(0, 5)) {
+      try {
+        const url = validatePublicUrl(hit.url).toString();
+        if (!hits.some((entry) => entry.url === url)) hits.push(checked(SearchHitSchema, { url, title: hit.title.slice(0, 400), snippet: hit.content?.slice(0, 3000) }));
+      } catch { /* Unsafe or malformed search candidates are not fetched. */ }
+    }
     return { value: hits };
   }
 
@@ -537,6 +615,21 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
       if (verifiedAlias && !result.value.needsConfirmation) result.value.target = { ...verifiedAlias.target };
       return result;
     },
+    async searchRecent(query, signal): Promise<ProviderResult<SearchHit[]>> {
+      const handles = queryHandles(query);
+      if (signal.aborted) throw new ProviderError('CANCELLED', '処理を中止しました。');
+      if (config.xEnabled && handles.length > 1) throw new ProviderError('AMBIGUOUS_X_ACCOUNT', '複数のXアカウントが指定されています。');
+      if (!config.xEnabled || handles.length === 0) return searchWeb(query, signal);
+      const recent = await recentXAccount(handles[0]!, signal);
+      return { value: balancedXHits(recent.user, recent.posts, []) };
+    },
+    async searchArchive(query, signal): Promise<ProviderResult<SearchHit[]>> {
+      const handles = queryHandles(query);
+      if (signal.aborted) throw new ProviderError('CANCELLED', '処理を中止しました。');
+      if (config.xEnabled && handles.length > 1) throw new ProviderError('AMBIGUOUS_X_ACCOUNT', '複数のXアカウントが指定されています。');
+      if (!config.xEnabled || handles.length === 0) return { value: [], actualUsd: 0 };
+      return searchArchiveX(handles[0]!, signal);
+    },
     async search(query, signal): Promise<ProviderResult<SearchHit[]>> {
       if (!query.trim() || query.length > 300) throw new ProviderError('INVALID_QUERY', '検索語を確認してください。');
       const handles = [...new Set(Array.from(query.matchAll(/(?:^|\s)@([A-Za-z0-9_]{1,15})(?=$|\s|[、,。])/g), (match) => match[1]!))];
@@ -544,19 +637,7 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
       // before this branch. No unbudgeted fallback follows a failed X request.
       if (config.xEnabled && handles.length === 1) return searchX(handles[0]!, signal);
       if (config.xEnabled && handles.length > 1) throw new ProviderError('AMBIGUOUS_X_ACCOUNT', '複数のXアカウントが指定されています。');
-      requireConfigured(config.tavilyApiKey, '検索APIキー');
-      const response = checked(TavilySchema, await apiJson(TAVILY_SEARCH, config.tavilyApiKey, signal, {
-        query, search_depth: 'basic', max_results: 5, topic: 'general', auto_parameters: false,
-        include_answer: false, include_raw_content: false, include_images: false,
-      }));
-      const hits: SearchHit[] = [];
-      for (const hit of response.results.slice(0, 5)) {
-        try {
-          const url = validatePublicUrl(hit.url).toString();
-          if (!hits.some((entry) => entry.url === url)) hits.push(checked(SearchHitSchema, { url, title: hit.title.slice(0, 400), snippet: hit.content?.slice(0, 3000) }));
-        } catch { /* Unsafe or malformed search candidates are not fetched. */ }
-      }
-      return { value: hits };
+      return searchWeb(query, signal);
     },
     async fetchPage(hit, signal): Promise<ProviderResult<EvidenceSource>> {
       checked(SearchHitSchema, hit);
@@ -597,8 +678,13 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
       const quotePrefix = `quote-${randomUUID()}`;
       const sentenceSegmenter = new Intl.Segmenter('ja', { granularity: 'sentence' });
       const balanced = sources.some(source => source.topic);
+      const hasSocial = sources.some(source => source.kind === 'instagram' || source.kind === 'facebook');
+      const cardMix = hasSocial
+        ? 'CARD MIX: Select at most ONE strongest supported Instagram or Facebook post card (prefer the newest actual publication date), TWO recent_x cards from DISTINCT posts, and ONE popular_x card when available. Use profile facts only to fill unsupported gaps. Do not select two social cards or omit the useful social card merely to repeat a profile. '
+        : 'CARD MIX: Prefer exactly TWO recent_x cards from two DISTINCT posts, ONE popular_x card, and ONE profile card about a professional attribute or company. ';
       const evidence = sources.slice(0, balanced ? 6 : 4).map((source, sourceIndex) => {
         const text = sliceText(source.text, 0, 10_000);
+        const post = source.xPost ?? source.socialPost;
         // Segment before windowing so a truncated long sentence cannot become
         // a shorter claim with its subject, condition or negation cut away.
         let sentences = Array.from(sentenceSegmenter.segment(source.text), (part) => {
@@ -625,21 +711,21 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
             sentences.sort((left, right) => left.start - right.start);
           }
         }
-        if (source.xPost) {
-          // A tweet slot can only quote that tweet, never the copied bio/header.
+        if (post) {
+          // A social-post slot can only quote its exact body, never a copied bio/header.
           const marker = '\n公開投稿: ';
           const offset = source.text.indexOf(marker);
-          const postStart = offset < 0 ? -1 : offset + marker.length;
-          sentences = postStart >= 0 && source.text.slice(postStart) === source.xPost.text
-            ? Array.from(sentenceSegmenter.segment(source.xPost.text), part => {
+          const postStart = source.socialPost && source.text === post.text ? 0 : offset < 0 ? -1 : offset + marker.length;
+          sentences = postStart >= 0 && source.text.slice(postStart) === post.text
+            ? Array.from(sentenceSegmenter.segment(post.text), part => {
               const fact = part.segment.trim(); const start = postStart + part.index + part.segment.indexOf(fact);
               return { fact, start, end: start + fact.length };
             }).filter(({ fact }) => fact.length > 0 && fact.length <= 200)
             : [];
-          const wholePost = source.xPost.text.trim();
-          if (postStart >= 0 && source.text.slice(postStart) === source.xPost.text && wholePost.length <= 200 &&
+          const wholePost = post.text.trim();
+          if (postStart >= 0 && source.text.slice(postStart) === post.text && wholePost.length <= 200 &&
               !sentences.some(sentence => sentence.fact === wholePost)) {
-            const start = postStart + source.xPost.text.indexOf(wholePost);
+            const start = postStart + post.text.indexOf(wholePost);
             sentences.unshift({ fact: wholePost, start, end: start + wholePost.length });
           }
         }
@@ -651,7 +737,7 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
           const content = fact.replace(/^公開投稿:\s*/u, '').trim();
           if (/^(?:https?:\/\/\S+\s*)+$/u.test(content)) return false;
           const bare = content.replace(/[\s。.!！?？、,〜~…]/gu, '');
-          if (source.xPost) {
+          if (post) {
             const quotes: string[] = [];
             for (const character of fact) {
               if (character === '「' || character === '『') quotes.push(character);
@@ -661,7 +747,7 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
             }
             if (quotes.length || /[、，,:：]$/u.test(fact)) return false;
           }
-          if (source.xPost && /^(?:最近|先日|今日|昨日|この前|以前)(?:あった|の)?(?:会話|話|出来事|こと)$/u.test(bare)) return false;
+          if (post && /^(?:最近|先日|今日|昨日|この前|以前)(?:あった|の)?(?:会話|話|出来事|こと)$/u.test(bare)) return false;
           return !/^(?:たしかに|確かに|なるほど|はい|いいえ|そうですね|そうです|そうなんですね|了解|了解です|ありがとう|ありがとうございます|おはようございます|こんにちは|こんばんは|すごい|すごいですね|同意|同感)$/u.test(bare);
         });
         const excerpts: { excerptId: string; text: string; facts: { factId: string; text: string }[] }[] = [];
@@ -685,13 +771,15 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
         }
         return { sourceId: source.sourceId, kind: source.kind, url: source.url, title: source.title, text,
           cardEligible: evidenceMatchesCard(text, target, source, sources), excerpts,
+          ...(source.socialPost ? { socialPost: { platform: source.socialPost.platform, publishedAt: source.socialPost.createdAt,
+            authorHandle: source.socialPost.authorHandle, profileUrl: source.socialPost.profileUrl, identitySourceUrl: source.socialPost.identitySourceUrl } } : {}),
           ...(balanced ? { topic: sourceTopic(source), ...(source.xPost ? { post: { publishedAt: source.xPost.createdAt, likes: source.xPost.likeCount, reposts: source.xPost.repostCount, quotes: source.xPost.quoteCount, selectionScope: source.xPost.selectionScope } } : {}) } : {}) };
       }).sort((left, right) => Number(right.cardEligible) - Number(left.cardEligible));
       const identityModeInstructions = target.companyName
         ? 'IDENTITY MODE: person plus supplied company. Verify the source connection to BOTH supplied clues. '
         : 'IDENTITY MODE: intentional name-only PUBLIC PERSON research. companyName is deliberately empty; the absence of a company is NOT a reason to ask for confirmation, reject identity, or demand an affiliation. Never invent a company. A curated official X account in verifiedIdentityAliases plus its ACTUALLY RETRIEVED self-published profile can qualify as a primary identity source; a separate company website is not mandatory. The fetched profile must still substantiate public activity and match this person, and every selected fact must be attributable to this person. A handle mapping alone, an empty profile, a name-only mention, or an ordinary private person does not qualify. Set publicPersonVerified=true and identityVerified=true only when those public-primary and attribution requirements are met, list the exact retrieved source IDs, and otherwise keep them false. Distinguish missing evidence from conflicting people: if evidence is merely incomplete, request an official-profile followUpQuery; real competing identities require confirmation. Cards must still select only supplied raw factIds; never invent, paraphrase, or fill missing facts. ';
       const result = await complete(SelectionAssessmentSchema,
-        identityModeInstructions + (balanced ? 'CARD MIX: Prefer exactly TWO recent_x cards from two DISTINCT posts, ONE popular_x card, and ONE profile card about a professional attribute or company. A post source provides only actual post facts, never its copied profile header. Choose one fact/question per distinct post. Follow the trusted source.topic; never label a profile or recent post as historical popularity. popular_x means high reactions among returned all-time archive candidates, NOT the most popular post in history. If a category has no supported useful fact, fill with other supported categories and explain the shortage; never invent a fact to satisfy a quota. Keep output order recent_x,recent_x,popular_x,profile when available. For posts, ask a natural question specifically about what the person wrote or experienced in that dated post, rather than treating someone else mentioned in a post as the target. Historical questions must acknowledge that the post was in the past, not assume it happened today. A known verified X account post may rely on a separately supplied WEB source that explicitly establishes this person/company relationship; cardEligible includes this strictly bounded account-plus-company-evidence check. Still assess the author, attribution, company relationship and any contradictions across all actual sources before identityVerified=true. ' : '') + 'Return {identityVerified:boolean,needsConfirmation:boolean,publicPersonVerified:boolean,publicIdentitySourceIds:[],candidates:[],cards:[{factId,suggestedQuestion,displayFact,displayQuestion}],followUpQuery:string|null,reason:string}. When CARD MIX is active, return up to 6 supported candidate cards so the server can select the final four: include one useful fact for EACH available recent_x post, one popular_x post, then profile candidates. Do not skip a usable recent post to repeat a profile. Use at most one fact per post. Without CARD MIX return up to 4 distinct useful cards. Pair each candidate with one suggestedQuestion. Skip name-only facts. Prefer professional role, activities and explicitly self-published hobbies over a repeated basic identity. Return fewer when evidence is insufficient. Questions are addressed directly to the conversation partner: use natural Japanese open-ended follow-ups about their experience or interests, do not ask for a name, job or date already stated in the displayed fact, and do not repeat the same question across cards. Cards may use only supplied sources with cardEligible=true. This flag is a string-match precondition, not verified identity. Assess ALL supplied sources for ambiguity or conflicts, including cardEligible=false sources. For each card SELECT a factId from source.excerpts[].facts; do not output or rewrite fact, sourceId, excerptId or excerpt text. Each supplied fact is a complete raw source sentence or a complete pipe-delimited X profile item, at most 200 characters. For profile items, examine the full excerpt for qualifications or negations; never select a fragment contradicted by its surrounding context. Its supplied excerpt is an EXACT CONTIGUOUS substring of its source text, at most 1000 characters, containing personName and normally the nonempty companyName (or verified aliases; hiragana/katakana variants are equivalent). For a verified-account post only, the nonempty company relationship may instead be established by a separately supplied Web source under the cardEligible rule described above. This co-occurrence does NOT establish attribution: verify that the selected fact describes the target person, not another person mentioned nearby. Do not equate aliases or translations except the supplied verifiedIdentityAliases record, whose public primary-source URLs were checked separately. That record permits only identity-name equivalence, never proof of new facts or current legal-entity employment. When companyName is present, source evidence must still explicitly connect the person and company. When companyName is empty, do not invent an affiliation: require an official or self-published primary profile that clearly establishes one publicly active person (for example an author, performer, public speaker or business leader), and explicitly attributes the proposed facts to that person. publicPersonVerified=true only with that primary evidence, listing its exact supplied source IDs in publicIdentitySourceIds. Name co-occurrence, third-party mentions, an ordinary private person, or a hint alone are insufficient. Public figures need no registry entry. If evidence is missing, use a bounded followUpQuery; if identity remains private, uncertain or ambiguous, needsConfirmation=true and cards=[]. If no supplied fact supports the target, return cards=[]. suggestedQuestion is a separate conversation suggestion, max 180 characters. In this SAME response also supply a concise glasses display: displayFact is at most 28 characters and MUST be one exact contiguous, complete meaningful phrase from the selected raw fact (also present in its excerpt), with no paraphrase or new assertion. Preserve negation, time and other qualifications; omit displayFact when safe shortening is impossible. displayQuestion is a complete natural Japanese question at most 26 characters, ending in ？. Prefer concise complete questions over long ones. Never use ellipses (… or ...) in either display field and never cut a word or clause mid-way. These display fields supplement, never replace, the selected fact and its evidence. All suggestedQuestion and reason values must be Japanese. Verify identity only with the person/company connection when companyName is nonempty, or the public primary-profile requirements when companyName is empty; never use a name match alone. With conflicting identities, needsConfirmation=true, identityVerified=false, cards=[]. Prioritize short professional roles, work, public talks, and explicitly self-published non-sensitive hobbies or activities. Do not select facts or suggest questions about medical or health conditions, fertility or reproductive treatment, children, pregnancy, sexuality, religion, politics, finances, or other sensitive private life, even when self-published or mixed into a profile. Skip a candidate that combines professional content with such private details. Never infer hobbies, friendships or sensitive traits. Only explicitly self-published hobbies/activities may be used. If evidence is missing, give a targeted followUpQuery or null when further research is not useful. Never treat search snippets as evidence.',
+        identityModeInstructions + 'Instagram and Facebook sources supply an exact social-post body and separately verified account-link metadata. Only the supplied body factIds may support a post card; profile/header labels or account-link metadata are not post facts. Respect each actual publication date and platform, and never infer activities from an image or a profile name. ' + (balanced ? cardMix + 'A post source provides only actual post facts, never its copied profile header. Choose one fact/question per distinct post. Follow the trusted source.topic; never label a profile or recent post as historical popularity. popular_x means high reactions among returned all-time archive candidates, NOT the most popular post in history. If a category has no supported useful fact, fill with other supported categories and explain the shortage; never invent a fact to satisfy a quota. Follow the active CARD MIX order when all categories are available. For posts, ask a natural question specifically about what the person wrote or experienced in that dated post, rather than treating someone else mentioned in a post as the target. Historical questions must acknowledge that the post was in the past, not assume it happened today. A known verified X account post may rely on a separately supplied WEB source that explicitly establishes this person/company relationship; cardEligible includes this strictly bounded account-plus-company-evidence check. Still assess the author, attribution, company relationship and any contradictions across all actual sources before identityVerified=true. ' : '') + 'Return {identityVerified:boolean,needsConfirmation:boolean,publicPersonVerified:boolean,publicIdentitySourceIds:[],candidates:[],cards:[{factId,suggestedQuestion,displayFact,displayQuestion}],followUpQuery:string|null,reason:string}. When CARD MIX is active, return up to 6 supported candidate cards so the server can select the final four: include one useful fact for EACH available recent_x post, one popular_x post, then profile candidates. When social sources are supplied, also include exactly one useful safe social-post fact if supported, following the social CARD MIX; keep at most one social-post card. Do not skip a usable recent post to repeat a profile. Use at most one fact per post. Without CARD MIX return up to 4 distinct useful cards. Pair each candidate with one suggestedQuestion. Skip name-only facts. Prefer professional role, activities and explicitly self-published hobbies over a repeated basic identity. Return fewer when evidence is insufficient. Questions are addressed directly to the conversation partner: use natural Japanese open-ended follow-ups about their experience or interests, do not ask for a name, job or date already stated in the displayed fact, and do not repeat the same question across cards. Cards may use only supplied sources with cardEligible=true. This flag is a string-match precondition, not verified identity. Assess ALL supplied sources for ambiguity or conflicts, including cardEligible=false sources. For each card SELECT a factId from source.excerpts[].facts; do not output or rewrite fact, sourceId, excerptId or excerpt text. Each supplied fact is a complete raw source sentence or a complete pipe-delimited X profile item, at most 200 characters. For profile items, examine the full excerpt for qualifications or negations; never select a fragment contradicted by its surrounding context. Its supplied excerpt is an EXACT CONTIGUOUS substring of its source text, at most 1000 characters, containing personName and normally the nonempty companyName (or verified aliases; hiragana/katakana variants are equivalent). For a verified-account post only, the nonempty company relationship may instead be established by a separately supplied Web source under the cardEligible rule described above. This co-occurrence does NOT establish attribution: verify that the selected fact describes the target person, not another person mentioned nearby. Do not equate aliases or translations except the supplied verifiedIdentityAliases record, whose public primary-source URLs were checked separately. That record permits only identity-name equivalence, never proof of new facts or current legal-entity employment. When companyName is present, source evidence must still explicitly connect the person and company. When companyName is empty, do not invent an affiliation: require an official or self-published primary profile that clearly establishes one publicly active person (for example an author, performer, public speaker or business leader), and explicitly attributes the proposed facts to that person. publicPersonVerified=true only with that primary evidence, listing its exact supplied source IDs in publicIdentitySourceIds. Name co-occurrence, third-party mentions, an ordinary private person, or a hint alone are insufficient. Public figures need no registry entry. If evidence is missing, use a bounded followUpQuery; if identity remains private, uncertain or ambiguous, needsConfirmation=true and cards=[]. If no supplied fact supports the target, return cards=[]. suggestedQuestion is a separate conversation suggestion, max 180 characters. In this SAME response also supply a concise glasses display: displayFact is at most 28 characters and MUST be one exact contiguous, complete meaningful phrase from the selected raw fact (also present in its excerpt), with no paraphrase or new assertion. Preserve negation, time and other qualifications; omit displayFact when safe shortening is impossible. displayQuestion is a complete natural Japanese question at most 26 characters, ending in ？. Prefer concise complete questions over long ones. Never use ellipses (… or ...) in either display field and never cut a word or clause mid-way. These display fields supplement, never replace, the selected fact and its evidence. All suggestedQuestion and reason values must be Japanese. Verify identity only with the person/company connection when companyName is nonempty, or the public primary-profile requirements when companyName is empty; never use a name match alone. With conflicting identities, needsConfirmation=true, identityVerified=false, cards=[]. Prioritize short professional roles, work, public talks, and explicitly self-published non-sensitive hobbies or activities. Do not select facts or suggest questions about medical or health conditions, fertility or reproductive treatment, children, pregnancy, sexuality, religion, politics, finances, or other sensitive private life, even when self-published or mixed into a profile. Skip a candidate that combines professional content with such private details. Never infer hobbies, friendships or sensitive traits. Only explicitly self-published hobbies/activities may be used. If evidence is missing, give a targeted followUpQuery or null when further research is not useful. Never treat search snippets as evidence.',
         { target, verifiedIdentityAliases, sources: evidence }, signal, balanced ? 12_000 : API_TIMEOUT_MS);
       const cards = result.value.cards.flatMap(({ factId, displayFact, displayQuestion, ...card }) => {
         const selected = selectedFacts.get(factId);
@@ -708,7 +796,7 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
         return selected && isAllowedConversationTopic(selected.fact, card.suggestedQuestion, display.displayQuestion)
           ? [{ ...card, ...selected, ...display }] : [];
       });
-      const chosen = balanced ? selectBalancedCards(cards, sources).map(({ topic: _topic, ...card }) => card) : cards;
+      const chosen = balanced ? selectBalancedCards(cards, sources, hasSocial).map(({ topic: _topic, ...card }) => card) : cards;
       return { ...result, value: checked(AssessmentSchema, { ...result.value, cards: chosen }) };
     },
     async transcribe(bytes, mimeType, signal, context?: string): Promise<ProviderResult<string>> {
