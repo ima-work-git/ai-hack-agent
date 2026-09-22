@@ -13,6 +13,19 @@ const input = (extra: Partial<ResearchInput> = {}): ResearchInput => ({ text: DE
 afterEach(() => { vi.useRealTimers(); });
 
 describe('bounded evidence research', () => {
+  it.each(['fact', 'suggestedQuestion'] as const)('independently rejects a health-related %s from an alternate provider', async field => {
+    const provider = createFixtureProvider('normal');
+    const assess = provider.assess.bind(provider);
+    provider.assess = async (...args) => {
+      const response = await assess(...args);
+      response.value.cards = response.value.cards.map(card => ({ ...card, [field]: field === 'fact' ? '登壇者として医療や服薬の体験を話しました。' : '副反応について教えていただけますか？' }));
+      return response;
+    };
+    const result = await runAgent(input(), provider);
+    expect(result.cards).toEqual([]);
+    expect(result.trace.some(event => event.message.includes('カード全体を除外'))).toBe(true);
+  });
+
   it('revalidates display facts independently of provider output without losing a valid full card', async () => {
     const provider = createFixtureProvider('normal');
     const assess = provider.assess.bind(provider);

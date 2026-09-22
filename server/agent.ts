@@ -4,6 +4,7 @@ import {
 } from '../src/shared/contracts.ts';
 import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, Target, TraceEvent } from '../src/shared/contracts.ts';
 import { extractExplicitXHandles } from '../src/shared/x-account.ts';
+import { isAllowedConversationTopic } from '../src/shared/topic-policy.ts';
 import { evidenceMatchesTarget, normalizeIdentity, verifiedAliasForInputTarget, verifiedAliasForTarget } from '../src/shared/identity-aliases.ts';
 import type { ProviderResult, ResearchProvider } from './provider-contract.ts';
 import { ProviderError } from './provider-contract.ts';
@@ -200,6 +201,9 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       cards = []; emit('discard', '本人性と公開活動を確認できる根拠が足りないため、人物の事実を採用しません。'); return true;
     }
     for (const proposal of assessment.cards) {
+      if (!isAllowedConversationTopic(proposal.fact, proposal.suggestedQuestion, proposal.displayQuestion)) {
+        emit('discard', '健康や私生活に関わる話題を含むため、カード全体を除外しました。'); continue;
+      }
       const source = sources.find(s => s.sourceId === proposal.sourceId);
       if (!source || !contains(source.text, proposal.excerpt) || !matches(proposal.excerpt, target, source.url) || !contains(proposal.excerpt, proposal.fact)) {
         emit('discard', '出典、対象名・所属、本文引用の検査に通らないカードを棄却しました。'); continue;

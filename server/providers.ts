@@ -5,6 +5,7 @@ import {
   type Assessment, type EvidenceSource, type PlanDecision, type ResearchInput, type SearchHit, type Target,
 } from '../src/shared/contracts.ts';
 import { extractExplicitXHandles } from '../src/shared/x-account.ts';
+import { isAllowedConversationTopic } from '../src/shared/topic-policy.ts';
 import { evidenceMatchesTarget, isTargetGroundedInTranscript, normalizeIdentity, verifiedAliasForInputTarget, verifiedAliasForTarget, VERIFIED_IDENTITY_ALIASES } from '../src/shared/identity-aliases.ts';
 import { ProviderError, type ProviderConfig, type ProviderResult, type ResearchProvider } from './provider-contract.ts';
 import { safeRequest, SafeFetchError, validatePublicUrl } from './safe-fetch.ts';
@@ -502,6 +503,7 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
         // These mechanically identifiable fragments are not useful talk facts.
         // Keep short professional descriptions (e.g. 作家) and all raw offsets.
         sentences = sentences.filter(({ fact }) => {
+          if (!isAllowedConversationTopic(fact)) return false;
           if (/^公開プロフィール:[^\r\n]+$/u.test(fact)) return false;
           const content = fact.replace(/^公開投稿:\s*/u, '').trim();
           if (/^(?:https?:\/\/\S+\s*)+$/u.test(content)) return false;
@@ -540,7 +542,9 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
         const selected = selectedFacts.get(factId);
         // Unknown or stale selections fail closed. All factual strings come
         // from this call's raw source, never from model-generated paraphrases.
-        return selected ? [{ ...card, ...selected, ...validatedCardDisplay(selected.fact, selected.excerpt, displayFact, displayQuestion) }] : [];
+        const display = selected ? validatedCardDisplay(selected.fact, selected.excerpt, displayFact, displayQuestion) : {};
+        return selected && isAllowedConversationTopic(selected.fact, card.suggestedQuestion, display.displayQuestion)
+          ? [{ ...card, ...selected, ...display }] : [];
       });
       return { ...result, value: checked(AssessmentSchema, { ...result.value, cards }) };
     },

@@ -37,6 +37,27 @@ function fixture(reply: (input: SelectionInput) => unknown = () => emptyAssessme
 const hasLoneSurrogate = (text: string) => [...text].some(character => character.length === 1 && character.charCodeAt(0) >= 0xd800 && character.charCodeAt(0) <= 0xdfff);
 
 describe('bounded evidence selection — mocked model, no network or assertion of semantic identity', () => {
+  it.each([
+    '新型コロナワクチンの副反応について話しながら公開イベントに登壇しました。',
+    'I write books and discuss my medication side effects.',
+  ])('rejects an entire mixed health fact while retaining safe facts and the source: %s', async sensitive => {
+    const original = source('primary', `${target.companyName}の${target.personName}です。${sensitive} ${FACT}`);
+    const f = fixture(data => {
+      const facts = data.sources[0]!.excerpts.flatMap(excerpt => excerpt.facts.map(fact => fact.text));
+      expect(facts.some(fact => fact.includes(sensitive))).toBe(false);
+      expect(facts).toContain(FACT);
+      return { ...emptyAssessment(), cards: [select(data)] };
+    });
+    const result = await f.assess([original]);
+    expect(result.value.cards.map(card => card.fact)).toEqual([FACT]);
+    expect(f.inputs[0]!.sources[0]!.text).toContain(sensitive);
+  });
+
+  it.each(['suggestedQuestion', 'displayQuestion'] as const)('rejects a sensitive generated %s even when the fact is safe', async field => {
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), [field]: 'ワクチンの副反応は？' }] }));
+    expect((await f.assess()).value.cards).toEqual([]);
+  });
+
   it('selects exact source facts for an unregistered public figure without a company, preserving primary-evidence assessment', async () => {
     const subject = { personName: '架空作家', companyName: '' };
     const original = source('primary', `${subject.personName}の公式プロフィールです。${FACT}`);
