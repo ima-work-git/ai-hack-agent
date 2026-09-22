@@ -16,6 +16,8 @@ export interface GlassesView {
   header: string
   content: string
   footer: string
+  /** Only question/excerpt bodies request small text; navigation stays native. */
+  textSize?: 'small'
 }
 
 /** Physical gestures only. The current UI confirmation chooses their meaning. */
@@ -53,7 +55,7 @@ export interface G2RuntimeOptions {
   maxAudioMs?: number
   /** Test injection; production uses a local Canvas, never an external image API. */
   renderBitmap?: typeof renderGlassesBitmap
-  /** Off by default until image transfer latency has been verified on hardware. */
+  /** Enables explicit textSize:'small' views; other views always remain native. */
   enableImageText?: boolean
 }
 
@@ -118,6 +120,8 @@ export class G2Runtime {
   private pending: ViewJob | null = null
   private flushing = false
   private imageMode = false
+  private imageAvailable = false
+  private layoutUncertain = false
   private lastImageContent: string | null = null
   private lastText: Partial<GlassesView> = {}
   private singleTapTimer: ReturnType<typeof setTimeout> | null = null
@@ -264,8 +268,9 @@ export class G2Runtime {
         : invoke(this.options.getBridge ?? waitForEvenAppBridge))
       if (this.disposed || version !== this.connectionVersion) return false
       this.bridge = bridge
-      this.imageMode = Boolean(this.options.enableImageText && bridge.updateImageRawData && bridge.rebuildPageContainer &&
-        (this.options.renderBitmap ?? renderGlassesBitmap)(SAFE_VIEW.content))
+      this.imageAvailable = Boolean(this.options.enableImageText && bridge.updateImageRawData && bridge.rebuildPageContainer)
+      this.imageMode = false
+      this.layoutUncertain = false
       // Never put a person's details in an uncancellable startup operation.
       const result = await this.deadline(invoke(() => bridge.createStartUpPageContainer(this.startupPage())))
       if (this.disposed || version !== this.connectionVersion) return false
@@ -287,7 +292,6 @@ export class G2Runtime {
       this.notify('connected', 'bridge_acknowledged')
       // Invalidation while connect was waiting must not resurrect an old view.
       if (initialView && token === this.token && viewEpoch === this.viewEpoch) return this.render(initialView, token)
-      if (this.imageMode) return this.render(SAFE_VIEW, this.token)
       return true
     } catch (error) {
       this.connected = false
@@ -392,28 +396,45 @@ export class G2Runtime {
         const job = this.pending
         this.pending = null
         let success = true
-        if (this.imageMode && this.current(job) && this.lastImageContent !== job.view.content) {
+        if (this.current(job)) {
           try {
-            // A partly written pair must never be mistaken for the previous complete pair.
-            this.lastImageContent = null
-            const images = (this.options.renderBitmap ?? renderGlassesBitmap)(job.view.content)
-            let accepted = images !== null
-            if (images) for (const [index, imageData] of images.entries()) {
-              if (!this.currentImage(job)) { accepted = false; break }
-              const result = await this.deadline(invoke(() => this.bridge!.updateImageRawData!(new ImageRawDataUpdate({
-                containerID: index + 4, containerName: `small-text-${index}`, imageData,
-              }))))
-              if (!ImageRawDataUpdateResult.isSuccess(result)) { accepted = false; break }
+            let wantsImage = this.imageAvailable && job.view.textSize === 'small'
+            let images: ReturnType<typeof renderGlassesBitmap> = null
+            if (wantsImage && (!this.imageMode || this.lastImageContent !== job.view.content)) {
+              images = (this.options.renderBitmap ?? renderGlassesBitmap)(job.view.content)
+              wantsImage = images !== null
             }
-            if (accepted && this.currentImage(job)) this.lastImageContent = job.view.content
-            else if (!accepted && this.currentImage(job)) await this.fallbackToText()
+            // Overflow and unsupported Canvas use native text for this view only.
+            // Rebuilds contain no person data; an invalidated job cannot publish
+            // its old content after an uncancellable native rebuild completes.
+            if (wantsImage !== this.imageMode || this.layoutUncertain) await this.setImageMode(wantsImage)
+            if (this.imageMode && this.currentImage(job) && this.lastImageContent !== job.view.content) {
+              // A partly written pair cannot stand for a previous complete pair.
+              this.lastImageContent = null
+              let accepted = images !== null
+              if (images) for (const [index, imageData] of images.entries()) {
+                if (!this.currentImage(job)) { accepted = false; break }
+                const result = await this.deadline(invoke(() => this.bridge!.updateImageRawData!(new ImageRawDataUpdate({
+                  containerID: index + 4, containerName: `small-text-${index}`, imageData,
+                }))))
+                if (!ImageRawDataUpdateResult.isSuccess(result)) { accepted = false; break }
+              }
+              if (accepted && this.currentImage(job)) this.lastImageContent = job.view.content
+              else if (!accepted && this.currentImage(job)) await this.fallbackToText()
+            }
           } catch (error) {
-            try {
-              if (error instanceof BridgeTimeout || !this.currentImage(job)) throw error
-              await this.fallbackToText()
-            } catch {
-              success = false; this.fatal = true; this.cancelViews(); void this.stopAudio()
-              if (!this.disposed) this.notify('error', error instanceof BridgeTimeout ? 'display_timeout' : 'display_failed')
+            if (!(error instanceof BridgeTimeout) && !this.currentImage(job)) {
+              // A rejected obsolete view need not interrupt conversation. Its
+              // awaited operation has settled; the next view can repair layout.
+              success = false
+            } else {
+              try {
+                if (error instanceof BridgeTimeout) throw error
+                await this.fallbackToText()
+              } catch {
+                success = false; this.fatal = true; this.cancelViews(); void this.stopAudio()
+                if (!this.disposed) this.notify('error', error instanceof BridgeTimeout ? 'display_timeout' : 'display_failed')
+              }
             }
           }
         }
@@ -452,7 +473,7 @@ export class G2Runtime {
   private currentImage(job: ViewJob): boolean {
     // New speech status must not starve an in-flight pair of unchanged topic images.
     return this.usable() && job.epoch === this.viewEpoch && job.token === this.token &&
-      (job.sequence === this.viewSequence || this.pending?.view.content === job.view.content)
+      (job.sequence === this.viewSequence || this.pending?.view.content === job.view.content && this.pending.view.textSize === job.view.textSize)
   }
 
   private usable(): boolean { return this.connected && this.foreground && !this.disposed && !this.fatal && this.bridge !== null }
@@ -494,27 +515,37 @@ export class G2Runtime {
   }
 
   private async fallbackToText(): Promise<void> {
+    // An explicit device rejection disables images for this connection; a long
+    // view merely returning null from Canvas does not disable later short views.
+    this.imageAvailable = false
+    await this.setImageMode(false)
+  }
+
+  private async setImageMode(enabled: boolean): Promise<void> {
     this.clearDisplayCache()
-    this.imageMode = false
-    const page = this.startupPage()
+    this.layoutUncertain = true
+    const page = this.startupPage(enabled)
+    // Keep a truthful microphone state during the brief layout replacement.
+    page.textObject!.find(container => container.containerName === 'footer')!.content = this.acceptingAudio ? '音声認識中' : '音声状態を確認'
     const accepted = await this.deadline(invoke(() => this.bridge!.rebuildPageContainer!(new RebuildPageContainer({
-      containerTotalNum: page.containerTotalNum, textObject: page.textObject,
+      containerTotalNum: page.containerTotalNum, textObject: page.textObject, ...(page.imageObject ? { imageObject: page.imageObject } : {}),
     }))))
-    if (!accepted) throw new Error('text_fallback_failed')
+    if (!accepted) throw new Error('layout_change_failed')
+    this.imageMode = enabled; this.layoutUncertain = false
   }
 
   private clearDisplayCache(): void { this.lastImageContent = null; this.lastText = {} }
 
-  private startupPage(): CreateStartUpPageContainer {
+  private startupPage(imageMode = this.imageMode): CreateStartUpPageContainer {
     const geometry = [{ y: 0, height: 48 }, { y: 52, height: 184 }, { y: 240, height: 48 }]
     const names = ['header', 'content', 'footer'] as const
     const textObject = names.map((name, index) => new TextContainerProperty({
       xPosition: 0, yPosition: geometry[index]!.y, width: 576, height: geometry[index]!.height,
       borderWidth: index === 2 ? 0 : 1, borderColor: 5, borderRadius: 4, paddingLength: 6,
-      containerID: index + 1, containerName: name, content: this.imageMode && name === 'content' ? ' ' : SAFE_VIEW[name], isEventCapture: index === 1 ? 1 : 0,
-      ...(this.imageMode ? { zOrderIndex: index + 1 } : {}),
+      containerID: index + 1, containerName: name, content: imageMode && name === 'content' ? ' ' : SAFE_VIEW[name], isEventCapture: index === 1 ? 1 : 0,
+      ...(imageMode ? { zOrderIndex: index + 1 } : {}),
     }))
-    const imageObject = this.imageMode ? [0, 1].map(index => new ImageContainerProperty({
+    const imageObject = imageMode ? [0, 1].map(index => new ImageContainerProperty({
       xPosition: index * 288, yPosition: 66, width: 288, height: 144,
       containerID: index + 4, containerName: `small-text-${index}`, zOrderIndex: index + 4,
     })) : undefined

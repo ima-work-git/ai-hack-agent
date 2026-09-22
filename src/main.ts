@@ -21,7 +21,7 @@ let pageLeaving = false;
 
 const DEMO_TEXT = '架空・みなもデザイン株式会社の星野あおいさんについて調べたい。';
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
-const BOARD_MARKUP = Array.from({ length: 4 }, (_, index) => `<button type="button" class="topic-card empty" id="topic-${index}" disabled aria-label="${index + 1}件目は未確認"><span class="topic-number">${index + 1} / 未確認</span><span class="topic-row"><span class="topic-caption">事実</span><span class="topic-fact"${index === 0 ? ' id="fact"' : ''}>未確認</span></span><span class="topic-row"><span class="topic-caption">推奨質問</span><span class="topic-question"${index === 0 ? ' id="question"' : ''}>確認後に表示</span></span></button>`).join('');
+const BOARD_MARKUP = Array.from({ length: 4 }, (_, index) => `<button type="button" class="topic-card empty" id="topic-${index}" disabled aria-label="${index + 1}件目は未確認"><span class="topic-number">${index + 1} / 未確認</span><span class="topic-row"><span class="topic-caption">事実</span><span class="topic-fact"${index === 0 ? ' id="fact"' : ''}>未確認</span></span><span class="topic-row topic-question-row"><span class="topic-caption">⭐️推奨質問：</span><span class="topic-question"${index === 0 ? ' id="question"' : ''}>確認後に表示</span></span></button>`).join('');
 const app = document.getElementById('app')!;
 app.innerHTML = `
 <header class="masthead"><div class="wordmark"><span class="mark" aria-hidden="true">◌</span><div><div class="eyebrow">AI HACK · EVEN G2</div><h1>これで誰でも雑談マスター</h1></div></div><span class="pill" id="connection">スマートフォン表示</span></header>
@@ -170,9 +170,9 @@ function clearDisplayedCards() {
   for (const id of ['metric-time', 'metric-calls', 'metric-cost']) $(id).textContent = '—';
   $('card-count').textContent = '0 / 0'; $('previous').setAttribute('disabled', ''); $('next').setAttribute('disabled', '');
 }
-function sendHistoryView(header: string, content: string, footer: string) {
+function sendHistoryView(header: string, content: string, footer: string, textSize?: GlassesView['textSize']) {
   historyRendering = true;
-  try { void sendView(header, content, footer); } finally { historyRendering = false; }
+  try { void sendView(header, content, footer, textSize); } finally { historyRendering = false; }
 }
 function renderPeopleList() {
   const entries = personHistory.entries(); const list = $('people-list');
@@ -404,12 +404,12 @@ function clearResult(preserveSelection = false) {
   $('hud-target').textContent = 'WAITING'; $('hud-source').textContent = '各カードを押すと原文・出典を表示'; $('hud-expiry').textContent = '0 / 4件確認';
   $('card-count').textContent = '0 / 0'; $('previous').setAttribute('disabled', ''); $('next').setAttribute('disabled', '');
 }
-async function sendView(header: string, content: string, footer: string) {
+async function sendView(header: string, content: string, footer: string, textSize?: GlassesView['textSize']) {
   if (!historyRendering && voicePhase !== 'error') {
     if (peopleScreen === 'list') { renderPeopleGlasses(); return; }
     if (peopleScreen === 'person') { renderCard(); return; }
   }
-  glassesView = { header: header.slice(0, 60), content: content.slice(0, 1800), footer: footer.slice(0, 100) };
+  glassesView = { header: header.slice(0, 60), content: content.slice(0, 1800), footer: footer.slice(0, 100), ...(textSize ? { textSize } : {}) };
   await renderGlassesView();
 }
 async function renderGlassesView() {
@@ -505,7 +505,7 @@ function renderCard() {
   const title = document.createElement('h3'); title.textContent = `${cardIndex + 1}. ${source.title}`;
   const platform = document.createElement('p'); platform.className = 'source-platform'; platform.textContent = `出典：${sourceLabel(source)}`;
   const fullFact = document.createElement('p'); fullFact.className = 'source-fact'; fullFact.textContent = `事実（全文）：${card.fact}`;
-  const fullQuestion = document.createElement('p'); fullQuestion.textContent = `質問の提案：${card.suggestedQuestion}`;
+  const fullQuestion = document.createElement('p'); fullQuestion.className = 'source-question'; fullQuestion.textContent = `⭐️推奨質問：${card.suggestedQuestion}`;
   const quote = document.createElement('blockquote'); quote.textContent = card.excerpt;
   const date = document.createElement('p'); date.className = 'muted'; date.textContent = `取得：${new Date(source.retrievedAt).toLocaleString('ja-JP')}`;
   const expiry = document.createElement('p'); expiry.className = 'muted'; expiry.textContent = `有効期限：${new Date(card.expiresAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}`;
@@ -546,7 +546,7 @@ function renderCard() {
   const rows = Array.from({ length: 4 }, (_, index) => {
     const entry = cards[index];
     const label = entry ? cardLabel(entry) : '';
-    return entry ? `${index + 1}${label ? ` ${label}` : ''} 事実:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')}\n推奨質問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事実:未確認\n推奨質問:—`;
+    return entry ? `${index + 1}${label ? ` ${label}` : ''} 事実:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')}\n⭐️推奨質問：${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事実:未確認\n⭐️推奨質問：—`;
   });
   refreshControls();
   if (pendingNavigation || pendingSearchChoice || pendingAudioAction) { void renderGlassesView(); return; }
@@ -559,11 +559,11 @@ function renderCard() {
     sourcePage = Math.min(sourcePage, pages.length - 1);
     const page = pages[sourcePage]!;
     sourcePosition = positionAt(cards, sourcePage);
-    sendHistoryView(`${visibleLocked ? '固定 ' : ''}${page.index + 1} ${cardLabel(page.entry) || '出典'} 該当文 ${page.page + 1}/${page.count}`, page.content, 'スクロールで続き・最後の次は質問');
+    sendHistoryView(`${visibleLocked ? '固定 ' : ''}${page.index + 1} ${cardLabel(page.entry) || '出典'} 該当文 ${page.page + 1}/${page.count}`, page.content, 'スクロールで続き・最後の次は質問', 'small');
     return;
   }
   sourcePosition = null;
-  sendHistoryView(`${visible!.mode === 'demo' ? '[架空] ' : ''}${visibleLocked ? '固定 ' : ''}${shortText(visible!.target?.personName || '', 28)} ${cards.length}/4件${isProgressive(visible) ? ' 速報・追加調査中' : ''}`, rows.join('\n\n'), '下=出典確認 上=聞き直し確認 / 2回=人物一覧');
+  sendHistoryView(`${visible!.mode === 'demo' ? '[架空] ' : ''}${visibleLocked ? '固定 ' : ''}${shortText(visible!.target?.personName || '', 28)} ${cards.length}/4件${isProgressive(visible) ? ' 速報・追加調査中' : ''}`, rows.join('\n\n'), '下=出典確認 上=聞き直し確認 / 2回=人物一覧', 'small');
 }
 function addTrace(event: TraceEvent) {
   if (event.search) {
@@ -598,7 +598,7 @@ function showResult(value: ResearchResult) {
   if (!value.cards.length) {
     renderBoard([]); $('hud-target').textContent = value.target?.personName || '対象未確認'; $('hud-expiry').textContent = '0 / 4件確認';
     void sendView(failure ? '調査を一時停止' : value.status === 'awaiting_confirmation' ? '相手の確認が必要です' : '確認できた情報はありません',
-      failure ? failure.message : Array.from({ length: 4 }, (_, index) => `${index + 1} 事実:未確認\n推奨質問:—`).join('\n\n'), failure?.action ?? 'スマートフォンで確認');
+      failure ? failure.message : Array.from({ length: 4 }, (_, index) => `${index + 1} 事実:未確認\n⭐️推奨質問：—`).join('\n\n'), failure?.action ?? 'スマートフォンで確認');
   }
   renderCard();
 }
@@ -797,7 +797,7 @@ function acceptAudio(chunk: Uint8Array) {
   if (!recording || audioBytes + chunk.length > 960_000) return;
   audioChunks.push(chunk.slice()); audioBytes += chunk.length;
 }
-g2 = new G2Runtime({ onStatus: g2Status, onAudio: acceptAudio, onAction: action => {
+g2 = new G2Runtime({ enableImageText: true, onStatus: g2Status, onAudio: acceptAudio, onAction: action => {
   if (action === 'next') navigateGlassesSource(1);
   else if (action === 'previous') navigateGlassesSource(-1);
   else if (action === 'primary') {

@@ -17,7 +17,7 @@ interface SearchCandidateInput {
   companyContext?: string;
   catalog?: readonly PublicFigureCatalogEntry[];
 }
-interface Seed { target: Target; correction: boolean; }
+interface Seed { target: Target; correction: boolean; userProvided?: boolean; }
 const normalizeName = (value: string) => normalizeIdentity(value).replace(/(?:さん|氏|様)$/u, '');
 const sameName = (value: string, names: readonly string[]) => names.some(name => normalizeName(value) === normalizeName(name));
 const namesFor = (entry: PublicFigureCatalogEntry) => [entry.canonicalName, entry.kana, ...entry.publicNames, ...(entry.xHandle ? [entry.xHandle, `@${entry.xHandle}`] : [])].filter(Boolean);
@@ -41,6 +41,27 @@ function literal(text: string, name: string): string | undefined {
     from = found + 1;
   }
   return;
+}
+/** A user-supplied surname is a search hint only. Require a standalone name
+ * or honorific, excluding other people/places/objects such as 高野太郎,
+ * 高野山 and 高野豆腐. Previous speech cannot introduce this person. */
+function userProvidedMention(text: string, entry: PublicFigureCatalogEntry): boolean {
+  // Preserve word separators for the boundary check, unlike identity equality.
+  const normalized = text.split(/(\s+)/u).map(part => /^\s+$/u.test(part) ? ' ' : normalizeIdentity(part)).join('');
+  return (entry.userProvidedSearchNames ?? []).some(name => {
+    const needle = normalizeName(name);
+    if (!needle) return false;
+    let from = 0;
+    while (from <= normalized.length) {
+      const start = normalized.indexOf(needle, from); if (start < 0) return false;
+      const end = start + needle.length;
+      const before = normalized[start - 1] ?? ''; const after = normalized.slice(end).trimStart();
+      if ((!before || /[\s\p{P}\p{S}のはがをにとで]/u.test(before)) &&
+        (!after || /^(?:さん|さま|様|氏|くん|ちゃん)(?=$|[\p{P}\p{S}はがをにのとで])/u.test(after) || /^[\p{P}\p{S}]/u.test(after))) return true;
+      from = start + 1;
+    }
+    return false;
+  });
 }
 function companiesFor(entry: PublicFigureCatalogEntry): string[] {
   return [...new Set([
@@ -73,7 +94,7 @@ function nearName(raw: string, entry: PublicFigureCatalogEntry): boolean {
 }
 const quote = (value: string) => `"${value.normalize('NFKC').replace(/["\\\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim()}"`;
 const queryFor = (target: Target) => [quote(target.personName), ...(target.companyName ? [quote(target.companyName)] : [])].join(' ');
-const labelFor = (seed: Seed) => `${seed.target.personName}${seed.target.companyName ? ` / ${seed.target.companyName}` : ''}${seed.correction ? '（補正候補・要確認）' : ''}`;
+const labelFor = (seed: Seed) => `${seed.target.personName}${seed.target.companyName ? ` / ${seed.target.companyName}` : ''}${seed.userProvided ? '（ユーザー指定の呼称・要確認）' : seed.correction ? '（補正候補・要確認）' : ''}`;
 function stableId(value: string): string {
   let hash = 0x811c9dc5;
   for (const character of value) { hash ^= character.codePointAt(0)!; hash = Math.imul(hash, 0x01000193); }
@@ -87,10 +108,10 @@ export function buildSearchCandidates(input: SearchCandidateInput): SearchCandid
   if (!current.trim()) return [];
   const catalog = (input.catalog ?? PUBLIC_FIGURE_CATALOG).slice(0, 256);
   const seeds: Seed[] = []; const seedKeys = new Set<string>();
-  const addSeed = (target: Target, correction: boolean) => {
+  const addSeed = (target: Target, correction: boolean, userProvided = false) => {
     const key = `${normalizeName(target.personName)}|${normalizeIdentity(target.companyName)}`;
     if (seedKeys.has(key)) return;
-    seedKeys.add(key); seeds.push({ target: { ...target }, correction });
+    seedKeys.add(key); seeds.push({ target: { ...target }, correction, ...(userProvided ? { userProvided: true } : {}) });
   };
   const raw: Target[] = [];
   for (const proposed of input.targets.slice(0, 8)) {
@@ -123,6 +144,20 @@ export function buildSearchCandidates(input: SearchCandidateInput): SearchCandid
     // Do not attach a famous candidate to a different, explicitly supplied employer.
     if (suppliedCompany && !companiesFor(entry).some(name => normalizeIdentity(name) === normalizeIdentity(suppliedCompany))) continue;
     addSeed({ personName: entry.canonicalName, companyName: suppliedCompany ?? observedCompany(entry, current, context) }, score < 3);
+  }
+  // Kept completely outside namesFor(): no alias, correction, transcript
+  // grounding or automatic identity resolution derives from these hints.
+  for (const entry of catalog) {
+    if (!userProvidedMention(current, entry)) continue;
+    // Include an already-canonical planner proposal as well: it must not
+    // erase a supplied conflicting employer merely because its name failed
+    // the public-alias grounding above.
+    const relevant = input.targets.slice(0, 8).flatMap(proposed => {
+      const parsed = TargetSchema.safeParse(proposed);
+      return parsed.success && sameName(parsed.data.personName, [...namesFor(entry), ...(entry.userProvidedSearchNames ?? [])]) ? [parsed.data] : [];
+    });
+    if (relevant.some(target => target.companyName && !companiesFor(entry).some(name => normalizeIdentity(name) === normalizeIdentity(target.companyName)))) continue;
+    addSeed({ personName: entry.canonicalName, companyName: '' }, false, true);
   }
   const candidates: SearchCandidate[] = []; const keys = new Set<string>();
   const append = (seed: Seed, suffix = '', target = seed.target) => {

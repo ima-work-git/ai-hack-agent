@@ -71,6 +71,15 @@ export function isIdentityNameSpan(text: string, name: string, start: number, en
   }
   const before = normalize(text.slice(0, start)).at(-1) ?? '';
   const after = normalize(text.slice(end));
+  // Two-kana public names also name ordinary objects (こまを回す) and
+  // commands (コマンド). Permit a name ending or honorific, not a bare
+  // two-kana noun followed by particles/word continuation.
+  if (/^[ぁ-ゖー]{2}$/u.test(needle)) {
+    // A counter ending at punctuation is still ordinary speech: 4コマ。
+    // Space removal must not make 4 コマ or 一コマ into a public name.
+    if (/[\p{N}〇零一二三四五六七八九十百千万億兆数何]/u.test(before) || /ひと$/u.test(normalize(text.slice(0, start)))) return false;
+    if (after && !/^(?:さん|さま|様|氏|くん|ちゃん)/u.test(after) && !/^[\p{P}\p{S}]/u.test(after)) return false;
+  }
   if (/^[ぁ-ゖー]{2,3}$/u.test(needle)) {
     if (/[ぁ-ゖー]/u.test(before) && !/[のはがをにとで]/u.test(before)) return false;
     if (/^[ぁ-ゖー]/u.test(after) && !/^(?:さん|さま|くん|ちゃん|です|は|が|を|に|の|と|で)/u.test(after)) return false;
