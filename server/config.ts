@@ -16,6 +16,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     orcaModel: env.ORCAROUTER_MODEL || env.ORCA_MODEL || '',
     orcaSttModel: env.ORCAROUTER_STT_MODEL || '',
     tavilyApiKey: env.TAVILY_API_KEY || '',
+    xBalancedTopics: env.X_BALANCED_TOPICS !== 'false',
     xEnabled: env.X_API_ENABLED === 'true', xBearerToken: env.X_API_BEARER_TOKEN || env.X_BEARER_TOKEN || '',
     sttApiKey: env.STT_API_KEY || '', sttBaseUrl: env.STT_API_BASE_URL || '', sttModel: env.STT_MODEL || '',
   };
@@ -55,7 +56,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   if (accessCode.length < 16) missing.push('16文字以上の利用コード');
   if (providers.xEnabled) {
     if (!providers.xBearerToken) missing.push('Xの読取トークン');
-    maximumCosts.search = Math.max(maximumCosts.search, amount('X_MAX_SEARCH_COST_USD', 'X検索全体の最大見積額（ユーザー1件＋投稿5件）'));
+    maximumCosts.search = Math.max(maximumCosts.search, amount('X_MAX_SEARCH_COST_USD', 'X検索全体の最大見積額（ユーザー1件＋直近5件＋過去20件＋空時補完10件）'));
   }
   const explicitStt = Boolean(providers.sttApiKey || providers.sttBaseUrl || providers.sttModel);
   const sttComplete = explicitStt ? Boolean(providers.sttApiKey && providers.sttBaseUrl && providers.sttModel) : Boolean(providers.orcaApiKey && providers.orcaSttModel);

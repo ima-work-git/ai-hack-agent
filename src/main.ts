@@ -107,13 +107,18 @@ function shortText(text: string, maximumWidth: number): string {
   for (const character of characters) { if (used + width(character) > maximumWidth - 2) break; clipped += character; used += width(character); }
   return `${clipped}…`;
 }
+function topicLabel(card: Card): string {
+  const topic = card.topic ?? result?.sources.find(source => source.sourceId === card.sourceId)?.topic;
+  return topic === 'recent_x' ? '最近X' : topic === 'popular_x' ? '過去X' : topic === 'profile' ? '人物・会社' : '';
+}
 function renderBoard(cards: Card[]) {
   for (let index = 0; index < 4; index++) {
     const slot = $<HTMLButtonElement>(`topic-${index}`); const card = cards[index];
+    const label = card ? topicLabel(card) : '';
     slot.disabled = !card; slot.classList.toggle('empty', !card); slot.classList.toggle('selected', !!card && index === cardIndex);
     slot.setAttribute('aria-pressed', String(!!card && index === cardIndex));
-    slot.setAttribute('aria-label', card ? `${index + 1}件目の原文と出典を表示` : `${index + 1}件目は未確認`);
-    slot.querySelector('.topic-number')!.textContent = `${index + 1} / ${card ? '原文・出典 ↗' : '未確認'}`;
+    slot.setAttribute('aria-label', card ? `${index + 1}件目${label ? `・${label}` : ''}の原文と出典を表示` : `${index + 1}件目は未確認`);
+    slot.querySelector('.topic-number')!.textContent = `${index + 1} / ${card ? `${label ? `${label} · ` : ''}原文・出典 ↗` : '未確認'}`;
     slot.querySelector('.topic-fact')!.textContent = card ? card.displayFact || card.fact : '未確認';
     slot.querySelector('.topic-question')!.textContent = card ? card.displayQuestion || card.suggestedQuestion : '確認後に表示';
     slot.onclick = card ? () => { cardIndex = index; renderCard(); } : null;
@@ -196,11 +201,31 @@ function renderCard() {
   const date = document.createElement('p'); date.className = 'muted'; date.textContent = `取得：${new Date(source.retrievedAt).toLocaleString('ja-JP')}`;
   const expiry = document.createElement('p'); expiry.className = 'muted'; expiry.textContent = `有効期限：${new Date(card.expiresAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}`;
   evidence.append(title, fullFact, fullQuestion, quote, date, expiry);
+  const label = topicLabel(card);
+  if (label) { const category = document.createElement('p'); category.className = 'source-topic muted'; category.textContent = `話題：${label}`; evidence.insertBefore(category, fullFact); }
+  if (source.xPost) {
+    const post = source.xPost;
+    if (post.createdAt) {
+      const posted = document.createElement('p'); posted.className = 'source-post-date muted';
+      posted.textContent = `投稿：${new Date(post.createdAt).toLocaleString('ja-JP')}`; evidence.append(posted);
+    }
+    const counts = [['いいね', post.likeCount], ['リポスト', post.repostCount], ['返信', post.replyCount], ['引用', post.quoteCount]] as const;
+    const visibleCounts = counts.filter(([, count]) => typeof count === 'number' && Number.isFinite(count) && count >= 0);
+    if (visibleCounts.length) {
+      const metrics = document.createElement('p'); metrics.className = 'source-post-metrics muted';
+      metrics.textContent = `取得時の反響：${visibleCounts.map(([name, count]) => `${name} ${count!.toLocaleString('ja-JP')}`).join(' / ')}`; evidence.append(metrics);
+    }
+    if (post.selectionScope === 'full_archive_sample') {
+      const scope = document.createElement('p'); scope.className = 'source-selection-scope muted';
+      scope.textContent = '過去の反響：全期間の検索候補から選定'; evidence.append(scope);
+    }
+  }
   if (source.kind !== 'fixture' && /^https?:\/\//.test(source.url)) { const link = document.createElement('a'); link.href = source.url; link.textContent = '出典を開く ↗'; link.target = '_blank'; link.rel = 'noopener noreferrer'; evidence.append(link); }
   $('sources').append(evidence);
   const rows = Array.from({ length: 4 }, (_, index) => {
     const entry = cards[index];
-    return entry ? `${index + 1} 事:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')} 問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事:未確認 問:—`;
+    const label = entry ? topicLabel(entry) : '';
+    return entry ? `${index + 1}${label ? ` ${label}` : ''} 事:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')} 問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事:未確認 問:—`;
   });
   void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件`, rows.join('\n'), '事=事実 問=質問 / 原文はスマホ');
 }

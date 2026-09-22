@@ -14,12 +14,22 @@ export const ResearchInputSchema = z.object({
   conversationId: z.string().uuid().optional(),
 }).strict();
 export type ResearchInput = z.infer<typeof ResearchInputSchema>;
-export const SearchHitSchema = z.object({ url: z.url().max(2048), title: z.string().max(400), snippet: z.string().max(3000).optional() }).strict();
+export const TopicSchema = z.enum(['recent_x', 'popular_x', 'profile']);
+export type CardTopic = z.infer<typeof TopicSchema>;
+export const XPostSchema = z.object({
+  id: z.string().regex(/^\d{1,25}$/), authorId: z.string().regex(/^\d{1,25}$/), username: z.string().regex(/^[A-Za-z0-9_]{1,15}$/),
+  createdAt: z.iso.datetime(), likeCount: z.number().int().nonnegative(), repostCount: z.number().int().nonnegative(),
+  replyCount: z.number().int().nonnegative(), quoteCount: z.number().int().nonnegative(), text: z.string().max(30000),
+  selectionScope: z.literal('full_archive_sample').optional(),
+}).strict();
+export type XPost = z.infer<typeof XPostSchema>;
+export const SearchHitSchema = z.object({ url: z.url().max(2048), title: z.string().max(400), snippet: z.string().max(3000).optional(), topic: TopicSchema.optional() }).strict();
 export type SearchHit = z.infer<typeof SearchHitSchema>;
 export const EvidenceSourceSchema = z.object({
   sourceId: z.string().min(1).max(100), url: z.url().max(2048), title: z.string().max(400),
   retrievedAt: z.iso.datetime(), text: z.string().max(40000),
   kind: z.enum(['web', 'x', 'fixture']),
+  topic: TopicSchema.optional(), xPost: XPostSchema.optional(),
 }).strict();
 export type EvidenceSource = z.infer<typeof EvidenceSourceSchema>;
 export const CandidateSchema = z.object({ id: z.string().min(1).max(80), personName: z.string().trim().min(1).max(100), companyName: z.string().trim().max(160), reason: z.string().max(400), sourceIds: z.array(z.string()).max(4) }).strict();
@@ -53,7 +63,7 @@ export const AssessmentSchema = z.object({
   cards: z.array(ProposedCardSchema).max(4), followUpQuery: z.string().max(300).nullable(), reason: z.string().max(600),
 }).strict();
 export type Assessment = z.infer<typeof AssessmentSchema>;
-export const CardSchema = ProposedCardSchema.extend({ cardId: z.string(), expiresAt: z.iso.datetime(), requestId: z.string(), subjectRevision: z.number().int() }).strict();
+export const CardSchema = ProposedCardSchema.extend({ cardId: z.string(), expiresAt: z.iso.datetime(), requestId: z.string(), subjectRevision: z.number().int(), topic: TopicSchema.optional() }).strict();
 export type Card = z.infer<typeof CardSchema>;
 export const TraceEventSchema = z.object({ eventId: z.number().int().positive(), step: z.string().max(60), message: z.string().max(800), at: z.iso.datetime() }).strict();
 export type TraceEvent = z.infer<typeof TraceEventSchema>;
@@ -65,7 +75,7 @@ export const ResearchResultSchema = z.object({
   requestId: z.string(), subjectRevision: z.number().int(), mode: ModeSchema,
   status: z.enum(['ready', 'partial', 'no_evidence', 'awaiting_confirmation', 'failed', 'cancelled']),
   target: TargetSchema.nullable(), candidates: z.array(CandidateSchema).max(5),
-  cards: z.array(CardSchema).max(4), sources: z.array(EvidenceSourceSchema).max(4),
+  cards: z.array(CardSchema).max(4), sources: z.array(EvidenceSourceSchema).max(6),
   trace: z.array(TraceEventSchema).max(60), reasonCode: z.string().max(80), message: z.string().max(800), usage: UsageSchema,
 }).strict();
 export type ResearchResult = z.infer<typeof ResearchResultSchema>;
