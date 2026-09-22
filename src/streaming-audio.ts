@@ -16,11 +16,9 @@ interface Connection {
   opened: boolean;
   resolve: (ready: boolean) => void;
   timer: ReturnType<typeof setTimeout>;
-  pending: Uint8Array[];
-  bytes: number;
 }
 
-/** Immediate PCM streaming; only connection setup may buffer up to two seconds. */
+/** Only ready-state PCM is streamed; preparation audio is never retained or replayed. */
 export class StreamingAudio {
   private readonly options: StreamingAudioOptions;
   private connection: Connection | null = null;
@@ -45,7 +43,7 @@ export class StreamingAudio {
     let resolve!: (ready: boolean) => void;
     const result = new Promise<boolean>(done => { resolve = done; });
     const connection: Connection = {
-      socket, ready: false, opened: false, resolve, pending: [], bytes: 0,
+      socket, ready: false, opened: false, resolve,
       timer: setTimeout(() => this.finish(connection, new Error('音声接続の準備がタイムアウトしました。')), READY_TIMEOUT_MS),
     };
     this.connection = connection;
@@ -69,16 +67,11 @@ export class StreamingAudio {
 
   append(chunk: Uint8Array): void {
     const connection = this.connection;
-    if (!connection || !chunk.length) return;
+    if (!connection || !connection.ready || !chunk.length) return;
     if (!(chunk instanceof Uint8Array) || chunk.length % 2 !== 0) {
       this.finish(connection, new Error('音声データの形式を確認できませんでした。')); return;
     }
-    if (connection.ready) { this.send(connection, chunk); return; }
-    if (connection.bytes + chunk.byteLength > MAX_BUFFER_BYTES) {
-      this.finish(connection, new Error('音声接続の準備が遅れたため、録音を停止しました。')); return;
-    }
-    connection.pending.push(chunk.slice());
-    connection.bytes += chunk.byteLength;
+    this.send(connection, chunk);
   }
 
   cancel(): void { if (this.connection) this.finish(this.connection); }
@@ -100,11 +93,6 @@ export class StreamingAudio {
         if (connection.ready) return;
         connection.ready = true;
         clearTimeout(connection.timer);
-        for (const chunk of connection.pending) {
-          if (!this.send(connection, chunk)) return;
-          chunk.fill(0);
-        }
-        connection.pending = []; connection.bytes = 0;
         connection.resolve(true);
         return;
       }
@@ -130,8 +118,6 @@ export class StreamingAudio {
     if (this.connection !== connection) return;
     this.connection = null;
     clearTimeout(connection.timer);
-    for (const chunk of connection.pending) chunk.fill(0);
-    connection.pending = []; connection.bytes = 0;
     connection.resolve(false);
     connection.socket.onopen = connection.socket.onmessage = connection.socket.onerror = connection.socket.onclose = null;
     try { connection.socket.close(); } catch { /* An already failed socket may reject close. */ }
