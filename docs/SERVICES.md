@@ -1,6 +1,6 @@
 # OrcaRouter・実行環境の準備
 
-確認日：2026-09-21。実アカウント操作、キー発行、バウチャー適用、API疎通、クラウド作成は未実施。
+更新日：2026-09-22。ユーザーからXアカウントとX Developerの準備完了を受領。こちらでのアカウント操作、キー発行、バウチャー適用、API疎通、クラウド作成は未実施。
 
 ## OrcaRouter
 
@@ -55,8 +55,34 @@ AWSを使う場合は以下を準備する。
 - Even G2：[既存方式と実機確認](EVEN_G2_INTEGRATION.md)。
 - STT：PCM 16kHz mono入力、日本語の人名/会社名、遅延、課金、保持条件を短い許可済み音声で検証する。OrcaRouterのSTT対応は未確認なので前提にしない。
 - Web検索：利用可能なAPIを選び、検索と本文取得の権限・費用・サイズ/時間制限を決める。検索抜粋だけを裏取り済みとしない。
-- X：公式の人物検索APIは候補取得に利用可能。開発者アクセスと従量課金の確認が必要。未契約ならMVPの必須経路から外す。[人物検索](https://docs.x.com/x-api/users/search/introduction)、[料金](https://docs.x.com/x-api/getting-started/pricing)
+- X：開発用アカウント @aihack2026sep と同じアカウントのX Developerを準備済み（ユーザー申告）。人物検索・公開投稿の読取に利用する予定。App・トークン・利用権限・残高・API疎通は未確認。下記手順で確認する。[人物検索](https://docs.x.com/x-api/users/search/introduction)、[料金](https://docs.x.com/x-api/getting-started/pricing)
 - Facebook：Pages向けAPIと個人プロフィールを区別する。任意人物のプロフィールを取得できるとは未確認。必要な許可と読取可能性が確認できるまで公式サイト中心で進める。[Meta公式サンプルのアクセス前提](https://github.com/fbsamples/reels_publishing_apis/blob/main/insta_reels_publishing_api_sample/README.md#before-you-start)
 - 削除/非公開後も検索結果に古い内容が残り得るため、取得本文を確認できない主張をカードに載せない。[X公式説明](https://help.x.com/en/safety-and-security/remove-x-profile-from-google-search)
 
-確認日：2026-09-22。SNS API契約・資格情報・実リクエストは未確認。金額上限と送信先・保持条件を設定してからliveで接続する。
+確認日：2026-09-22。Xのアカウント準備と、APIが利用可能であることを区別する。金額上限と送信先・保持条件を設定してからliveで接続する。
+
+## X API：準備状況と使い方
+
+開発用アカウント：[@aihack2026sep](https://x.com/aihack2026sep)。2026-09-22、ユーザーが作成しX Developerにも同じアカウントを使用したと報告。ログイン情報・トークンは受け取っていない。
+
+- [x] Xアカウントの作成（ユーザー申告）
+- [x] 同じアカウントでX Developerを準備（ユーザー申告）
+- [ ] Developer ConsoleのApp作成・利用可能なエンドポイントを確認
+- [ ] AppのBearer Tokenをサーバー側の秘密管理へ設定
+- [ ] 利用クレジット残高・課金単位・支出上限を確認
+- [ ] アプリ側の取得件数・呼出回数・時間・金額上限を実装
+- [ ] 最小読取で401/403/429等の扱いと利用額を確認
+
+調査の流れは、名前/会社から候補を探す → 公式プロフィール等で対象を照合 → 確定したアカウントの公開プロフィール・投稿を取得 → 本人が公表した話題を根拠付きカードへ、を想定する。アカウントのbioだけで同一人物と決めない。
+
+最初の連携は、既知ハンドルを `GET /2/users/by/username/{username}` で照合し、対象IDの `GET /2/users/{id}/tweets` を少数取得する。人物候補検索の `GET /2/users/search` は必要な認証方式と権限を別途疎通で確認し、使えなければ公式サイトにあるハンドルから照合する。エンドポイントごとの認証・利用枠を同一視しない。[公式API別利用枠](https://docs.x.com/x-api/fundamentals/rate-limits)
+
+`GET /2/tweets/search/recent` は直近7日間の条件検索で、上記のユーザー投稿取得とは別。MVPは対象の投稿取得を優先し、過去の趣味や活動を直近検索だけで網羅できるとは扱わない。[投稿検索の範囲](https://docs.x.com/x-api/posts/search/introduction)
+
+初回疎通は開発用アカウント自身のプロフィール等を少量だけ読む。相手のアカウントへのログインを求めず、公開情報の読取にAppの認証を使う。投稿・DM・フォロー操作は実装対象外。
+
+環境変数の案は `.env.example` の `X_API_BEARER_TOKEN`。実値はサーバー側だけに保存し、`VITE_*`・グラス用パッケージ・公開コードへ入れない。`X_API_ENABLED=false`も現時点では提案値で、読込と停止制御の実装はこれから。
+
+X APIは従量課金で、読取は返却リソース数に応じて課金される。呼出回数だけでなく、ユーザー候補数・投稿数・展開データ数にも上限を設ける。現在価格は実行前にDeveloper Consoleで確認し、STT・OrcaRouterとは別の費用として合算する。クレジット購入や支出設定はまだ行っていない。[公式料金・支出上限](https://docs.x.com/x-api/getting-started/pricing)
+
+Xへの追加呼出も[設計の調査全体の時間・回数・費用上限](specs/02_AGENT_DESIGN.md)に含める。APIの最小取得件数・ページ数と価格を確認してから件数上限を決め、結果の自動全件取得はしない。
