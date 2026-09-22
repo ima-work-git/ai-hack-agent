@@ -38,15 +38,16 @@ describe('streaming PCM client (mocked WebSocket)', () => {
     socket.event({ type: 'ready' }); expect(await starting).toBe(true); audio.cancel();
   });
 
-  it('flushes setup PCM in order then immediately sends each frame, with no eight-second batching', async () => {
+  it('drops preparation PCM without replay, then immediately sends only ready-state frames', async () => {
     const f = fixture(); const starting = f.audio.start('ticket');
     const first = new Uint8Array([1, 2]); f.audio.append(first); first.fill(9);
     f.audio.append(new Uint8Array([3, 4])); f.socket.open();
     expect(f.socket.send).toHaveBeenCalledTimes(1);
     f.socket.event({ type: 'ready' }); expect(await starting).toBe(true);
+    expect(f.socket.send).toHaveBeenCalledTimes(1);
     const frame = new Uint8Array([5, 6]); f.audio.append(frame); frame.fill(9);
     expect(f.socket.send.mock.calls.slice(1).map(([value]) => [...new Uint8Array(value as ArrayBuffer)]))
-      .toEqual([[1, 2], [3, 4], [5, 6]]);
+      .toEqual([[5, 6]]);
     f.socket.event({ type: 'delta', itemId: 'a', text: '増分' });
     f.socket.event({ type: 'delta', itemId: 'a', text: 'です' });
     f.socket.event({ type: 'final', itemId: 'a', text: '増分です' });
@@ -55,12 +56,24 @@ describe('streaming PCM client (mocked WebSocket)', () => {
     f.audio.cancel();
   });
 
-  it('allows exactly two seconds during setup and stops before retaining excess PCM', async () => {
+  it('waits beyond two seconds with continuous preparation PCM without retaining it or stopping', async () => {
     const f = fixture(); const starting = f.audio.start('ticket');
-    f.audio.append(new Uint8Array(64_000)); expect(f.onError).not.toHaveBeenCalled();
-    f.audio.append(new Uint8Array(2)); expect(await starting).toBe(false);
-    expect(f.socket.close).toHaveBeenCalledOnce(); expect(f.onError).toHaveBeenCalledOnce();
-    f.socket.open(); f.socket.event({ type: 'ready' }); expect(f.socket.send).not.toHaveBeenCalled();
+    const ready = vi.fn(); void starting.then(ready); f.socket.open();
+    for (let second = 0; second < 5; second++) {
+      const frame = new Uint8Array(32_000).fill(second + 1);
+      const copy = vi.spyOn(frame, 'slice');
+      f.audio.append(frame);
+      expect(copy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(ready).not.toHaveBeenCalled();
+    expect(f.socket.send).toHaveBeenCalledTimes(1);
+    expect(f.onError).not.toHaveBeenCalled(); expect(f.socket.close).not.toHaveBeenCalled();
+    f.socket.event({ type: 'ready' }); expect(await starting).toBe(true);
+    expect(f.socket.send).toHaveBeenCalledTimes(1);
+    f.audio.append(new Uint8Array([7, 8]));
+    expect([...new Uint8Array(f.socket.send.mock.calls[1]![0] as ArrayBuffer)]).toEqual([7, 8]);
+    f.audio.cancel();
   });
 
   it('stops on transport backpressure without sending or retaining another frame', async () => {
@@ -73,6 +86,7 @@ describe('streaming PCM client (mocked WebSocket)', () => {
   it('cancels preparation and ignores delayed events from the previous connection after restart', async () => {
     const f = fixture(); const previous = f.audio.start('old'); const old = f.socket;
     const lateOpen = old.onopen!; const lateMessage = old.onmessage!; const lateClose = old.onclose!;
+    f.audio.append(new Uint8Array(96_000));
     expect(await f.audio.start('duplicate')).toBe(false); f.audio.cancel(); expect(await previous).toBe(false);
     const next = f.audio.start('new'); f.socket.open(); f.socket.event({ type: 'ready' }); expect(await next).toBe(true);
     lateOpen(); lateMessage({ data: JSON.stringify({ type: 'final', itemId: 'old', text: 'obsolete' }) }); lateClose();
@@ -86,6 +100,18 @@ describe('streaming PCM client (mocked WebSocket)', () => {
     const next = f.audio.start('ticket'); f.socket.open(); f.socket.event({ type: 'ready' }); expect(await next).toBe(true);
     await vi.advanceTimersByTimeAsync(60_000); f.audio.append(new Uint8Array(2));
     expect(f.socket.close).not.toHaveBeenCalled(); f.audio.cancel();
+  });
+
+  it('keeps the ten-second preparation deadline even while dropping incoming PCM', async () => {
+    const f = fixture(); const starting = f.audio.start('ticket'); f.socket.open();
+    for (let second = 0; second < 10; second++) {
+      f.audio.append(new Uint8Array(32_000));
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(await starting).toBe(false);
+    expect(f.onError).toHaveBeenCalledOnce();
+    expect(f.onError.mock.calls[0]![0].message).toContain('準備がタイムアウト');
+    expect(f.socket.send).toHaveBeenCalledTimes(1);
   });
 
   it.each(['error', 'closed', 'close', 'socket-error', 'invalid', 'odd-pcm'] as const)('stops once on %s and suppresses later frames', async reason => {

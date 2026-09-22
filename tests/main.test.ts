@@ -452,6 +452,10 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
   it.each([
     ['費用上限に達しました。', '費用上限で停止'],
     ['音声認識サービスへ接続できませんでした。', '音声API接続失敗'],
+    ['音声接続の準備がタイムアウトしました。', '音声の接続待ち切れ'],
+    ['音声接続の準備が遅れたため、録音を停止しました。', '音声の接続待ち切れ'],
+    ['音声の送信が遅れたため、録音を停止しました。', '音声送信が不安定'],
+    ['音声データの形式を確認できませんでした。', '音声データを確認'],
   ])('shows the actual audio error category on glasses and permits restart: %s', async (message, label) => {
     await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
     devices.streaming!.options.onError(new Error(message)); await flush();
@@ -462,6 +466,83 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element<HTMLButtonElement>('conversation').disabled).toBe(false);
     click('conversation'); await flush();
     expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('G2 聞取中');
+  });
+
+  it('waits for ASR readiness before starting the G2 microphone and clearly displays preparation', async () => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush();
+    const ready = deferred<boolean>();
+    click('conversation'); devices.streaming!.start.mockReturnValueOnce(ready.promise); await flush();
+    expect(devices.streaming!.start).toHaveBeenCalledWith('fixture-stream-ticket');
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled(); expect(devices.phone!.start).not.toHaveBeenCalled();
+    expect(element('status').textContent).toContain('準備完了後に話してください');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('音声準備中');
+    devices.g2!.options.onStatus?.({ state: 'connected' }); await flush();
+    expect(devices.streaming!.cancel).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled();
+    ready.resolve(true); await flush();
+    expect(devices.g2!.startAudio).toHaveBeenCalledExactlyOnceWith({ continuous: true });
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('G2 聞取中');
+    expect(element('status').textContent).toContain('ストリーミング認識中');
+    devices.g2!.options.onStatus?.({ state: 'connected' }); await flush();
+    expect(devices.streaming!.cancel).toHaveBeenCalledOnce();
+  });
+
+  it('starts the phone microphone inside the tap while ASR is still preparing', async () => {
+    const setup = deferred<Response>(); routes.set('/api/conversation', () => setup.promise);
+    await boot(); chooseLiveAndConsent(); click('conversation');
+    expect(devices.phone!.start).toHaveBeenCalledExactlyOnceWith({ continuous: true });
+    expect(devices.streaming!.start).not.toHaveBeenCalled(); expect(devices.g2!.startAudio).not.toHaveBeenCalled();
+    const ready = deferred<boolean>(); devices.streaming!.start.mockReturnValueOnce(ready.promise);
+    setup.resolve(jsonResponse({ conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab', expiresAt: Date.now() + 900_000 })); await flush();
+    expect(devices.streaming!.start).toHaveBeenCalledOnce();
+    expect(element('status').textContent).toContain('準備完了後に話してください');
+    ready.resolve(true); await flush();
+    expect(devices.phone!.start).toHaveBeenCalledOnce(); expect(devices.phone!.recording).toBe(true);
+    expect(element('status').textContent).toContain('ストリーミング認識中');
+  });
+
+  it.each(['cancel', 'background', 'consent', 'pagehide', 'g2-disconnected', 'g2-background', 'g2-error'] as const)('does not start the G2 microphone when ASR becomes ready after %s', async action => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush();
+    const ready = deferred<boolean>();
+    click('conversation'); const stream = devices.streaming!; stream.start.mockReturnValueOnce(ready.promise); await flush();
+    if (action === 'cancel') click('cancel');
+    else if (action === 'background') {
+      vi.spyOn(document, 'hidden', 'get').mockReturnValue(true); document.dispatchEvent(new Event('visibilitychange'));
+    } else if (action === 'consent') {
+      element<HTMLInputElement>('consent').checked = false; element('consent').dispatchEvent(new Event('change'));
+    } else if (action === 'pagehide') window.dispatchEvent(new Event('pagehide'));
+    else devices.g2!.options.onStatus?.({ state: action === 'g2-disconnected' ? 'disconnected' : action === 'g2-background' ? 'background' : 'error' });
+    await flush(); ready.resolve(true); await flush();
+    expect(stream.cancel).toHaveBeenCalledOnce();
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled(); expect(devices.phone!.start).not.toHaveBeenCalled();
+    expect(requests('/api/research')).toHaveLength(0);
+  });
+
+  it('ignores readiness from a canceled generation while a new G2 conversation is active', async () => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush();
+    const ready = deferred<boolean>();
+    click('conversation'); const old = devices.streaming!; old.start.mockReturnValueOnce(ready.promise); await flush();
+    click('cancel'); await flush(); click('conversation'); await flush();
+    const current = devices.streaming!;
+    expect(current).not.toBe(old); expect(devices.g2!.startAudio).toHaveBeenCalledOnce();
+    const stops = devices.g2!.stopAudio.mock.calls.length;
+    ready.resolve(true); await flush();
+    expect(devices.g2!.startAudio).toHaveBeenCalledOnce(); expect(devices.g2!.stopAudio).toHaveBeenCalledTimes(stops);
+    expect(current.cancel).not.toHaveBeenCalled();
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('G2 聞取中');
+  });
+
+  it.each(['false', 'throw'] as const)('closes the ready ASR connection if the G2 microphone fails with %s', async failure => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush();
+    if (failure === 'false') devices.g2!.startAudio.mockResolvedValueOnce(false);
+    else devices.g2!.startAudio.mockRejectedValueOnce(new Error('G2のマイクを開始できませんでした。'));
+    click('conversation'); await flush();
+    expect(devices.streaming!.start).toHaveBeenCalledOnce();
+    expect(devices.streaming!.cancel).toHaveBeenCalledOnce(); expect(devices.g2!.stopAudio).toHaveBeenCalledOnce();
+    expect(requests('/api/cancel')).toHaveLength(1);
+    expect(element('status').textContent).toContain('マイクを開始できません');
+    expect(element<HTMLButtonElement>('conversation').disabled).toBe(false);
   });
 
   it('keeps capture for ambiguous candidates and selects within the original conversation budget', async () => {

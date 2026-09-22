@@ -154,7 +154,7 @@ async function renderGlassesView() {
   if (voicePhase !== 'off') {
     const source = audioSource === 'g2' ? 'G2' : 'スマホ';
     const labels: Record<Exclude<VoicePhase, 'off'>, string> = {
-      connecting: `${source} 音声接続中`, listening: `${source} 聞取${running || audioBusy ? '・調査' : ''}中`,
+      connecting: `${source} 音声準備中・発話はお待ちください`, listening: `${source} 聞取${running || audioBusy ? '・調査' : ''}中`,
       paused: '音声一時停止・スマホで確認', stopped: '音声停止', error: voiceErrorLabel,
     };
     footer = labels[voicePhase];
@@ -181,9 +181,10 @@ function reportVoiceError(message: string) {
   voiceErrorLabel = /費用|予算/.test(message) ? '費用上限で停止・再開してください'
     : /認証|ログイン|期限/.test(message) ? '利用期限・QRを読み直してください'
     : /マイク|許可/.test(message) ? 'マイク未接続・G2接続を確認'
-    : /送信速度/.test(message) ? '音声の送信速度超過・再開してください'
-    : /遅れ|追いつ|サイズ|形式/.test(message) ? '音声送信が不安定・再開してください'
     : /準備|タイムアウト|時間内/.test(message) ? '音声の接続待ち切れ・再開してください'
+    : /送信速度/.test(message) ? '音声の送信速度超過・再開してください'
+    : /遅れ|追いつ|送信待ち/.test(message) ? '音声送信が不安定・再開してください'
+    : /サイズ|形式/.test(message) ? '音声データを確認・再開してください'
     : /受け付け/.test(message) ? '音声API受付エラー・再開してください'
     : /応答.*検証|応答.*確認/.test(message) ? '音声API応答エラー・再開してください'
     : /サービス|音声認識/.test(message) ? '音声API接続失敗・再開してください'
@@ -430,7 +431,8 @@ function g2Status(state: G2Status) {
   connected = state.state === 'connected' || state.state === 'recording';
   const labels: Record<string, string> = { idle: '画面プレビュー', connecting: 'G2へ接続中', connected: 'G2接続受付済み', recording: 'G2で録音中', background: 'バックグラウンド・停止', disconnected: 'G2切断', unavailable: 'Evenアプリ内で接続してください', error: 'G2接続を確認してください', disposed: 'G2接続終了' };
   $('device-status').textContent = `Even G2 · ${labels[state.state] || state.state}`; $('connection').textContent = connected ? 'G2接続受付済み' : 'スマートフォン表示'; $('device-dot').classList.toggle('on', connected);
-  if (recording && audioSource === 'g2' && state.state !== 'recording') { if (conversationRunning) void cancel(); else void stopRecording(state.state === 'connected'); }
+  const awaitingGlassesMicrophone = conversationRunning && voicePhase === 'connecting' && state.state === 'connected';
+  if (recording && audioSource === 'g2' && state.state !== 'recording' && !awaitingGlassesMicrophone) { if (conversationRunning) void cancel(); else void stopRecording(state.state === 'connected'); }
   if (['background', 'disconnected', 'error', 'disposed'].includes(state.state)) { currentId = crypto.randomUUID(); newViewToken(); clearResult(); }
 }
 function acceptAudio(chunk: Uint8Array) {
@@ -622,8 +624,9 @@ async function startConversation() {
   completedTranscript = ''; partialTranscripts.clear(); pendingTranscript = null; ignoredTranscriptItems.clear(); resettingConversation = false; conversationSubjectGeneration++;
   $('correction-hint').textContent = ''; $('correction-hint').classList.add('hidden');
   audioSource = $<HTMLSelectElement>('microphone').value === 'g2' ? 'g2' : 'phone'; currentId = crypto.randomUUID(); newViewToken(); clearResult();
+  const source = audioSource;
   setVoicePhase('connecting');
-  conversation = new StreamingAudio({
+  const stream = new StreamingAudio({
     onDelta: (itemId, delta) => {
       if (generation !== audioGeneration || !conversationRunning) return;
       if (resettingConversation) { if (ignoredTranscriptItems.size < 64) ignoredTranscriptItems.add(itemId); return; }
@@ -643,18 +646,29 @@ async function startConversation() {
     onError: error => { if (generation === audioGeneration) { void stopRecording(false); reportVoiceError(error.message); } },
     onClose: () => { if (generation === audioGeneration && conversationRunning) { void stopRecording(false); reportVoiceError('音声接続が終了しました。会話モードを再開してください。'); } },
   });
-  status('ストリーミング音声認識へ接続しています…'); refreshControls();
+  conversation = stream;
+  const valid = () => generation === audioGeneration && conversationRunning && recording && conversation === stream
+    && !!token && !document.hidden && !pageLeaving && $<HTMLInputElement>('consent').checked;
+  status('音声認識を準備しています。準備完了後に話してください。'); refreshControls();
   try {
     const setup = api('/api/conversation', json({})).then(response => response.json()); void setup.catch(() => {});
-    // Start the microphone within the user's tap for iPhone permission handling.
-    const microphone = audioSource === 'g2' ? g2.startAudio({ continuous: true }) : phone.start({ continuous: true });
+    // iPhone permission requires a tap-time phone start. Its preparation PCM is
+    // discarded by StreamingAudio; the G2 microphone waits for ASR readiness.
+    const microphone = source === 'phone' ? phone.start({ continuous: true }) : Promise.resolve(true);
     const [group, opened] = await Promise.all([setup, microphone]);
-    if (generation !== audioGeneration) return;
-    if (!opened || !recording || typeof group.conversationId !== 'string') throw new Error('マイクを開始できませんでした。接続と許可を確認してください。');
+    if (!valid()) return;
+    if (!opened || typeof group.conversationId !== 'string') throw new Error('マイクを開始できませんでした。接続と許可を確認してください。');
     conversationId = group.conversationId;
     const ticketResponse = await api('/api/conversation/stream', json({ conversationId }));
-    const ticket = await ticketResponse.json(); if (generation !== audioGeneration) return;
-    if (!await conversation!.start(ticket.ticket) || generation !== audioGeneration) return;
+    const ticket = await ticketResponse.json(); if (!valid()) return;
+    const ready = await stream.start(ticket.ticket); if (!valid()) return;
+    if (!ready) throw new Error('音声接続の準備を完了できませんでした。');
+    if (source === 'g2') {
+      status('音声認識の準備ができました。G2のマイクを開始しています…');
+      const microphoneReady = await g2.startAudio({ continuous: true });
+      if (!valid()) return;
+      if (!microphoneReady) throw new Error('G2のマイクを開始できませんでした。接続と許可を確認してください。');
+    }
     setVoicePhase('listening'); refreshControls();
     status('ストリーミング認識中です。話している途中から文字が表示され、人物名を見つけたら公開情報を調べます。');
     await sendView('会話モード', '音声をストリーミング認識中', '終了はスマートフォンから');
