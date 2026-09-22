@@ -185,6 +185,40 @@ function simulation(overrides: Record<string, unknown> = {}) {
 }
 
 describe('supervisor recovery orchestration without external calls', () => {
+  it('keeps a new healthy tunnel stable while its public hostname becomes resolvable, then leaves startup grace after first success', async () => {
+    let elapsed = 0; const restarts: number[] = [];
+    const run = simulation({ healthProbe: vi.fn().mockImplementation(async (url: string) => !url.startsWith('https://') || elapsed === 4 * 60_000) });
+    run.dependencies.log = vi.fn().mockImplementation(code => { if (code === 'TUNNEL_HEALTH_RESTART') restarts.push(elapsed); });
+    run.dependencies.sleep = async () => {
+      elapsed += 10_000; run.setTime(NOW + elapsed);
+      if (elapsed >= 7 * 60_000 + 10_000) run.controller.abort();
+    };
+    await supervise(run.config, run.dependencies);
+    expect(run.dependencies.publishEndpoint).toHaveBeenCalledTimes(1);
+    expect(run.dependencies.publishEndpoint.mock.calls[0]![0].now).toBe(NOW + 4 * 60_000);
+    expect(restarts).toEqual([7 * 60_000]);
+    expect(run.children.filter(child => child.kind === 'tunnel')).toHaveLength(1);
+  });
+
+  it('bounds initial public DNS grace to five minutes without delaying app-crash recovery or extending grace on app restart', async () => {
+    let elapsed = 0; const restarts: number[] = [];
+    const run = simulation({ healthProbe: vi.fn().mockImplementation(async (url: string) => !url.startsWith('https://')) });
+    run.dependencies.log = vi.fn().mockImplementation(code => { if (code === 'TUNNEL_HEALTH_RESTART') restarts.push(elapsed); });
+    run.dependencies.sleep = async () => {
+      elapsed += 10_000; run.setTime(NOW + elapsed);
+      if (elapsed === 3 * 60_000) run.children.find(child => child.kind === 'app')!.alive = false;
+      if (elapsed >= 7 * 60_000 + 10_000) run.controller.abort();
+    };
+    await supervise(run.config, run.dependencies);
+    const apps = run.children.filter(child => child.kind === 'app');
+    expect(apps).toHaveLength(2);
+    expect(apps[1]!.startedAt).toBe(NOW + 3 * 60_000 + 10_000);
+    // Failures at minute 5, 6 and 7 trigger restart, rather than a fresh grace
+    // period starting with the recovered app at minute 3.
+    expect(restarts).toEqual([7 * 60_000]);
+    expect(run.dependencies.publishEndpoint).not.toHaveBeenCalled();
+  });
+
   it('keeps children running while offline and restarts a broken tunnel only after connectivity returns', async () => {
     let checks = 0;
     const run = simulation({ healthProbe: vi.fn().mockImplementation(async (url: string) => !url.startsWith('https://') || ++checks === 1 || checks >= 6),

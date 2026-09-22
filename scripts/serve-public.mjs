@@ -15,6 +15,7 @@ export const PORTS = Object.freeze({ app: 4173, metrics: 20243, supervisor: 2024
 const BRANCH = 'live-endpoint';
 const FILE = 'endpoint.json';
 const HEALTH_MS = 60_000;
+const PUBLIC_ORIGIN_GRACE_MS = 5 * 60_000;
 const REFRESH_MS = 12 * 60 * 60_000;
 const ORIGIN = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com$/;
 
@@ -210,6 +211,7 @@ export async function supervise(config, dependencies = {}) {
   let tunnel; let app; let candidate; let origin; let tunnelText = ''; let generation = 0; let nextBootstrapProbe = 0;
   let tunnelFailures = 0; let appFailures = 0; let nextTunnel = 0; let nextApp = 0;
   let failures = 0; let nextHealth = 0; let publishedOrigin; let publishedAt = 0;
+  let originStartedAt = 0; let publicConfirmed = false;
   const stopTunnel = async () => { const owned = tunnel; generation++; tunnel = undefined; candidate = undefined; tunnelText = ''; await stop(owned); };
   const stopApp = async () => { const owned = app; app = undefined; await stop(owned); };
   try {
@@ -232,6 +234,7 @@ export async function supervise(config, dependencies = {}) {
       if (candidate && candidate !== origin) {
         await stopApp(); await updateEnv(join(config.cwd, '.env.local'), candidate);
         origin = candidate; nextApp = 0; failures = 0; nextHealth = 0;
+        originStartedAt = clock(); publicConfirmed = false;
       }
       if (origin && !app && now >= nextApp) {
         await portFree(PORTS.app);
@@ -240,15 +243,22 @@ export async function supervise(config, dependencies = {}) {
       }
       now = clock();
       if (app?.alive && tunnel?.alive && origin === candidate && now >= nextHealth) {
-        const inGrace = now - Math.max(app.startedAt, tunnel.startedAt) < 30_000;
+        const childInGrace = now - Math.max(app.startedAt, tunnel.startedAt) < 30_000;
         const [localHealthy, tunnelHealthy, publicHealthy] = await Promise.all([
           probe('http://127.0.0.1:4173/api/status', { statusJson: true, signal }),
           probe('http://127.0.0.1:20243/ready', { signal }),
           probe(`${origin}/api/status`, { statusJson: true, signal }),
         ]);
         signal.throwIfAborted();
+        if (publicHealthy) publicConfirmed = true;
+        // macOS may retain an initial negative DNS answer for a newly generated
+        // hostname even after Cloudflare is ready. Do not keep replacing it.
+        // This fixed origin deadline is never extended by an app-only restart.
+        const publicInGrace = localHealthy && tunnelHealthy && !publicConfirmed &&
+          clock() - originStartedAt < PUBLIC_ORIGIN_GRACE_MS;
+        const inGrace = childInGrace || publicInGrace;
         const healthy = localHealthy && tunnelHealthy && publicHealthy;
-        failures = healthy ? 0 : inGrace ? failures : failures + 1;
+        failures = healthy || inGrace ? 0 : failures + 1;
         const connected = !healthy && failures >= 3 && localHealthy ? await online({ signal }) : false;
         const action = recoveryAction({ localHealthy, tunnelHealthy, publicHealthy, failures, online: connected, inGrace });
         nextHealth = clock() + (inGrace && !healthy ? 3000 : HEALTH_MS);
