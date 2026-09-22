@@ -292,6 +292,21 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(lastView().footer).not.toContain('こんにちは');
   });
 
+  it.each([
+    ['費用上限に達しました。', '費用上限で停止'],
+    ['音声認識サービスへ接続できませんでした。', '音声API接続失敗'],
+  ])('shows the actual audio error category on glasses and permits restart: %s', async (message, label) => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    devices.streaming!.options.onError(new Error(message)); await flush();
+    const lastView = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(lastView.footer).toContain(label);
+    expect(element('status').textContent).toBe(message);
+    expect(element('conversation').textContent).toBe('会話モードを再開');
+    expect(element<HTMLButtonElement>('conversation').disabled).toBe(false);
+    click('conversation'); await flush();
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('G2 聞取中');
+  });
+
   it('pauses capture for ambiguous candidates and selects within the original conversation budget', async () => {
     routes.set('/api/research', async init => {
       const input = JSON.parse(String(init.body)) as ResearchInput;

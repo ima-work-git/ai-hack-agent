@@ -4,7 +4,7 @@ import {
 } from '../src/shared/contracts.ts';
 import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, Target, TraceEvent } from '../src/shared/contracts.ts';
 import { extractExplicitXHandles } from '../src/shared/x-account.ts';
-import { evidenceMatchesTarget, normalizeIdentity, verifiedAliasForInputTarget } from '../src/shared/identity-aliases.ts';
+import { evidenceMatchesTarget, normalizeIdentity, verifiedAliasForInputTarget, verifiedAliasForTarget } from '../src/shared/identity-aliases.ts';
 import type { ProviderResult, ResearchProvider } from './provider-contract.ts';
 import { ProviderError } from './provider-contract.ts';
 import { BudgetError, BudgetLedger } from './budget.ts';
@@ -151,6 +151,14 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     let hits;
     try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.search(queryForTarget(query, initialSearch), signal))); }
     catch (error) { if (fatal(error)) throw error; hadFailure = true; emit('recovery', '検索を取得できませんでした。別の検索か検証済みの情報へ縮退します。'); return; }
+    const knownPublicPerson = !initialSearch && target && !target.companyName ? verifiedAliasForTarget(target) : undefined;
+    if (knownPublicPerson?.scope === 'public-person') {
+      // These are known public identity locations, not cached factual evidence.
+      // Fetch their real text within the same page allowance, then apply all
+      // normal identity, attribution and exact-quotation guards.
+      const primary = knownPublicPerson.sourceUrls.slice(0, 2).map(url => ({ url, title: '公開プロフィールの取得候補' }));
+      hits = [...primary, ...hits.filter(hit => !primary.some(candidate => candidate.url === hit.url))].slice(0, 10);
+    }
     for (const hit of hits) {
       if (counts.page >= pageCeiling) break;
       if (!sourceUrlIsPublicShape(hit.url) || attemptedSourceUrls.has(hit.url) || sources.some(s => s.url === hit.url)) continue;
@@ -241,12 +249,24 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
         hadFailure ? '情報源を取得できず、根拠を確認できませんでした。入力または接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
     }
     let assessment = await assess();
-    if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '所属や候補に曖昧さがあります。確認後に調査を再開してください。');
-    if (assessment.followUpQuery && counts.search < 2 && counts.llm < 3 && cards.length < 4) {
-      emit('replan', '根拠を補うため、追加の公開活動を自律的に調べます。');
-      await gather(assessment.followUpQuery, false);
-      assessment = await assess();
-      if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '追加資料で対象に曖昧さが見つかりました。候補を確認してください。');
+    const accepted = applyAssessment(assessment);
+    // X may lack primary identity evidence or useful facts. A candidate
+    // ambiguity still stops immediately; use only the existing Web allowance.
+    const needsPublicWeb = !target.companyName && assessment.candidates.length === 0 &&
+      ((!accepted && (!assessment.identityVerified || !assessment.publicPersonVerified || !assessment.publicIdentitySourceIds?.length)) ||
+        (accepted && publicIdentityVerified && cards.length < 4)) &&
+      sources.every(source => source.kind === 'x') && counts.search < limits.search && counts.llm < limits.llm && counts.page < limits.page;
+    if (!accepted && !needsPublicWeb) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '所属や候補に曖昧さがあります。確認後に調査を再開してください。');
+    if ((needsPublicWeb || assessment.followUpQuery) && counts.search < limits.search && counts.llm < limits.llm && cards.length < 4) {
+      emit('replan', needsPublicWeb ? 'Xの資料を補うため、公式Webプロフィールで本人性と話題の根拠を追加で確認します。' : '根拠を補うため、追加の公開活動を自律的に調べます。');
+      const priorSources = sources.length;
+      await gather(assessment.followUpQuery || '公式 プロフィール', false);
+      if (needsPublicWeb && sources.length === priorSources) {
+        if (!accepted) return finish('awaiting_confirmation', 'PUBLIC_IDENTITY_CONFIRMATION_REQUIRED', '公式プロフィールの根拠を追加取得できませんでした。活動名や公式URLなどの手掛かりを確認してください。');
+      } else {
+        assessment = await assess();
+        if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '追加資料で対象に曖昧さが見つかりました。候補を確認してください。');
+      }
     }
     if (!target.companyName && !publicIdentityVerified) return finish('awaiting_confirmation', 'PUBLIC_IDENTITY_CONFIRMATION_REQUIRED', '公開プロフィールだけでは対象を一人に絞れませんでした。活動名、所属や公式URLなどの手掛かりを確認してください。');
     if (cards.length) return finish(hadFailure ? 'partial' : 'ready', hadFailure ? 'PARTIAL_SOURCES_UNAVAILABLE' : 'EVIDENCE_VERIFIED', hadFailure ? '取得できなかった資料があります。確認できた根拠だけを表示します。' : '本文と対象を照合した話題カードを表示します。');

@@ -17,6 +17,18 @@ const liveEnv = (): NodeJS.ProcessEnv => ({
 });
 
 describe('live configuration gates (REQ-007, REQ-008, REQ-009)', () => {
+  it('defaults to normal limits and accepts only an explicit bounded suspension with timezones', () => {
+    const env = { ...liveEnv(), BUDGET_LIMITS_SUSPEND_FROM: '2026-09-22T00:00:00+09:00', BUDGET_LIMITS_SUSPEND_UNTIL: '2026-09-24T00:00:00+09:00' };
+    expect(readConfig(liveEnv()).budget.limitSuspension).toBeUndefined();
+    expect(readConfig(env).budget.limitSuspension).toEqual({ startsAt: Date.parse('2026-09-21T15:00:00Z'), endsAt: Date.parse('2026-09-23T15:00:00Z') });
+    expect(readConfig({ ...env, MAX_LLM_CALL_USD: '' }).status.liveEnabled).toBe(false);
+    expect(readConfig({ ...env, RUN_BUDGET_USD: '' }).status.liveEnabled).toBe(false);
+    for (const BUDGET_LIMITS_SUSPEND_UNTIL of ['', 'invalid', '2026-09-24T00:00:00', env.BUDGET_LIMITS_SUSPEND_FROM, '2026-09-24T00:00:01+09:00']) {
+      expect(() => readConfig({ ...env, BUDGET_LIMITS_SUSPEND_UNTIL })).toThrow(/Budget suspension/);
+    }
+    expect(() => readConfig({ ...env, BUDGET_LIMITS_SUSPEND_FROM: '' })).toThrow(/Budget suspension/);
+  });
+
   it('enables streaming ASR only with a separate server key and explicit per-minute reservation', () => {
     const env = { ...liveEnv(), OPENAI_API_KEY: 'fixture-openai-key', STREAMING_ASR_MAX_USD_PER_MINUTE: '0.04' };
     expect(readConfig(env).status.streamingEnabled).toBe(true);

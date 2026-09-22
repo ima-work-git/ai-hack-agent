@@ -1,5 +1,6 @@
 import type { ProviderConfig } from './provider-contract.ts';
 import type { RuntimeStatus } from '../src/shared/contracts.ts';
+import { z } from 'zod';
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   const host = env.HOST || '127.0.0.1';
@@ -24,11 +25,24 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     if (!Number.isFinite(value) || (zeroAllowed ? value < 0 : value <= 0)) { missing.push(label); return 0; }
     return value;
   };
+  const suspensionFrom = env.BUDGET_LIMITS_SUSPEND_FROM || '';
+  const suspensionUntil = env.BUDGET_LIMITS_SUSPEND_UNTIL || '';
+  let limitSuspension: { startsAt: number; endsAt: number } | undefined;
+  if (suspensionFrom || suspensionUntil) {
+    const timestamp = z.iso.datetime({ offset: true });
+    const startsAt = Date.parse(suspensionFrom); const endsAt = Date.parse(suspensionUntil);
+    if (!timestamp.safeParse(suspensionFrom).success || !timestamp.safeParse(suspensionUntil).success ||
+        !Number.isSafeInteger(startsAt) || !Number.isSafeInteger(endsAt) || endsAt <= startsAt || endsAt - startsAt > 48 * 60 * 60_000) {
+      throw new Error('Budget suspension requires explicit ISO timestamps with timezone and a positive window of at most 48 hours');
+    }
+    limitSuspension = { startsAt, endsAt };
+  }
   const budget = {
     directory: env.PRIVATE_DIR || '.private', currency: 'USD' as const,
     runLimitUsd: amount('RUN_BUDGET_USD', '1回の調査の費用上限'),
     dayLimitUsd: amount('DAY_BUDGET_USD', '1日の費用上限'),
     eventLimitUsd: amount('EVENT_BUDGET_USD', 'イベント全体の費用上限'),
+    limitSuspension,
   };
   const maximumCosts = {
     llm: amount('MAX_LLM_CALL_USD', 'LLMの1呼出あたり最大見積額'),

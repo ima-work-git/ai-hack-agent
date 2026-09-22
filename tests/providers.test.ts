@@ -203,6 +203,21 @@ describe('bounded OrcaRouter adapter', () => {
       .rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
   });
 
+  it('instructs intentional name-only assessment to evaluate a retrieved official X profile without demanding a company', async () => {
+    const api = mockFetch(completion({ ...assessment, identityVerified: false, publicPersonVerified: false, publicIdentitySourceIds: [] }));
+    const profile: EvidenceSource = { sourceId: 'x-primary', url: 'https://x.com/hirox246', title: '架空の評価用プロフィール',
+      text: '公開プロフィール: ひろゆき (@hirox246)\nこれは公開活動を示さない名前だけの架空テスト資料です。', retrievedAt: '2026-09-22T00:00:00Z', kind: 'x' };
+    const result = await createLiveProvider(config, { fetch: api }).assess({ personName: '西村博之', companyName: '' }, [profile], signal());
+    const payload = JSON.parse(String(api.mock.calls[0]![1]!.body));
+    const instructions = payload.messages[0].content as string;
+    expect(instructions).toContain('intentional name-only PUBLIC PERSON research');
+    expect(instructions).toContain('absence of a company is NOT a reason');
+    expect(instructions).toContain('ACTUALLY RETRIEVED self-published profile can qualify');
+    expect(instructions).toContain('must still substantiate public activity');
+    expect(result.value).toMatchObject({ identityVerified: false, publicPersonVerified: false, cards: [] });
+    expect(api).toHaveBeenCalledOnce();
+  });
+
   it('keeps supplied evidence separate from instructions and caps model input', async () => {
     const api = mockFetch(completion(assessment));
     const source: EvidenceSource = { sourceId: 's1', url: 'https://company.example.org/team', title: 'Team',
@@ -217,6 +232,18 @@ describe('bounded OrcaRouter adapter', () => {
     expect(payload.messages[0].content).toContain('EXACT CONTIGUOUS substring');
     expect(payload.messages[0].content).toContain('at most 1000 characters');
     expect(payload.messages[0].content).toContain('Do not equate aliases or translations');
+  });
+
+  it('omits X name headers, URL-only items and acknowledgements while keeping a short professional fact', async () => {
+    const raw = '公開プロフィール: 山田花子 (@fixture_user)\n株式会社灯 | 作家 | https://example.org/profile | たしかに。\n公開投稿: たしかに。';
+    const evidence: EvidenceSource = { sourceId: 'x-profile', url: 'https://x.com/fixture_user', title: 'Profile', text: raw, kind: 'x', retrievedAt: '2026-09-22T00:00:00Z' };
+    const api = mockFetch(completion(assessment));
+    await createLiveProvider(config, { fetch: api }).assess(target, [evidence], signal());
+    const data = JSON.parse(JSON.parse(String(api.mock.calls[0]![1]!.body)).messages[1].content);
+    const facts = data.sources[0].excerpts.flatMap((excerpt: { facts: { text: string }[] }) => excerpt.facts.map(fact => fact.text));
+    expect(facts).toContain('作家');
+    expect(facts.some((fact: string) => fact.startsWith('公開プロフィール:') || fact.includes('https://') || fact.includes('たしかに'))).toBe(false);
+    expect(facts.every((fact: string) => raw.includes(fact))).toBe(true);
   });
 
   it('offers complete pipe-delimited X profile items without including the whole bio or slicing long items', async () => {

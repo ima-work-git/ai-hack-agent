@@ -34,5 +34,5 @@ const server = createServer(async (req, res) => {
 server.on('upgrade', (req, socket, head) => { if (!api.upgrade(req, socket, head) && production) socket.destroy(); });
 server.requestTimeout = 30_000;
 server.headersTimeout = 10_000;
-server.listen(config.port, config.host, () => console.info(`会話アシスタント: ${config.origin} (${config.status.liveEnabled ? '実API利用可能' : '体験デモ'})`));
+server.listen(config.port, config.host, () => console.info(`これで誰でも雑談マスター: ${config.origin} (${config.status.liveEnabled ? '実API利用可能' : '体験デモ'})`));
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { api.close(); void vite?.close(); server.close(() => process.exit(0)); });

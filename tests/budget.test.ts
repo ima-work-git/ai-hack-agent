@@ -55,6 +55,36 @@ describe('persistent spending limits', () => {
     await writeFile(join(settings.directory, 'budget.json'), '{broken');
     await expect(new BudgetLedger(settings).reserve(randomUUID(), 0.1)).rejects.toThrow('BUDGET_LEDGER_INVALID');
   });
+  it('suspends only amount stops inside the fixed window while retaining accounting across restarts', async () => {
+    const startsAt = Date.parse('2026-09-22T00:00:00+09:00');
+    const endsAt = Date.parse('2026-09-24T00:00:00+09:00');
+    let clock = startsAt - 1;
+    const settings = { ...await config(), now: () => clock, limitSuspension: { startsAt, endsAt } };
+    const run = randomUUID(); const ledger = new BudgetLedger(settings);
+    await expect(ledger.reserve(run, 3)).rejects.toThrow('BUDGET_EXHAUSTED');
+    clock = startsAt;
+    const held = await ledger.reserve(run, 3); await ledger.settle(held, null);
+    const restarted = new BudgetLedger(settings);
+    expect(await restarted.snapshot(run)).toMatchObject({ costKnown: false, reservedUsd: 3, dayUsedUsd: 3, eventUsedUsd: 3 });
+    await expect(restarted.reserve(run, NaN)).rejects.toThrow('INVALID_COST');
+    await expect(restarted.reserve('not-a-run', 0.1)).rejects.toThrow('INVALID_BUDGET_RUN_ID');
+    clock = endsAt - 1;
+    const last = await restarted.reserve(run, 4); await restarted.settle(last, 2);
+    clock = endsAt;
+    expect(await restarted.snapshot(run)).toMatchObject({ costKnown: false, actualUsd: 2, reservedUsd: 3, eventUsedUsd: 5 });
+    await expect(restarted.reserve(run, 0.1)).rejects.toThrow('BUDGET_EXHAUSTED');
+    await expect(new BudgetLedger(settings).reserve(randomUUID(), 0.1)).rejects.toThrow('BUDGET_EXHAUSTED');
+    await restarted.settle(held, 1);
+    expect(await restarted.snapshot(run)).toMatchObject({ costKnown: true, actualUsd: 3, reservedUsd: 0, eventUsedUsd: 3 });
+  });
+  it('rejects invalid suspension windows and still fails closed on a corrupt ledger during suspension', async () => {
+    const settings = await config(); const startsAt = Date.parse('2026-09-22T00:00:00Z');
+    for (const endsAt of [NaN, Infinity, startsAt, startsAt - 1, startsAt + 48 * 60 * 60_000 + 1]) {
+      expect(() => new BudgetLedger({ ...settings, limitSuspension: { startsAt, endsAt } })).toThrow('INVALID_BUDGET_SUSPENSION');
+    }
+    await writeFile(join(settings.directory, 'budget.json'), '{broken');
+    await expect(new BudgetLedger({ ...settings, now: () => startsAt, limitSuspension: { startsAt, endsAt: startsAt + 1000 } }).reserve(randomUUID(), 3)).rejects.toThrow('BUDGET_LEDGER_INVALID');
+  });
   it('stores only opaque accounting IDs and amount totals', async () => {
     const settings = await config();
     await new BudgetLedger(settings).reserve(randomUUID(), 0);

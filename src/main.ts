@@ -73,6 +73,7 @@ let g2: G2Runtime;
 type VoicePhase = 'off' | 'connecting' | 'listening' | 'paused' | 'stopped' | 'error';
 let voicePhase: VoicePhase = 'off';
 let voicePreview = '';
+let voiceErrorLabel = '音声接続エラー・再開してください';
 let voiceDisplayTimer: ReturnType<typeof setTimeout> | undefined;
 const emptyGlassesView = (): GlassesView => ({ header: 'これで誰でも雑談マスター', content: '会話を待っています', footer: 'マイクは停止中' });
 let glassesView = emptyGlassesView();
@@ -86,6 +87,7 @@ function refreshControls() {
   $('scenario').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
   $('record').toggleAttribute('disabled', !recording && (microphoneConnecting || audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked));
   $('conversation').toggleAttribute('disabled', microphoneConnecting || recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked);
+  $('conversation').textContent = voicePhase === 'error' ? '会話モードを再開' : '会話モードを開始';
   $('record').textContent = recording ? conversationRunning ? '会話モードを終了' : '録音を止めて調べる' : '音声で入力';
   if (voicePhase !== 'off') queueVoiceDisplay();
 }
@@ -129,7 +131,7 @@ async function renderGlassesView() {
     const source = audioSource === 'g2' ? 'G2' : 'スマホ';
     const labels: Record<Exclude<VoicePhase, 'off'>, string> = {
       connecting: `${source} 音声接続中`, listening: `${source} 聞取${running || audioBusy ? '・調査' : ''}中`,
-      paused: '音声一時停止・スマホで確認', stopped: '音声停止', error: '音声エラー・スマホで再開',
+      paused: '音声一時停止・スマホで確認', stopped: '音声停止', error: voiceErrorLabel,
     };
     footer = labels[voicePhase];
     if (voicePhase === 'listening') {
@@ -150,6 +152,19 @@ function setVoicePhase(phase: VoicePhase) {
   voicePhase = phase;
   if (phase !== 'listening') voicePreview = '';
   queueVoiceDisplay(true);
+}
+function reportVoiceError(message: string) {
+  voiceErrorLabel = /費用|予算/.test(message) ? '費用上限で停止・再開してください'
+    : /認証|ログイン|期限/.test(message) ? '利用期限・QRを読み直してください'
+    : /マイク|許可/.test(message) ? 'マイク未接続・G2接続を確認'
+    : /送信速度/.test(message) ? '音声の送信速度超過・再開してください'
+    : /遅れ|追いつ|サイズ|形式/.test(message) ? '音声送信が不安定・再開してください'
+    : /準備|タイムアウト|時間内/.test(message) ? '音声の接続待ち切れ・再開してください'
+    : /受け付け/.test(message) ? '音声API受付エラー・再開してください'
+    : /応答.*検証|応答.*確認/.test(message) ? '音声API応答エラー・再開してください'
+    : /サービス|音声認識/.test(message) ? '音声API接続失敗・再開してください'
+    : '音声接続切れ・再開してください';
+  setVoicePhase('error'); status(message, true); refreshControls();
 }
 function renderCard() {
   const cards = result?.cards.filter(c => Date.parse(c.expiresAt) > Date.now()).slice(0, 4) || [];
@@ -397,7 +412,7 @@ async function drainTranscripts(generation: number) {
       await processConversationTranscript(next.text, generation);
     }
   } catch (error) {
-    if (generation === audioGeneration && conversationRunning) { await stopRecording(false); setVoicePhase('error'); status(error instanceof Error ? error.message : '会話の調査を続けられませんでした。', true); }
+    if (generation === audioGeneration && conversationRunning) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話の調査を続けられませんでした。'); }
   } finally { identifyingTranscript = false; if (pendingTranscript && conversationRunning) void drainTranscripts(audioGeneration); }
 }
 async function startConversation() {
@@ -423,8 +438,8 @@ async function startConversation() {
       $<HTMLTextAreaElement>('text').value = completedTranscript;
       pendingTranscript = { itemId, text: text.slice(0, 2000) }; void drainTranscripts(generation);
     },
-    onError: error => { if (generation === audioGeneration) { void stopRecording(false); setVoicePhase('error'); status(error.message, true); } },
-    onClose: () => { if (generation === audioGeneration && conversationRunning) { void stopRecording(false); setVoicePhase('error'); status('音声接続が終了しました。会話モードを再開してください。'); } },
+    onError: error => { if (generation === audioGeneration) { void stopRecording(false); reportVoiceError(error.message); } },
+    onClose: () => { if (generation === audioGeneration && conversationRunning) { void stopRecording(false); reportVoiceError('音声接続が終了しました。会話モードを再開してください。'); } },
   });
   status('ストリーミング音声認識へ接続しています…'); refreshControls();
   try {
@@ -441,7 +456,7 @@ async function startConversation() {
     setVoicePhase('listening');
     status('ストリーミング認識中です。話している途中から文字が表示され、人物名を見つけたら公開情報を調べます。');
     await sendView('会話モード', '音声をストリーミング認識中', '終了はスマートフォンから');
-  } catch (error) { if (generation === audioGeneration) { await stopRecording(false); setVoicePhase('error'); status(error instanceof Error ? error.message : '会話モードを開始できませんでした。', true); } }
+  } catch (error) { if (generation === audioGeneration) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話モードを開始できませんでした。'); } }
 }
 async function startRecording() {
   if (!runtimeStatus.sttEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || audioBusy || microphoneConnecting) return;
