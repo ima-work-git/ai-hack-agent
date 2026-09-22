@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import {
-  AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, ResearchInputSchema, ResearchResultSchema, SearchHitSchema,
+  AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, ResearchInputSchema, ResearchResultSchema, SearchHitSchema, validatedCardDisplay,
 } from '../src/shared/contracts.ts';
 import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, Target, TraceEvent } from '../src/shared/contracts.ts';
 import { extractExplicitXHandles } from '../src/shared/x-account.ts';
+import { isAllowedConversationTopic } from '../src/shared/topic-policy.ts';
+import { evidenceMatchesTarget, normalizeIdentity, verifiedAliasForInputTarget, verifiedAliasForTarget } from '../src/shared/identity-aliases.ts';
 import type { ProviderResult, ResearchProvider } from './provider-contract.ts';
 import { ProviderError } from './provider-contract.ts';
 import { BudgetError, BudgetLedger } from './budget.ts';
@@ -24,7 +26,7 @@ class StopError extends Error {
 }
 const normalize = (s: string) => s.normalize('NFKC').replace(/\s+/g, '').toLocaleLowerCase('ja');
 const contains = (text: string, part: string) => !!normalize(part) && normalize(text).includes(normalize(part));
-const matches = (text: string, target: Target) => contains(text, target.personName) && contains(text, target.companyName);
+const matches = evidenceMatchesTarget;
 const sourceUrlIsPublicShape = (url: string) => {
   try { const u = new URL(url); return ['https:', 'http:'].includes(u.protocol) && !u.username && !u.password; } catch { return false; }
 };
@@ -43,6 +45,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
   let target: Target | null = null;
   let candidates: Candidate[] = [];
   let hadFailure = false;
+  let publicIdentityVerified = false;
   let counts = { llm: 0, search: 0, page: 0 };
   let observedCost = 0;
   let reservedCost = 0;
@@ -136,7 +139,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     // Model-selected topics stay inside the research purpose; source text cannot become an exfiltration query.
     const allowedTopics = ['公式', 'プロフィール', '事業', '登壇', '公開活動', 'インタビュー', '趣味', '経歴', 'official', 'profile', 'business', 'conference'];
     const topics = allowedTopics.filter(topic => query.toLowerCase().includes(topic)).slice(0, 3);
-    const subject = `${target.personName} ${target.companyName}`.replaceAll('@', '');
+    const subject = `${target.personName} ${target.companyName}`.replaceAll('@', '').trim();
     // Only the first search carries the user-specified account. Follow-up terms
     // cannot force another timeline call instead of the requested web research.
     return `${subject} ${topics.length ? topics.join(' ') : '公式 プロフィール'}${preferExplicitAccount && handles.length === 1 ? ` @${handles[0]}` : ''}`;
@@ -145,10 +148,18 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     // Keep at least two of the four total attempts available for follow-up web
     // evidence, even when the initial timeline/search returns many candidates.
     const pageCeiling = initialSearch ? Math.min(limits.page, counts.page + 2) : limits.page;
-    emit('search', '対象の氏名と会社名に絞って公開情報を検索します。');
+    emit('search', target?.companyName ? '対象の氏名と会社名に絞って公開情報を検索します。' : '氏名から公式プロフィールと公開活動の根拠を検索します。');
     let hits;
     try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.search(queryForTarget(query, initialSearch), signal))); }
     catch (error) { if (fatal(error)) throw error; hadFailure = true; emit('recovery', '検索を取得できませんでした。別の検索か検証済みの情報へ縮退します。'); return; }
+    const knownPublicPerson = !initialSearch && target && !target.companyName ? verifiedAliasForTarget(target) : undefined;
+    if (knownPublicPerson?.scope === 'public-person') {
+      // These are known public identity locations, not cached factual evidence.
+      // Fetch their real text within the same page allowance, then apply all
+      // normal identity, attribution and exact-quotation guards.
+      const primary = knownPublicPerson.sourceUrls.slice(0, 2).map(url => ({ url, title: '公開プロフィールの取得候補' }));
+      hits = [...primary, ...hits.filter(hit => !primary.some(candidate => candidate.url === hit.url))].slice(0, 10);
+    }
     for (const hit of hits) {
       if (counts.page >= pageCeiling) break;
       if (!sourceUrlIsPublicShape(hit.url) || attemptedSourceUrls.has(hit.url) || sources.some(s => s.url === hit.url)) continue;
@@ -176,19 +187,30 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     if (assessment.needsConfirmation) {
       candidates = assessment.candidates.filter(candidate => candidate.sourceIds.length > 0 && candidate.sourceIds.every(id => {
         const source = sources.find(s => s.sourceId === id);
-        return source && matches(source.text, candidate);
+        return source && matches(source.text, candidate, source.url);
       }));
       cards = []; // No personal facts are shown while identity remains ambiguous.
       return false;
     }
-    if (!assessment.identityVerified || !target) { cards = []; emit('discard', '対象を特定できる根拠が足りないため、人物の事実を採用しません。'); return true; }
+    publicIdentityVerified = Boolean(target && !target.companyName && assessment.identityVerified && assessment.publicPersonVerified &&
+      assessment.publicIdentitySourceIds?.length && assessment.publicIdentitySourceIds.every(id => {
+        const source = sources.find(item => item.sourceId === id);
+        return source && sourceUrlIsPublicShape(source.url) && matches(source.text, target!, source.url);
+      }));
+    if (!assessment.identityVerified || !target || !target.companyName && !publicIdentityVerified) {
+      cards = []; emit('discard', '本人性と公開活動を確認できる根拠が足りないため、人物の事実を採用しません。'); return true;
+    }
     for (const proposal of assessment.cards) {
+      if (!isAllowedConversationTopic(proposal.fact, proposal.suggestedQuestion, proposal.displayQuestion)) {
+        emit('discard', '健康や私生活に関わる話題を含むため、カード全体を除外しました。'); continue;
+      }
       const source = sources.find(s => s.sourceId === proposal.sourceId);
-      if (!source || !contains(source.text, proposal.excerpt) || !matches(proposal.excerpt, target) || !contains(proposal.excerpt, proposal.fact)) {
+      if (!source || !contains(source.text, proposal.excerpt) || !matches(proposal.excerpt, target, source.url) || !contains(proposal.excerpt, proposal.fact)) {
         emit('discard', '出典、対象名・所属、本文引用の検査に通らないカードを棄却しました。'); continue;
       }
-      if (cards.some(c => normalize(c.fact) === normalize(proposal.fact)) || cards.length >= 3) continue;
-      cards.push({ ...proposal, cardId: randomUUID(), expiresAt: new Date(now() + 300_000).toISOString(), requestId: input.requestId, subjectRevision: input.subjectRevision });
+      if (cards.some(c => normalize(c.fact) === normalize(proposal.fact)) || cards.length >= 4) continue;
+      const { displayFact, displayQuestion, ...verifiedProposal } = proposal;
+      cards.push({ ...verifiedProposal, ...validatedCardDisplay(proposal.fact, proposal.excerpt, displayFact, displayQuestion), cardId: randomUUID(), expiresAt: new Date(now() + 300_000).toISOString(), requestId: input.requestId, subjectRevision: input.subjectRevision });
     }
     emit('verify', `${cards.length}件のカードが本文引用と対象照合の検査を通りました。`);
     return true;
@@ -207,11 +229,16 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     const plan = PlanDecisionSchema.parse(await call('llm', signal => provider.plan(input, signal)));
     target = plan.target;
     candidates = plan.candidates;
-    if (options.confirmedTarget && (!target || normalize(target.personName) !== normalize(options.confirmedTarget.personName) || normalize(target.companyName) !== normalize(options.confirmedTarget.companyName))) {
+    if (options.confirmedTarget && (!target || normalizeIdentity(target.personName) !== normalizeIdentity(options.confirmedTarget.personName) || normalizeIdentity(target.companyName) !== normalizeIdentity(options.confirmedTarget.companyName))) {
       target = options.confirmedTarget;
       return finish('awaiting_confirmation', 'SELECTED_TARGET_MISMATCH', '選択した対象と抽出結果が一致しませんでした。名前と会社を確認してください。');
     }
     if (plan.needsConfirmation || !target) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '対象を絞るため、氏名・会社名または候補を確認してください。');
+    const verifiedAlias = verifiedAliasForInputTarget(input.text, target);
+    if (verifiedAlias) {
+      if (handles.length && handles[0] !== verifiedAlias.xHandle) return finish('awaiting_confirmation', 'ACCOUNT_IDENTITY_CONFLICT', '入力されたアカウントと確認済みの人物情報が一致しません。対象を確認してください。');
+      if (!handles.length) handles.push(verifiedAlias.xHandle);
+    }
     if (input.selectedCandidateId) emit('human_confirmation', '利用者が選んだ候補で調査を再開します。');
     await gather(plan.query, true);
     if (!sources.length && counts.search < limits.search) {
@@ -226,13 +253,26 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
         hadFailure ? '情報源を取得できず、根拠を確認できませんでした。入力または接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
     }
     let assessment = await assess();
-    if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '所属や候補に曖昧さがあります。確認後に調査を再開してください。');
-    if (assessment.followUpQuery && counts.search < 2 && counts.llm < 3 && cards.length < 3) {
-      emit('replan', '根拠を補うため、追加の公開活動を自律的に調べます。');
-      await gather(assessment.followUpQuery, false);
-      assessment = await assess();
-      if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '追加資料で対象に曖昧さが見つかりました。候補を確認してください。');
+    const accepted = applyAssessment(assessment);
+    // X may lack primary identity evidence or useful facts. A candidate
+    // ambiguity still stops immediately; use only the existing Web allowance.
+    const needsPublicWeb = !target.companyName && assessment.candidates.length === 0 &&
+      ((!accepted && (!assessment.identityVerified || !assessment.publicPersonVerified || !assessment.publicIdentitySourceIds?.length)) ||
+        (accepted && publicIdentityVerified && cards.length < 4)) &&
+      sources.every(source => source.kind === 'x') && counts.search < limits.search && counts.llm < limits.llm && counts.page < limits.page;
+    if (!accepted && !needsPublicWeb) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '所属や候補に曖昧さがあります。確認後に調査を再開してください。');
+    if ((needsPublicWeb || assessment.followUpQuery) && counts.search < limits.search && counts.llm < limits.llm && cards.length < 4) {
+      emit('replan', needsPublicWeb ? 'Xの資料を補うため、公式Webプロフィールで本人性と話題の根拠を追加で確認します。' : '根拠を補うため、追加の公開活動を自律的に調べます。');
+      const priorSources = sources.length;
+      await gather(assessment.followUpQuery || '公式 プロフィール', false);
+      if (needsPublicWeb && sources.length === priorSources) {
+        if (!accepted) return finish('awaiting_confirmation', 'PUBLIC_IDENTITY_CONFIRMATION_REQUIRED', '公式プロフィールの根拠を追加取得できませんでした。活動名や公式URLなどの手掛かりを確認してください。');
+      } else {
+        assessment = await assess();
+        if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '追加資料で対象に曖昧さが見つかりました。候補を確認してください。');
+      }
     }
+    if (!target.companyName && !publicIdentityVerified) return finish('awaiting_confirmation', 'PUBLIC_IDENTITY_CONFIRMATION_REQUIRED', '公開プロフィールだけでは対象を一人に絞れませんでした。活動名、所属や公式URLなどの手掛かりを確認してください。');
     if (cards.length) return finish(hadFailure ? 'partial' : 'ready', hadFailure ? 'PARTIAL_SOURCES_UNAVAILABLE' : 'EVIDENCE_VERIFIED', hadFailure ? '取得できなかった資料があります。確認できた根拠だけを表示します。' : '本文と対象を照合した話題カードを表示します。');
     return finish(hadFailure ? 'failed' : 'no_evidence', hadFailure ? 'SOURCES_UNAVAILABLE' : 'NO_VERIFIABLE_EVIDENCE', hadFailure ? '一部の資料を取得できず、取得済みの資料からも対象と事実を照合できませんでした。入力や接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
   } catch (error) {

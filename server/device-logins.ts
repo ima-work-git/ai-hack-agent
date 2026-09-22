@@ -12,8 +12,8 @@ type Data = z.infer<typeof DataSchema>;
 type Device = z.infer<typeof DeviceSchema>;
 
 export class DeviceLoginError extends Error {
-  readonly code: 'NOT_CONFIGURED' | 'CAPACITY';
-  constructor(code: 'NOT_CONFIGURED' | 'CAPACITY') { super(code); this.code = code; }
+  readonly code: 'NOT_CONFIGURED' | 'CAPACITY' | 'INVALID_EXPIRY';
+  constructor(code: 'NOT_CONFIGURED' | 'CAPACITY' | 'INVALID_EXPIRY') { super(code); this.code = code; }
 }
 
 /** Independent login credentials only: no bearer tokens, session IDs or conversation data. */
@@ -27,16 +27,17 @@ export class DeviceLoginStore {
     this.file = join(directory, 'device-logins.json');
   }
 
-  issue(previousToken?: string): { token: string; expiresAt: number } {
+  issue(previousToken?: string, maximumExpiresAt?: number): { token: string; expiresAt: number } {
     if (this.accessCode.length < 16) throw new DeviceLoginError('NOT_CONFIGURED');
-    // Only the access-code login endpoint calls issue. A fresh verified code may
-    // replace corrupt records or credentials signed with a previous access code.
+    if (maximumExpiresAt !== undefined && (!Number.isSafeInteger(maximumExpiresAt) || maximumExpiresAt <= this.now())) throw new DeviceLoginError('INVALID_EXPIRY');
+    // Called after access-code or valid QR authentication. The caller supplies
+    // a fixed maximum expiry for reusable QR credentials.
     const data = this.read() ?? { version: 1, devices: [] };
     const previousHash = previousToken && TOKEN.test(previousToken) ? this.hash(previousToken) : undefined;
     data.devices = data.devices.filter(device => device.expiresAt > this.now() && device.tokenHash !== previousHash);
     if (data.devices.length >= 20) throw new DeviceLoginError('CAPACITY');
     const token = randomBytes(32).toString('hex');
-    const expiresAt = this.now() + LIFETIME_MS;
+    const expiresAt = Math.min(this.now() + LIFETIME_MS, maximumExpiresAt ?? Infinity);
     data.devices.push({ tokenHash: this.hash(token), expiresAt });
     this.write(data);
     return { token, expiresAt };

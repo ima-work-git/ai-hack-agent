@@ -14,6 +14,7 @@ import { createFixtureProvider, DEMO_TEXT } from '../server/fixtures.ts';
 import type { ResearchProvider } from '../server/provider-contract.ts';
 import { pcmToWav } from '../server/providers.ts';
 import type { ResearchInput } from '../src/shared/contracts.ts';
+import * as streamingRelay from '../server/ws-relay.ts';
 
 const cleanups: (() => Promise<void>)[] = [];
 async function fixture(options: { config?: Partial<AppConfig>; provider?: (input: ResearchInput) => ResearchProvider; liveProvider?: ResearchProvider; live?: boolean } = {}) {
@@ -56,7 +57,7 @@ async function fixture(options: { config?: Partial<AppConfig>; provider?: (input
     return { response, body: await response.json(), cookie: response.headers.getSetCookie().map(value => value.split(';')[0]).join('; ') };
   };
   const body = (revision = 1, extra: Record<string, unknown> = {}) => ({ text: DEMO_TEXT, requestId: randomUUID(), subjectRevision: revision, mode: 'demo', scenario: 'normal', ...extra });
-  const research = async (token: string, data = body()) => {
+  const research = async (token: string, data: ReturnType<typeof body> & Record<string, unknown> = body()) => {
     const response = await request('/api/research', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(data) });
     const text = await response.text();
     return { response, events: text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) };
@@ -66,8 +67,171 @@ async function fixture(options: { config?: Partial<AppConfig>; provider?: (input
 }
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
 
+describe('conversation-wide audio and research budget', () => {
+  const start = (f: Awaited<ReturnType<typeof fixture>>, token: string) => f.request('/api/conversation', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}',
+  });
+  const transcribe = (f: Awaited<ReturnType<typeof fixture>>, token: string, conversationId: string, requestId = randomUUID(), revision = 1) => f.request('/api/transcribe', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'audio/wav', 'X-Conversation-Id': conversationId,
+      'X-Request-Id': requestId, 'X-Subject-Revision': String(revision) }, body: pcmToWav(new Uint8Array(32)),
+  });
+
+  it('issues a short-lived stream ticket only for the authenticated same-origin conversation and rejects fabricated finals', async () => {
+    const provider: ResearchProvider = { ...createFixtureProvider('normal'), mode: 'live', plan: vi.fn(createFixtureProvider('normal').plan) };
+    const f = await fixture({ live: true, liveProvider: provider, config: { streamingApiKey: 'not-a-real-key', streamingModel: 'gpt-live-transcribe', streamingAudioMaxPerMinute: 0.03 } });
+    f.config.status.streamingEnabled = true;
+    const auth = await f.login(); const other = await f.login(); const group = await (await start(f, auth.body.token)).json();
+    const ticket = (token: string, headers: Record<string, string> = {}) => f.request('/api/conversation/stream', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ conversationId: group.conversationId }) });
+    expect((await ticket(other.body.token)).status).toBe(409);
+    expect((await ticket(auth.body.token, { Origin: 'https://foreign.invalid' })).status).toBe(403);
+    const response = await ticket(auth.body.token); const body = await response.json();
+    expect(response.status).toBe(200); expect(body.ticket).toMatch(/^[a-f0-9]{64}$/); expect(body.expiresAt).toBeLessThanOrEqual(Date.now() + 60_000);
+    const identified = await f.request('/api/conversation/identify', { method: 'POST', headers: { Authorization: `Bearer ${auth.body.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: group.conversationId, requestId: randomUUID(), subjectRevision: 1, text: 'Fabricated transcript' }) });
+    expect(identified.status).toBe(409); expect(provider.plan).not.toHaveBeenCalled();
+    f.advance(900_001); expect((await ticket(auth.body.token)).status).toBe(401);
+  });
+
+  it('identifies only a once-received streaming final and charges identification and research to its conversation', async () => {
+    let takeTicket!: (ticket: string) => streamingRelay.StreamGrant;
+    const spy = vi.spyOn(streamingRelay, 'createStreamingRelay').mockImplementation(options => {
+      takeTicket = options.takeTicket;
+      return { upgrade: () => false, closeConversation: vi.fn(), close: vi.fn() };
+    });
+    try {
+      const normal = createFixtureProvider('normal');
+      const provider: ResearchProvider = { ...normal, mode: 'live', plan: vi.fn(async (input, signal) => ({ ...await normal.plan(input, signal), actualUsd: 0.001 })) };
+      const f = await fixture({ live: true, liveProvider: provider, config: { maximumCosts: { llm: 0.001, search: 0.001, page: 0 }, streamingApiKey: 'fake-key', streamingModel: 'gpt-live-transcribe', streamingAudioMaxPerMinute: 0.03 } });
+      f.config.status.streamingEnabled = true;
+      const auth = await f.login(); const group = await (await start(f, auth.body.token)).json();
+      const issued = await f.request('/api/conversation/stream', { method: 'POST', headers: { Authorization: `Bearer ${auth.body.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: group.conversationId }) });
+      const ticket = (await issued.json()).ticket; const grant = takeTicket(ticket);
+      expect(() => takeTicket(ticket)).toThrow(); grant.onFinal(DEMO_TEXT);
+      const requestId = randomUUID();
+      const identify = (id = requestId) => f.request('/api/conversation/identify', { method: 'POST', headers: { Authorization: `Bearer ${auth.body.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: group.conversationId, requestId: id, subjectRevision: 1, text: DEMO_TEXT }) });
+      const identified = await identify(); expect(identified.status).toBe(200);
+      expect((await identified.json()).targets).toHaveLength(1);
+      expect((await identify(randomUUID())).status).toBe(409);
+      expect((await f.research(auth.body.token, f.body(1, { mode: 'live', conversationId: group.conversationId, requestId }))).response.status).toBe(200);
+      const ledger = JSON.parse(await readFile(join(f.directory, 'budget.json'), 'utf8'));
+      expect(Object.keys(ledger.runs)).toEqual([group.conversationId]); expect(ledger.runs[group.conversationId].spent).toBe(2_000);
+      f.advance(900_001); expect(grant.valid()).toBe(false);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('reserves STT, research and later windows against one server-issued parent budget', async () => {
+    const provider: ResearchProvider = { ...createFixtureProvider('normal'), mode: 'live', transcribe: vi.fn(async () => ({ value: DEMO_TEXT })) };
+    const f = await fixture({ live: true, liveProvider: provider }); const auth = await f.login();
+    const begun = await start(f, auth.body.token); const group = await begun.json();
+    expect(begun.status).toBe(200); expect(group.expiresAt).toBe(auth.body.expiresAt);
+    const requestId = randomUUID();
+    expect((await transcribe(f, auth.body.token, group.conversationId, requestId)).status).toBe(200);
+    const researched = await f.research(auth.body.token, f.body(1, { mode: 'live', conversationId: group.conversationId, requestId }));
+    expect(researched.events.at(-1).result.reasonCode).toBe('BUDGET_EXHAUSTED');
+    expect(researched.events.at(-1).result.usage.reservedUsd).toBe(0.01);
+    expect((await transcribe(f, auth.body.token, group.conversationId, randomUUID(), 2)).status).toBe(429);
+    expect(provider.transcribe).toHaveBeenCalledOnce();
+    const ledger = JSON.parse(await readFile(join(f.directory, 'budget.json'), 'utf8'));
+    expect(Object.keys(ledger.runs)).toEqual([group.conversationId]);
+    expect(ledger.runs[group.conversationId].reserved).toBe(10_000);
+  });
+
+  it('binds completed STT to its owner, request, revision and one research without permitting a missing group', async () => {
+    const provider: ResearchProvider = { ...createFixtureProvider('normal'), mode: 'live', transcribe: vi.fn(async () => ({ value: DEMO_TEXT, actualUsd: 0 })) };
+    const f = await fixture({ live: true, liveProvider: provider, config: { maximumCosts: { llm: 0.001, search: 0.001, page: 0 } } });
+    const auth = await f.login(); const other = await f.login(); const group = await (await start(f, auth.body.token)).json(); const requestId = randomUUID();
+    expect((await transcribe(f, other.body.token, group.conversationId, requestId)).status).toBe(409);
+    expect((await f.research(auth.body.token, f.body(1, { mode: 'live', conversationId: group.conversationId, requestId }))).response.status).toBe(409);
+    expect((await transcribe(f, auth.body.token, group.conversationId, requestId)).status).toBe(200);
+    expect((await transcribe(f, auth.body.token, group.conversationId, requestId)).status).toBe(409);
+    expect((await f.research(auth.body.token, f.body(1, { mode: 'live', requestId }))).response.status).toBe(409);
+    expect((await f.research(auth.body.token, f.body(2, { mode: 'live', conversationId: group.conversationId, requestId }))).response.status).toBe(409);
+    const data = f.body(1, { mode: 'live', conversationId: group.conversationId, requestId });
+    expect((await f.research(auth.body.token, data)).response.status).toBe(200);
+    expect((await f.research(auth.body.token, { ...data, subjectRevision: 2 })).response.status).toBe(409);
+    expect((await transcribe(f, auth.body.token, group.conversationId, randomUUID(), 2)).status).toBe(200);
+  });
+
+  it('allows windows without research but stops at the server-side one-hundred-window limit', async () => {
+    const provider: ResearchProvider = { ...createFixtureProvider('normal'), mode: 'live', transcribe: vi.fn(async () => ({ value: DEMO_TEXT, actualUsd: 0 })) };
+    const f = await fixture({ live: true, liveProvider: provider }); const auth = await f.login(); const group = await (await start(f, auth.body.token)).json();
+    for (let i = 0; i < 100; i++) expect((await transcribe(f, auth.body.token, group.conversationId)).status).toBe(200);
+    expect((await transcribe(f, auth.body.token, group.conversationId)).status).toBe(429);
+    expect(provider.transcribe).toHaveBeenCalledTimes(100);
+  });
+
+  it.each([{ targets: [], hasPersonMention: false }, { targets: [{ personName: '架空花子', companyName: '架空研究所' }], hasPersonMention: true }])('forwards optional validated target metadata and conversation context without an extra call: %j', async ({ targets, hasPersonMention }) => {
+    const provider: ResearchProvider = { ...createFixtureProvider('normal'), mode: 'live', transcribe: vi.fn(async () => ({ value: DEMO_TEXT, actualUsd: 0, transcriptTargets: targets, transcriptHasPersonMention: hasPersonMention })) };
+    const f = await fixture({ live: true, liveProvider: provider }); const auth = await f.login(); const group = await (await start(f, auth.body.token)).json();
+    const response = await transcribe(f, auth.body.token, group.conversationId);
+    expect(await response.json()).toEqual({ text: DEMO_TEXT, targets, hasPersonMention });
+    expect(provider.transcribe).toHaveBeenCalledOnce();
+    expect(vi.mocked(provider.transcribe!).mock.calls[0]![3]).toBe('');
+    expect((await transcribe(f, auth.body.token, group.conversationId)).status).toBe(200);
+    expect(provider.transcribe).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(provider.transcribe!).mock.calls[1]![3]).toBe(DEMO_TEXT);
+    const nextGroup = await (await start(f, auth.body.token)).json();
+    expect((await transcribe(f, auth.body.token, nextGroup.conversationId)).status).toBe(200);
+    expect(vi.mocked(provider.transcribe!).mock.calls[2]![3]).toBe('');
+  });
+
+  it('continues a confirmed candidate within its original conversation budget and rejects forged or unrelated groups', async () => {
+    const normal = createFixtureProvider('normal');
+    const ambiguous = createFixtureProvider('ambiguous');
+    const plan = vi.fn<ResearchProvider['plan']>(async (input, signal) => ({ ...await normal.plan(input, signal), actualUsd: 0.001 }));
+    plan.mockImplementationOnce(ambiguous.plan);
+    const provider: ResearchProvider = { ...normal, mode: 'live', plan, transcribe: vi.fn(async () => ({ value: DEMO_TEXT, actualUsd: 0 })) };
+    const f = await fixture({ live: true, liveProvider: provider, config: { maximumCosts: { llm: 0.001, search: 0.001, page: 0 } } });
+    const auth = await f.login(); const group = await (await start(f, auth.body.token)).json(); const requestId = randomUUID();
+    expect((await transcribe(f, auth.body.token, group.conversationId, requestId)).status).toBe(200);
+    const first = await f.research(auth.body.token, f.body(1, { mode: 'live', conversationId: group.conversationId, requestId }));
+    expect(first.events.at(-1).result.status).toBe('awaiting_confirmation');
+    const selected = first.events.at(-1).result.candidates[0];
+    const confirmation = f.body(2, { mode: 'live', conversationId: group.conversationId, selectedCandidateId: selected.id });
+    expect((await f.research(auth.body.token, { ...confirmation, selectedCandidateId: 'forged' })).response.status).toBe(409);
+    expect((await f.research(auth.body.token, { ...confirmation, text: 'changed input' })).response.status).toBe(409);
+    expect((await f.research(auth.body.token, { ...confirmation, conversationId: randomUUID() })).response.status).toBe(409);
+    expect((await f.research(auth.body.token, { ...confirmation, conversationId: undefined })).response.status).toBe(409);
+    const next = await f.research(auth.body.token, confirmation);
+    expect(next.response.status).toBe(200);
+    expect(next.events.at(-1).result.target).toEqual({ personName: selected.personName, companyName: selected.companyName });
+    expect(plan).toHaveBeenCalledTimes(2);
+    expect(provider.transcribe).toHaveBeenCalledOnce();
+    const ledger = JSON.parse(await readFile(join(f.directory, 'budget.json'), 'utf8'));
+    expect(Object.keys(ledger.runs)).toEqual([group.conversationId]);
+    expect(ledger.runs[group.conversationId].spent).toBe(1_000);
+  });
+
+  it('rejects concurrent start and cancels the entire group while STT is pending', async () => {
+    let started!: () => void; let release!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const provider: ResearchProvider = { ...createFixtureProvider('normal'), mode: 'live', transcribe: vi.fn(async () => {
+      started(); await new Promise<void>(resolve => { release = resolve; }); return { value: DEMO_TEXT };
+    }) };
+    const f = await fixture({ live: true, liveProvider: provider }); const auth = await f.login(); const group = await (await start(f, auth.body.token)).json(); const requestId = randomUUID();
+    const pending = transcribe(f, auth.body.token, group.conversationId, requestId); await entered;
+    expect((await start(f, auth.body.token)).status).toBe(409);
+    expect((await f.request('/api/cancel', { method: 'POST', headers: { Authorization: `Bearer ${auth.body.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: group.conversationId, requestId, subjectRevision: 1 }) })).status).toBe(200);
+    expect((await pending).status).toBe(408);
+    release();
+    expect((await f.research(auth.body.token, f.body(1, { mode: 'live', conversationId: group.conversationId, requestId }))).response.status).toBe(409);
+    expect(provider.transcribe).toHaveBeenCalledOnce();
+  });
+
+  it.each(['cancel', 'replace', 'forget', 'expiry', 'restart'] as const)('invalidates a conversation after %s before any additional provider work', async action => {
+    const provider: ResearchProvider = { ...createFixtureProvider('normal'), mode: 'live', transcribe: vi.fn(async () => ({ value: DEMO_TEXT, actualUsd: 0 })) };
+    const f = await fixture({ live: true, liveProvider: provider }); const auth = await f.login(); const group = await (await start(f, auth.body.token)).json();
+    if (action === 'cancel') expect((await f.request('/api/cancel', { method: 'POST', headers: { Authorization: `Bearer ${auth.body.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: group.conversationId, requestId: randomUUID(), subjectRevision: 1 }) })).status).toBe(200);
+    if (action === 'replace') await start(f, auth.body.token);
+    if (action === 'forget') await f.request('/api/session/forget', { method: 'POST', headers: { Authorization: `Bearer ${auth.body.token}`, 'Content-Type': 'application/json' }, body: '{}' });
+    if (action === 'expiry') f.advance(900_000);
+    if (action === 'restart') f.restart();
+    expect([401, 409]).toContain((await transcribe(f, auth.body.token, group.conversationId)).status);
+    expect(provider.transcribe).not.toHaveBeenCalled();
+  });
+});
+
 describe('single-use QR login', () => {
-  const issue = (f: Awaited<ReturnType<typeof fixture>>, token: string, headers: Record<string, string> = {}, body = '{}') =>
+  const issue = (f: Awaited<ReturnType<typeof fixture>>, token: string, headers: Record<string, string> = {}, body = JSON.stringify({ accessCode: f.config.accessCode })) =>
     f.request('/api/session/qr', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...headers }, body });
   const redeem = (f: Awaited<ReturnType<typeof fixture>>, ticket: string, headers: Record<string, string> = {}) =>
     f.request('/api/session/qr/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ ticket }) });
@@ -145,6 +309,61 @@ describe('single-use QR login', () => {
     expect((await redeem(f, 'a'.repeat(64))).status).toBe(429);
     f.advance(60_000);
     expect((await redeem(f, 'a'.repeat(64))).status).toBe(401);
+  });
+});
+
+describe('reusable fixed-expiry QR login', () => {
+  it('requires the operator code again to issue either QR type from a QR-derived session', async () => {
+    const f = await fixture(); const issuer = await f.login();
+    const expiresAt = new Date(issuer.body.expiresAt + 60 * 60_000).toISOString();
+    const issue = (token: string, reusable: boolean, data: Record<string, unknown>) => f.request(`/api/session/qr${reusable ? '/reusable' : ''}`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ ...(reusable ? { expiresAt } : {}), ...data }),
+    });
+    const grant = await (await issue(issuer.body.token, true, { accessCode: f.config.accessCode })).json();
+    const redeemed = await f.request('/api/session/qr/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticket: grant.ticket }) });
+    expect(redeemed.status).toBe(200); const recipient = await redeemed.json();
+    for (const reusable of [false, true]) {
+      expect((await issue(recipient.token, reusable, {})).status).toBe(401);
+      expect((await issue(recipient.token, reusable, { accessCode: 'wrong-code' })).status).toBe(401);
+      expect((await issue(recipient.token, reusable, { accessCode: f.config.accessCode, extra: true })).status).toBe(400);
+    }
+    expect((await issue(recipient.token, true, { accessCode: f.config.accessCode })).status).toBe(200);
+  });
+
+  it('shares the code attempt limit across both QR issuance routes and login', async () => {
+    const f = await fixture(); const issuer = await f.login();
+    const expiresAt = new Date(issuer.body.expiresAt + 60 * 60_000).toISOString();
+    const issue = (reusable: boolean) => f.request(`/api/session/qr${reusable ? '/reusable' : ''}`, {
+      method: 'POST', headers: { Authorization: `Bearer ${issuer.body.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ accessCode: 'wrong-code', ...(reusable ? { expiresAt } : {}) }),
+    });
+    for (let attempt = 0; attempt < 9; attempt++) expect((await issue(attempt % 2 === 0)).status).toBe(401);
+    expect((await issue(false)).status).toBe(429); expect((await issue(true)).status).toBe(429);
+    f.advance(60_000); expect((await issue(true)).status).toBe(401);
+  });
+
+  it('can be scanned repeatedly after issuer logout and restart but not after its fixed deadline', async () => {
+    const f = await fixture(); const issuer = await f.login();
+    const expiresAt = issuer.body.expiresAt - 900_000 + 36 * 60 * 60_000;
+    const issue = (headers: Record<string, string> = {}, deadline = expiresAt) => f.request('/api/session/qr/reusable', {
+      method: 'POST', headers: { Authorization: `Bearer ${issuer.body.token}`, 'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ expiresAt: new Date(deadline).toISOString(), accessCode: f.config.accessCode }),
+    });
+    expect((await issue({ Authorization: 'Bearer invalid' })).status).toBe(401);
+    expect((await issue({ Origin: 'https://foreign.invalid' })).status).toBe(403);
+    expect((await issue({}, expiresAt + 24 * 60 * 60_000)).status).toBe(400);
+    const issued = await issue(); const grant = await issued.json(); expect(issued.status).toBe(200); expect(grant.expiresAt).toBe(expiresAt);
+    const redeem = () => f.request('/api/session/qr/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticket: grant.ticket }) });
+    await f.request('/api/session', { method: 'DELETE', headers: { Authorization: `Bearer ${issuer.body.token}` } });
+    const first = await redeem(); const firstBody = await first.json();
+    const second = await redeem(); const secondBody = await second.json();
+    expect(first.status).toBe(200); expect(second.status).toBe(200);
+    expect(firstBody.token).not.toBe(secondBody.token);
+    expect(secondBody).toMatchObject({ hasPrevious: false, revision: 0 });
+    expect(await readFile(join(f.directory, 'reusable-qr.json'), 'utf8')).not.toContain(grant.ticket);
+    f.restart(); f.advance(35 * 60 * 60_000);
+    const nearExpiry = await redeem(); expect(nearExpiry.status).toBe(200);
+    const devices = JSON.parse(await readFile(join(f.directory, 'device-logins.json'), 'utf8')).devices;
+    expect(devices.every((device: { expiresAt: number }) => device.expiresAt <= expiresAt)).toBe(true);
+    f.advance(60 * 60_000); expect((await redeem()).status).toBe(401);
   });
 });
 

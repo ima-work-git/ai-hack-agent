@@ -6,6 +6,10 @@ export interface ProviderResult<T> {
   actualUsd?: number;
   /** Preliminary provider-reported USD for display only; never releases a reservation. */
   reportedUsd?: number;
+  /** STT-only clues: person in current transcript, company in current or quoted context. */
+  transcriptTargets?: Target[];
+  /** STT-only UI hint; not proof of an identity or affiliation. */
+  transcriptHasPersonMention?: boolean;
 }
 export interface ResearchProvider {
   readonly mode: 'demo' | 'live';
@@ -13,7 +17,7 @@ export interface ResearchProvider {
   search(query: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>>;
   fetchPage(hit: SearchHit, signal: AbortSignal): Promise<ProviderResult<EvidenceSource>>;
   assess(target: Target, sources: EvidenceSource[], signal: AbortSignal): Promise<ProviderResult<Assessment>>;
-  transcribe?(bytes: Uint8Array, mimeType: string, signal: AbortSignal): Promise<ProviderResult<string>>;
+  transcribe?(bytes: Uint8Array, mimeType: string, signal: AbortSignal, context?: string): Promise<ProviderResult<string>>;
 }
 
 export class ProviderError extends Error {

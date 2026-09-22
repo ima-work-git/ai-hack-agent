@@ -13,6 +13,31 @@ const input = (extra: Partial<ResearchInput> = {}): ResearchInput => ({ text: DE
 afterEach(() => { vi.useRealTimers(); });
 
 describe('bounded evidence research', () => {
+  it.each(['fact', 'suggestedQuestion'] as const)('independently rejects a health-related %s from an alternate provider', async field => {
+    const provider = createFixtureProvider('normal');
+    const assess = provider.assess.bind(provider);
+    provider.assess = async (...args) => {
+      const response = await assess(...args);
+      response.value.cards = response.value.cards.map(card => ({ ...card, [field]: field === 'fact' ? '登壇者として医療や服薬の体験を話しました。' : '副反応について教えていただけますか？' }));
+      return response;
+    };
+    const result = await runAgent(input(), provider);
+    expect(result.cards).toEqual([]);
+    expect(result.trace.some(event => event.message.includes('カード全体を除外'))).toBe(true);
+  });
+
+  it('revalidates display facts independently of provider output without losing a valid full card', async () => {
+    const provider = createFixtureProvider('normal');
+    const assess = provider.assess.bind(provider);
+    provider.assess = async (...args) => {
+      const result = await assess(...args);
+      result.value.cards = result.value.cards.map(card => ({ ...card, displayFact: '出典にない短い断定', displayQuestion: '活動で印象に残ったことは？' }));
+      return result;
+    };
+    const result = await runAgent(input(), provider);
+    expect(result.status).toBe('ready'); expect(result.cards).toHaveLength(2);
+    expect(result.cards.every(card => card.displayFact === undefined && card.displayQuestion === '活動で印象に残ったことは？')).toBe(true);
+  });
   it('executes a visible autonomous follow-up and produces only source-backed fictional cards', async () => {
     const result = await runAgent(input(), createFixtureProvider('normal'));
     expect(result.status).toBe('ready');
@@ -150,6 +175,53 @@ describe('bounded evidence research', () => {
     expect(provider.search).not.toHaveBeenCalled();
   });
 
+  it('stops before searching when an explicitly supplied account conflicts with a verified alias', async () => {
+    const provider = createFixtureProvider('normal');
+    provider.plan = async () => ({ value: { target: { personName: '千代田まどか', companyName: 'Microsoft' }, needsConfirmation: false, candidates: [], query: '', reason: '確認済み別名' } });
+    provider.search = vi.fn(provider.search);
+    const result = await runAgent(input({ text: 'マイクロソフトのちょまどさん @another_user' }), provider);
+    expect(result.reasonCode).toBe('ACCOUNT_IDENTITY_CONFLICT');
+    expect(result.cards).toEqual([]);
+    expect(provider.search).not.toHaveBeenCalled();
+  });
+
+  it('resolves a verified spoken pair to one X lookup and retains four literal profile cards with zero posts', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agent-verified-alias-'));
+    try {
+      const budget = new BudgetLedger({ directory, currency: 'USD', runLimitUsd: 1, dayLimitUsd: 2, eventLimitUsd: 3 });
+      // Deliberately synthetic source claims; this test asserts copying/bounds,
+      // never the real person's biography or a live API result.
+      const facts = ['模擬の第一活動です。', '模擬の第二活動です。', '模擬の第三活動です。', '模擬の第四活動です。'];
+      let completions = 0;
+      const api = vi.fn<typeof fetch>(async (url, init) => {
+        let value: unknown;
+        if (String(url).includes('/users/by/username/chomado')) value = { data: { id: '123', username: 'chomado', name: 'Madoka Chiyoda (Chomado)', description: `Microsoft. ${facts.join('')}`, protected: false } };
+        else if (String(url).includes('/users/123/tweets')) value = { meta: { result_count: 0, next_token: 'must-not-follow' } };
+        else if (url === 'https://api.orcarouter.ai/v1/chat/completions') {
+          const data = JSON.parse(JSON.parse(String(init!.body)).messages[1].content);
+          const content = ++completions === 1
+            ? { target: { personName: 'ちょまど', companyName: 'マイクロソフト' }, needsConfirmation: false, candidates: [], query: '公式 プロフィール', reason: '発話を抽出' }
+            : { identityVerified: true, needsConfirmation: false, candidates: [], cards: facts.map(fact => ({
+              factId: data.sources[0].excerpts.flatMap((excerpt: { facts: { factId: string; text: string }[] }) => excerpt.facts).find((candidate: { text: string }) => candidate.text === fact).factId,
+              suggestedQuestion: 'この模擬活動について教えてください。',
+            })), followUpQuery: null, reason: '模擬プロフィールの選択結果' };
+          value = { choices: [{ message: { content: JSON.stringify(content) } }] };
+        } else throw new Error('Unexpected mocked endpoint');
+        return new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
+      });
+      const provider = createLiveProvider({ orcaApiKey: 'fixture', orcaModel: 'fixture', tavilyApiKey: 'fixture', xEnabled: true, xBearerToken: 'fixture' }, { fetch: api });
+      const result = await runAgent(input({ text: 'マイクロソフトのちょまどさんです。', mode: 'live' }), provider,
+        { budget, maximumCosts: { llm: 0.01, search: 0.05, page: 0 } });
+      expect(result.status).toBe('ready');
+      expect(result.target).toEqual({ personName: '千代田まどか', companyName: 'Microsoft' });
+      expect(result.cards.map(card => card.fact)).toEqual(facts);
+      expect(result.sources).toHaveLength(1);
+      expect(result.sources[0]!.url).toBe('https://x.com/chomado');
+      expect(result.usage).toMatchObject({ llm: 2, searches: 1, pages: 1 });
+      expect(api).toHaveBeenCalledTimes(4); // plan + lookup + bounded timeline + assessment
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
   it.each([0, 1, 5])('routes a synthetic profile URL with %i X posts through Tavily and retrieves its web evidence', async postCount => {
     const directory = await mkdtemp(join(tmpdir(), 'agent-x-routing-'));
     try {
@@ -162,7 +234,7 @@ describe('bounded evidence research', () => {
           const data = JSON.parse(JSON.parse(String(init!.body)).messages[1].content);
           let content: unknown;
           if (++completions === 1) content = { target: DEMO_TARGET, needsConfirmation: false, candidates: [], query: '@fixture_user', reason: '入力の氏名・会社を使用' };
-          else if (completions === 2 && postCount > 0) content = { identityVerified: false, needsConfirmation: false, candidates: [], cards: [], followUpQuery: '公式 登壇 @fixture_user', reason: '公式の根拠が不足' };
+          else if (completions === 2) content = { identityVerified: false, needsConfirmation: false, candidates: [], cards: [], followUpQuery: '公式 登壇 @fixture_user', reason: '公式の根拠が不足' };
           else content = { identityVerified: true, needsConfirmation: false, candidates: [], cards: [{ suggestedQuestion: '勉強会では何を紹介しましたか。', factId: data.sources.find((s: { kind: string }) => s.kind === 'web').excerpts.flatMap((excerpt: { facts: { factId: string; text: string }[] }) => excerpt.facts).find((candidate: { text: string }) => candidate.text === fact).factId }], followUpQuery: null, reason: '公式本文で確認' };
           value = { choices: [{ message: { content: JSON.stringify(content) } }] };
         } else if (String(url).includes('/users/by/username/fixture_user')) {
@@ -184,8 +256,8 @@ describe('bounded evidence research', () => {
         { budget, maximumCosts: { llm: 0.01, search: 0.05, page: 0 } });
       expect(result.status).toBe('ready');
       expect(result.cards).toHaveLength(1);
-      expect(result.usage).toMatchObject({ llm: postCount ? 3 : 2, searches: 2, pages: Math.min(postCount, 2) + 1, costKnown: false });
-      expect(result.sources.filter(source => source.kind === 'x')).toHaveLength(Math.min(postCount, 2));
+      expect(result.usage).toMatchObject({ llm: 3, searches: 2, pages: Math.min(postCount + 1, 2) + 1, costKnown: false });
+      expect(result.sources.filter(source => source.kind === 'x')).toHaveLength(Math.min(postCount + 1, 2));
       expect(result.sources.filter(source => source.kind === 'web')).toHaveLength(1);
       expect(fetchPage).toHaveBeenCalledTimes(1);
       expect(fetchPage.mock.calls[0]![0]).toBe('https://company.example.org/event');
@@ -333,4 +405,105 @@ describe('bounded evidence research', () => {
     expect(result.status).toBe('failed');
     expect(result.cards).toHaveLength(0);
   });
+});
+
+describe('person-only public-profile research', () => {
+  function publicProvider(assessmentChanges: Partial<Assessment> = {}, personName = '架空作家'): ResearchProvider {
+    const subject = { personName, companyName: '' };
+    const text = `${personName}の公式プロフィールです。公開の執筆講座で創作について紹介しています。`;
+    const source = { sourceId: 'public-profile', url: 'https://author.example.org/profile', title: '架空の公式資料', text, retrievedAt: '2026-09-22T00:00:00Z', kind: 'web' as const };
+    return {
+      mode: 'demo',
+      plan: async () => ({ value: { target: subject, needsConfirmation: false, candidates: [], query: `${personName} 公式`, reason: '入力に明記', hasPersonMention: true }, actualUsd: 0 }),
+      search: vi.fn(async () => ({ value: [{ url: source.url, title: source.title }], actualUsd: 0 })),
+      fetchPage: async () => ({ value: source, actualUsd: 0 }),
+      assess: async () => ({ value: { identityVerified: true, publicPersonVerified: true, publicIdentitySourceIds: ['public-profile'], needsConfirmation: false, candidates: [], cards: [{ fact: '公開の執筆講座で創作について紹介しています。', excerpt: text, sourceId: source.sourceId, suggestedQuestion: '講座で印象に残ったことは？' }], followUpQuery: null, reason: '架空の一次資料で検証', ...assessmentChanges }, actualUsd: 0 }),
+    };
+  }
+
+  it('discovers an unregistered public person through web sources with no company or invented X account', async () => {
+    const provider = publicProvider();
+    const result = await runAgent(input({ text: '架空作家さんについて' }), provider);
+    expect(result.status).toBe('ready'); expect(result.target?.companyName).toBe(''); expect(result.cards).toHaveLength(1);
+    expect(provider.search).toHaveBeenCalledWith('架空作家 公式', expect.any(AbortSignal));
+    expect(result.usage).toMatchObject({ llm: 2, searches: 1, pages: 1 });
+  });
+
+  it.each([
+    { publicPersonVerified: false },
+    { publicIdentitySourceIds: [] },
+    { publicIdentitySourceIds: ['fabricated-profile'] },
+    { identityVerified: false },
+    { needsConfirmation: true },
+  ])('requires clarification for private, absent, forged or ambiguous public identity evidence %#', async changes => {
+    const result = await runAgent(input({ text: '架空作家さんについて' }), publicProvider(changes));
+    expect(result.status).toBe('awaiting_confirmation'); expect(result.cards).toEqual([]);
+  });
+
+  it('uses at most the remaining search and assessment when primary public evidence is missing', async () => {
+    const result = await runAgent(input({ text: '架空作家さんについて' }), publicProvider({ publicPersonVerified: false, followUpQuery: '公式 プロフィール' }));
+    expect(result.status).toBe('awaiting_confirmation'); expect(result.cards).toEqual([]);
+    expect(result.usage).toMatchObject({ llm: 3, searches: 2, pages: 1 });
+  });
+
+  it('routes a verified kana nickname to its grounded account without adding API calls', async () => {
+    const provider = publicProvider({}, '西村博之');
+    const result = await runAgent(input({ text: 'ヒロユキについて' }), provider);
+    expect(result.status).toBe('ready'); expect(provider.search).toHaveBeenCalledWith('西村博之 公式 @hirox246', expect.any(AbortSignal));
+    expect(result.target).toEqual({ personName: '西村博之', companyName: '' });
+  });
+  it.each(['verified', 'missing', 'ambiguous', 'few_cards'] as const)('uses a single Web follow-up for insufficient X-only public identity, but preserves ambiguity: %s', async outcome => {
+    const provider = publicProvider({}, '西村博之');
+    const originalFetch = provider.fetchPage.bind(provider); const originalAssess = provider.assess.bind(provider);
+    const xSources = ['profile', 'post'].map((suffix, index) => ({
+      sourceId: `x-${suffix}`, url: index ? 'https://x.com/hirox246/status/123' : 'https://x.com/hirox246',
+      title: '架空のXテスト資料', text: '西村博之の名前がある架空の資料です。公開の読書会に参加しています。', kind: 'x' as const, retrievedAt: '2026-09-22T00:00:00Z',
+    }));
+    let searches = 0; let assessments = 0;
+    provider.search = vi.fn(async () => ({ value: ++searches === 1 ? xSources.map(({ url, title }) => ({ url, title })) : [{ url: 'https://author.example.org/profile', title: '架空の公式資料' }], actualUsd: 0 }));
+    provider.fetchPage = vi.fn<ResearchProvider['fetchPage']>(async (hit, signal) => {
+      const x = xSources.find(source => source.url === hit.url);
+      if (x) return { value: x, actualUsd: 0 };
+      const fetched = await originalFetch(hit, signal);
+      return { value: { ...fetched.value, url: hit.url, sourceId: hit.url === 'https://guild.to/' ? 'public-profile' : 'secondary-profile' }, actualUsd: 0 };
+    });
+    provider.assess = vi.fn<ResearchProvider['assess']>(async (...args) => {
+      const result = await originalAssess(...args); assessments++;
+      if (assessments === 1 && outcome === 'few_cards') result.value = { ...result.value, publicIdentitySourceIds: ['x-profile'], cards: [{ fact: '公開の読書会に参加しています。', excerpt: xSources[0]!.text, sourceId: 'x-profile', suggestedQuestion: '読書会で印象に残った本は？' }] };
+      else if (assessments === 1 || outcome === 'missing') result.value = { ...result.value, identityVerified: false, publicPersonVerified: false, publicIdentitySourceIds: [], needsConfirmation: true, cards: [], followUpQuery: null, candidates: outcome === 'ambiguous' ? [
+        { id: 'candidate-1', personName: '西村博之', companyName: '', reason: '資料で区別できない候補', sourceIds: ['x-profile'] },
+        { id: 'candidate-2', personName: '西村博之', companyName: '', reason: '資料で区別できない別候補', sourceIds: ['x-post'] },
+      ] : [] };
+      return result;
+    });
+    const result = await runAgent(input({ text: 'ひろゆきについて' }), provider);
+    if (outcome === 'ambiguous') {
+      expect(result.status).toBe('awaiting_confirmation'); expect(result.candidates).toHaveLength(2);
+      expect(result.usage).toMatchObject({ llm: 2, searches: 1, pages: 2 });
+    } else {
+      expect(provider.search).toHaveBeenNthCalledWith(2, '西村博之 公式 プロフィール', expect.any(AbortSignal));
+      expect(result.usage).toMatchObject({ llm: 3, searches: 2, pages: 4 });
+      expect(vi.mocked(provider.fetchPage).mock.calls.slice(2).map(([hit]) => hit.url)).toEqual(['https://guild.to/', 'https://guild.to/news/弊社のメンバー達がノンタイトルで激突すること/']);
+      expect(result.trace.some(event => event.message.includes('公式Webプロフィール'))).toBe(true);
+      expect(result.status).toBe(['verified', 'few_cards'].includes(outcome) ? 'ready' : 'awaiting_confirmation');
+    }
+    expect(result.cards).toHaveLength(outcome === 'few_cards' ? 2 : outcome === 'verified' ? 1 : 0);
+  });
+
+  it('does not treat registered URLs as evidence when the preferred public pages cannot be fetched', async () => {
+    const provider = publicProvider({ identityVerified: false, publicPersonVerified: false, needsConfirmation: true, cards: [] }, '堀江貴文');
+    let searches = 0;
+    provider.search = vi.fn(async () => ({ value: ++searches === 1 ? [{ url: 'https://x.com/takapon_jp', title: '架空のX資料' }] : [{ url: 'https://unavailable.example.org/profile', title: '検索候補' }], actualUsd: 0 }));
+    provider.fetchPage = vi.fn<ResearchProvider['fetchPage']>(async hit => {
+      if (hit.url === 'https://x.com/takapon_jp') return { value: { sourceId: 'x-profile', url: hit.url, title: hit.title, text: '堀江貴文の名前がある架空の資料です。', kind: 'x', retrievedAt: '2026-09-22T00:00:00Z' }, actualUsd: 0 };
+      throw new Error('fixture unreachable');
+    });
+    provider.assess = vi.fn(provider.assess);
+    const result = await runAgent(input({ text: 'ほりえもんについて' }), provider);
+    expect(vi.mocked(provider.fetchPage).mock.calls.map(([hit]) => hit.url)).toEqual(['https://x.com/takapon_jp', 'https://snsgroup.jp/', 'https://zeroichi.media/', 'https://unavailable.example.org/profile']);
+    expect(result.status).toBe('awaiting_confirmation'); expect(result.cards).toEqual([]);
+    expect(result.sources).toHaveLength(1); expect(provider.assess).toHaveBeenCalledOnce();
+    expect(result.usage).toMatchObject({ llm: 2, searches: 2, pages: 4 });
+  });
+
 });

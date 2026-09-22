@@ -8,6 +8,7 @@ export interface BudgetConfig {
   runLimitUsd: number;
   dayLimitUsd: number;
   eventLimitUsd: number;
+  limitSuspension?: { startsAt: number; endsAt: number };
   now?: () => number;
 }
 
@@ -51,6 +52,7 @@ export class BudgetLedger {
   private readonly lock: string;
   private readonly now: () => number;
   private readonly config: BudgetConfig;
+  private readonly limitSuspension?: { startsAt: number; endsAt: number };
 
   constructor(config: BudgetConfig) {
     this.config = config;
@@ -59,6 +61,11 @@ export class BudgetLedger {
       throw new BudgetError('BUDGET_NOT_CONFIGURED');
     }
     this.limits = { run: amount(config.runLimitUsd), day: amount(config.dayLimitUsd), event: amount(config.eventLimitUsd) };
+    if (config.limitSuspension) {
+      const { startsAt, endsAt } = config.limitSuspension;
+      if (!Number.isSafeInteger(startsAt) || !Number.isSafeInteger(endsAt) || endsAt <= startsAt || endsAt - startsAt > 48 * 60 * 60_000) throw new BudgetError('INVALID_BUDGET_SUSPENSION');
+      this.limitSuspension = { startsAt, endsAt };
+    }
     this.file = join(config.directory, 'budget.json');
     this.lock = join(config.directory, 'budget.lock');
     this.now = config.now ?? Date.now;
@@ -68,11 +75,13 @@ export class BudgetLedger {
     if (!UUID.test(runId)) throw new BudgetError('INVALID_BUDGET_RUN_ID');
     const maximum = amount(maximumUsd);
     return this.transaction(data => {
-      const day = new Date(this.now()).toISOString().slice(0, 10); // UTC accounting day.
+      const currentTime = this.now();
+      const day = new Date(currentTime).toISOString().slice(0, 10); // UTC accounting day.
       const run = data.runs[runId] ?? zero();
       const daily = data.days[day] ?? zero();
       const checks: [Totals, number][] = [[run, this.limits.run], [daily, this.limits.day], [data.event, this.limits.event]];
-      if (checks.some(([total, limit]) => total.spent + total.reserved + maximum > limit)) throw new BudgetError('BUDGET_EXHAUSTED');
+      const limitsSuspended = this.limitSuspension && currentTime >= this.limitSuspension.startsAt && currentTime < this.limitSuspension.endsAt;
+      if (!limitsSuspended && checks.some(([total, limit]) => total.spent + total.reserved + maximum > limit)) throw new BudgetError('BUDGET_EXHAUSTED');
       const id = randomUUID();
       data.runs[runId] = run;
       data.days[day] = daily;

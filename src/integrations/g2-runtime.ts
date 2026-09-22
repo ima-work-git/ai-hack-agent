@@ -4,8 +4,13 @@ import {
   OsEventTypeList,
   TextContainerProperty,
   TextContainerUpgrade,
+  ImageContainerProperty,
+  ImageRawDataUpdate,
+  ImageRawDataUpdateResult,
+  RebuildPageContainer,
   waitForEvenAppBridge,
 } from '@evenrealities/even_hub_sdk'
+import { renderGlassesBitmap } from './g2-bitmap'
 
 export interface GlassesView {
   header: string
@@ -28,6 +33,8 @@ export interface G2Event {
 export interface G2Bridge {
   createStartUpPageContainer(page: CreateStartUpPageContainer): Promise<number>
   textContainerUpgrade(text: TextContainerUpgrade): Promise<boolean>
+  updateImageRawData?(image: ImageRawDataUpdate): Promise<ImageRawDataUpdateResult>
+  rebuildPageContainer?(page: RebuildPageContainer): Promise<boolean>
   audioControl(open: boolean, source?: AudioInputSource): Promise<boolean>
   onEvenHubEvent(callback: (event: G2Event) => void): () => void
   onDeviceStatusChanged(callback: (status: { connectType: string }) => void): () => void
@@ -41,8 +48,12 @@ export interface G2RuntimeOptions {
   onAudio?: (chunk: Uint8Array) => void
   onAction?: (action: G2Action) => void
   timeoutMs?: number
-  /** Can shorten the capture window, never extend it beyond 30 seconds. */
+  /** For ordinary capture: can shorten its window, never extend it beyond 30 seconds. */
   maxAudioMs?: number
+  /** Test injection; production uses a local Canvas, never an external image API. */
+  renderBitmap?: typeof renderGlassesBitmap
+  /** Off by default until image transfer latency has been verified on hardware. */
+  enableImageText?: boolean
 }
 
 interface ViewJob {
@@ -88,6 +99,7 @@ export class G2Runtime {
   private audioStarting = false
   private audioStopping = 0
   private acceptingAudio = false
+  private audioContinuous = false
   private audioBytes = 0
   private audioDeadline = 0
   private audioTimer: ReturnType<typeof setTimeout> | null = null
@@ -96,6 +108,9 @@ export class G2Runtime {
   private viewSequence = 0
   private pending: ViewJob | null = null
   private flushing = false
+  private imageMode = false
+  private lastImageContent: string | null = null
+  private lastText: Partial<GlassesView> = {}
 
   constructor(private readonly options: G2RuntimeOptions = {}) {
     this.timeoutMs = Number.isFinite(options.timeoutMs)
@@ -136,16 +151,20 @@ export class G2Runtime {
     return result
   }
 
-  async startAudio(): Promise<boolean> {
+  /** Continuous capture is opt-in for the caller's explicit conversation start. */
+  async startAudio(options: { continuous?: boolean } = {}): Promise<boolean> {
     if (!this.usable() || this.audioStarting || this.audioStopping > 0) return false
     if (this.acceptingAudio) return true
     const bridge = this.bridge!
     const version = ++this.audioVersion
     this.audioStarting = true
+    this.audioContinuous = options.continuous === true
     this.audioBytes = 0
-    this.audioDeadline = Date.now() + this.maxAudioMs
+    this.audioDeadline = this.audioContinuous ? Infinity : Date.now() + this.maxAudioMs
     // The deadline starts at the request, not a possibly delayed acknowledgement.
-    this.audioTimer = setTimeout(() => { void this.stopAudio('duration_limit') }, this.maxAudioMs)
+    if (!this.audioContinuous) {
+      this.audioTimer = setTimeout(() => { void this.stopAudio('duration_limit') }, this.maxAudioMs)
+    }
     const opening = invoke(() => bridge.audioControl(true, AudioInputSource.Glasses))
     // A timed-out or cancelled open can complete later: issue another close then.
     void opening.then(opened => {
@@ -188,6 +207,7 @@ export class G2Runtime {
     this.audioVersion += 1
     if (this.audioTimer !== null) clearTimeout(this.audioTimer)
     this.audioTimer = null
+    this.audioContinuous = false
     this.audioBytes = 0
     this.audioDeadline = 0
     const bridge = this.bridge
@@ -206,6 +226,7 @@ export class G2Runtime {
     if (this.disposed) return
     this.disposed = true
     this.connected = false
+    this.clearDisplayCache()
     this.connectionVersion += 1
     this.cancelViews()
     this.removeSubscriptions()
@@ -215,6 +236,7 @@ export class G2Runtime {
   }
 
   private async connectBridge(initialView: GlassesView | undefined, token: string): Promise<boolean> {
+    this.clearDisplayCache()
     const injected = Boolean(this.options.bridge || this.options.getBridge)
     if (!(this.options.isHostAvailable?.() ?? (injected || nativeHostAvailable()))) {
       this.notify('unavailable', 'no_native_host')
@@ -230,6 +252,8 @@ export class G2Runtime {
         : invoke(this.options.getBridge ?? waitForEvenAppBridge))
       if (this.disposed || version !== this.connectionVersion) return false
       this.bridge = bridge
+      this.imageMode = Boolean(this.options.enableImageText && bridge.updateImageRawData && bridge.rebuildPageContainer &&
+        (this.options.renderBitmap ?? renderGlassesBitmap)(SAFE_VIEW.content))
       // Never put a person's details in an uncancellable startup operation.
       const result = await this.deadline(invoke(() => bridge.createStartUpPageContainer(this.startupPage())))
       if (this.disposed || version !== this.connectionVersion) return false
@@ -251,6 +275,7 @@ export class G2Runtime {
       this.notify('connected', 'bridge_acknowledged')
       // Invalidation while connect was waiting must not resurrect an old view.
       if (initialView && token === this.token && viewEpoch === this.viewEpoch) return this.render(initialView, token)
+      if (this.imageMode) return this.render(SAFE_VIEW, this.token)
       return true
     } catch (error) {
       this.connected = false
@@ -286,10 +311,12 @@ export class G2Runtime {
     }
     if (audio && this.acceptingAudio && audio.source === AudioInputSource.Glasses
       && audio.audioPcm instanceof Uint8Array && audio.audioPcm.length > 0 && audio.audioPcm.length % 2 === 0) {
-      this.audioBytes += audio.audioPcm.length
-      if (this.audioBytes > Math.floor(this.maxAudioMs * 32)) {
-        void this.stopAudio('audio_size_limit')
-        return
+      if (!this.audioContinuous) {
+        this.audioBytes += audio.audioPcm.length
+        if (this.audioBytes > Math.floor(this.maxAudioMs * 32)) {
+          void this.stopAudio('audio_size_limit')
+          return
+        }
       }
       try { this.options.onAudio?.(audio.audioPcm.slice()) } catch { void this.stopAudio('audio_handler_failed') }
     }
@@ -299,6 +326,7 @@ export class G2Runtime {
   }
 
   private suspend(state: 'background' | 'disconnected', reason: string): void {
+    this.clearDisplayCache()
     if (state === 'background') this.foreground = false
     else this.connected = false
     this.cancelViews()
@@ -314,13 +342,42 @@ export class G2Runtime {
         const job = this.pending
         this.pending = null
         let success = true
+        if (this.imageMode && this.current(job) && this.lastImageContent !== job.view.content) {
+          try {
+            // A partly written pair must never be mistaken for the previous complete pair.
+            this.lastImageContent = null
+            const images = (this.options.renderBitmap ?? renderGlassesBitmap)(job.view.content)
+            let accepted = images !== null
+            if (images) for (const [index, imageData] of images.entries()) {
+              if (!this.currentImage(job)) { accepted = false; break }
+              const result = await this.deadline(invoke(() => this.bridge!.updateImageRawData!(new ImageRawDataUpdate({
+                containerID: index + 4, containerName: `small-text-${index}`, imageData,
+              }))))
+              if (!ImageRawDataUpdateResult.isSuccess(result)) { accepted = false; break }
+            }
+            if (accepted && this.currentImage(job)) this.lastImageContent = job.view.content
+            else if (!accepted && this.currentImage(job)) await this.fallbackToText()
+          } catch (error) {
+            try {
+              if (error instanceof BridgeTimeout || !this.currentImage(job)) throw error
+              await this.fallbackToText()
+            } catch {
+              success = false; this.fatal = true; this.cancelViews(); void this.stopAudio()
+              if (!this.disposed) this.notify('error', error instanceof BridgeTimeout ? 'display_timeout' : 'display_failed')
+            }
+          }
+        }
         for (const [index, name] of (['header', 'content', 'footer'] as const).entries()) {
           if (!this.current(job)) { success = false; break }
+          if (this.imageMode && name === 'content') continue
+          if (this.lastText[name] === job.view[name]) continue
           try {
+            delete this.lastText[name]
             const accepted = await this.deadline(invoke(() => this.bridge!.textContainerUpgrade(
               new TextContainerUpgrade({ containerID: index + 1, containerName: name, content: job.view[name] }),
             )))
             if (!accepted) throw new Error('display_rejected')
+            if (this.current(job)) this.lastText[name] = job.view[name]
           } catch (error) {
             success = false
             // Native calls cannot be cancelled. Do not start another write after timeout.
@@ -340,6 +397,12 @@ export class G2Runtime {
 
   private current(job: ViewJob): boolean {
     return this.usable() && job.epoch === this.viewEpoch && job.token === this.token && job.sequence === this.viewSequence
+  }
+
+  private currentImage(job: ViewJob): boolean {
+    // New speech status must not starve an in-flight pair of unchanged topic images.
+    return this.usable() && job.epoch === this.viewEpoch && job.token === this.token &&
+      (job.sequence === this.viewSequence || this.pending?.view.content === job.view.content)
   }
 
   private usable(): boolean { return this.connected && this.foreground && !this.disposed && !this.fatal && this.bridge !== null }
@@ -379,14 +442,31 @@ export class G2Runtime {
     try { this.options.onAction?.(action) } catch { /* No data or callback exception is logged. */ }
   }
 
+  private async fallbackToText(): Promise<void> {
+    this.clearDisplayCache()
+    this.imageMode = false
+    const page = this.startupPage()
+    const accepted = await this.deadline(invoke(() => this.bridge!.rebuildPageContainer!(new RebuildPageContainer({
+      containerTotalNum: page.containerTotalNum, textObject: page.textObject,
+    }))))
+    if (!accepted) throw new Error('text_fallback_failed')
+  }
+
+  private clearDisplayCache(): void { this.lastImageContent = null; this.lastText = {} }
+
   private startupPage(): CreateStartUpPageContainer {
     const geometry = [{ y: 0, height: 48 }, { y: 52, height: 184 }, { y: 240, height: 48 }]
     const names = ['header', 'content', 'footer'] as const
     const textObject = names.map((name, index) => new TextContainerProperty({
       xPosition: 0, yPosition: geometry[index]!.y, width: 576, height: geometry[index]!.height,
       borderWidth: index === 2 ? 0 : 1, borderColor: 5, borderRadius: 4, paddingLength: 6,
-      containerID: index + 1, containerName: name, content: SAFE_VIEW[name], isEventCapture: index === 1 ? 1 : 0,
+      containerID: index + 1, containerName: name, content: this.imageMode && name === 'content' ? ' ' : SAFE_VIEW[name], isEventCapture: index === 1 ? 1 : 0,
+      ...(this.imageMode ? { zOrderIndex: index + 1 } : {}),
     }))
-    return new CreateStartUpPageContainer({ containerTotalNum: textObject.length, textObject })
+    const imageObject = this.imageMode ? [0, 1].map(index => new ImageContainerProperty({
+      xPosition: index * 288, yPosition: 66, width: 288, height: 144,
+      containerID: index + 4, containerName: `small-text-${index}`, zOrderIndex: index + 4,
+    })) : undefined
+    return new CreateStartUpPageContainer({ containerTotalNum: textObject.length + (imageObject?.length ?? 0), textObject, ...(imageObject ? { imageObject } : {}) })
   }
 }

@@ -22,7 +22,7 @@ const server = createServer(async (req, res) => {
     if (file !== root && !file.startsWith(root + sep)) { res.writeHead(404).end(); return; }
     if (pathname === '/' || !extname(file)) file = resolve(root, 'index.html');
     if (!(await stat(file)).isFile()) { res.writeHead(404).end(); return; }
-    res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' https:; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' https: wss: ws:; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     res.setHeader('Content-Type', contentTypes[extname(file)] || 'application/octet-stream');
     res.setHeader('Cache-Control', 'no-store');
     res.end(req.method === 'HEAD' ? undefined : await readFile(file));
@@ -31,7 +31,8 @@ const server = createServer(async (req, res) => {
     res.end(JSON.stringify({ message: '処理を完了できませんでした。接続を確認して再開してください。' }));
   }
 });
+server.on('upgrade', (req, socket, head) => { if (!api.upgrade(req, socket, head) && production) socket.destroy(); });
 server.requestTimeout = 30_000;
 server.headersTimeout = 10_000;
-server.listen(config.port, config.host, () => console.info(`会話アシスタント: ${config.origin} (${config.status.liveEnabled ? '実API利用可能' : '体験デモ'})`));
+server.listen(config.port, config.host, () => console.info(`これで誰でも雑談マスター: ${config.origin} (${config.status.liveEnabled ? '実API利用可能' : '体験デモ'})`));
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { api.close(); void vite?.close(); server.close(() => process.exit(0)); });

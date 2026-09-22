@@ -1,5 +1,6 @@
 import type { ProviderConfig } from './provider-contract.ts';
 import type { RuntimeStatus } from '../src/shared/contracts.ts';
+import { z } from 'zod';
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   const host = env.HOST || '127.0.0.1';
@@ -24,11 +25,24 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     if (!Number.isFinite(value) || (zeroAllowed ? value < 0 : value <= 0)) { missing.push(label); return 0; }
     return value;
   };
+  const suspensionFrom = env.BUDGET_LIMITS_SUSPEND_FROM || '';
+  const suspensionUntil = env.BUDGET_LIMITS_SUSPEND_UNTIL || '';
+  let limitSuspension: { startsAt: number; endsAt: number } | undefined;
+  if (suspensionFrom || suspensionUntil) {
+    const timestamp = z.iso.datetime({ offset: true });
+    const startsAt = Date.parse(suspensionFrom); const endsAt = Date.parse(suspensionUntil);
+    if (!timestamp.safeParse(suspensionFrom).success || !timestamp.safeParse(suspensionUntil).success ||
+        !Number.isSafeInteger(startsAt) || !Number.isSafeInteger(endsAt) || endsAt <= startsAt || endsAt - startsAt > 48 * 60 * 60_000) {
+      throw new Error('Budget suspension requires explicit ISO timestamps with timezone and a positive window of at most 48 hours');
+    }
+    limitSuspension = { startsAt, endsAt };
+  }
   const budget = {
     directory: env.PRIVATE_DIR || '.private', currency: 'USD' as const,
     runLimitUsd: amount('RUN_BUDGET_USD', '1回の調査の費用上限'),
     dayLimitUsd: amount('DAY_BUDGET_USD', '1日の費用上限'),
     eventLimitUsd: amount('EVENT_BUDGET_USD', 'イベント全体の費用上限'),
+    limitSuspension,
   };
   const maximumCosts = {
     llm: amount('MAX_LLM_CALL_USD', 'LLMの1呼出あたり最大見積額'),
@@ -47,12 +61,16 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   const sttComplete = explicitStt ? Boolean(providers.sttApiKey && providers.sttBaseUrl && providers.sttModel) : Boolean(providers.orcaApiKey && providers.orcaSttModel);
   const sttMax = Number(env.MAX_STT_CALL_USD || NaN);
   const liveEnabled = env.AGENT_LIVE_ENABLED === 'true' && missing.length === 0;
+  const streamingApiKey = env.OPENAI_API_KEY || '';
+  const streamingModel = env.OPENAI_STREAMING_ASR_MODEL || 'gpt-live-transcribe';
+  const streamingAudioMaxPerMinute = Number(env.STREAMING_ASR_MAX_USD_PER_MINUTE || NaN);
   const status: RuntimeStatus = {
+    streamingEnabled: liveEnabled && !!streamingApiKey && streamingModel === 'gpt-live-transcribe' && Number.isFinite(streamingAudioMaxPerMinute) && streamingAudioMaxPerMinute > 0,
     liveEnabled, missing: env.AGENT_LIVE_ENABLED === 'true' ? missing : ['実APIモードの有効化', ...missing],
     sttEnabled: liveEnabled && sttComplete && Number.isFinite(sttMax) && sttMax > 0,
     xEnabled: liveEnabled && !!providers.xEnabled,
     accessCodeRequired: accessCode.length > 0, version: '0.1.0',
   };
-  return { host, port, origin, accessCode, providers, budget, maximumCosts, sttMax, status };
+  return { host, port, origin, accessCode, providers, budget, maximumCosts, sttMax, status, streamingApiKey, streamingModel, streamingAudioMaxPerMinute };
 }
 export type AppConfig = ReturnType<typeof readConfig>;

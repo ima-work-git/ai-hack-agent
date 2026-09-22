@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AudioInputSource, OsEventTypeList } from '@evenrealities/even_hub_sdk'
+import { AudioInputSource, ImageRawDataUpdateResult, OsEventTypeList } from '@evenrealities/even_hub_sdk'
 import { G2Runtime, type G2Bridge, type G2Event, type GlassesView } from '../src/integrations/g2-runtime'
 
 function deferred<T>() {
@@ -44,6 +44,86 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     await runtime.dispose()
   })
 
+  it('keeps the four-row board in one bounded display container without paging', async () => {
+    const { bridge } = fakeBridge()
+    const runtime = new G2Runtime({ bridge })
+    await runtime.connect()
+    const page = vi.mocked(bridge.createStartUpPageContainer).mock.calls[0]![0]
+    const containers = page.textObject!
+    for (const container of containers) {
+      expect(container.xPosition! + container.width!).toBeLessThanOrEqual(576)
+      expect(container.yPosition! + container.height!).toBeLessThanOrEqual(288)
+    }
+    const content = containers.find(container => container.containerName === 'content')!
+    expect(content.height! - 2 * content.paddingLength!).toBeGreaterThanOrEqual(160)
+    const rows = ['1 事:公開事実 問:質問例？', '2 事:公開事実 問:質問例？', '3 事:未確認 問:—', '4 事:未確認 問:—'].join('\n')
+    expect(await runtime.render({ header: '調査結果 2/4件', content: rows, footer: '事=事実 問=質問 / 原文はスマホ' })).toBe(true)
+    const update = vi.mocked(bridge.textContainerUpgrade).mock.calls.find(([value]) => value.containerName === 'content')![0]
+    expect(update.content).toBe(rows)
+    expect(update.content!.split('\n')).toHaveLength(4)
+    await runtime.dispose()
+  })
+
+  it('serializes two small-text image tiles and rebuilds ordinary text if images are rejected', async () => {
+    const { bridge } = fakeBridge()
+    bridge.updateImageRawData = vi.fn(async () => ImageRawDataUpdateResult.success)
+    bridge.rebuildPageContainer = vi.fn(async () => true)
+    const runtime = new G2Runtime({ bridge, enableImageText: true, renderBitmap: () => [new Uint8Array([1]), new Uint8Array([2])] })
+    expect(await runtime.connect()).toBe(true)
+    const page = vi.mocked(bridge.createStartUpPageContainer).mock.calls[0]![0]
+    expect(page.containerTotalNum).toBe(5)
+    expect(page.imageObject).toHaveLength(2)
+    expect(page.textObject!.filter(container => container.isEventCapture === 1)).toHaveLength(1)
+    expect([...page.textObject!, ...page.imageObject!].map(container => container.zOrderIndex)).toEqual([1, 2, 3, 4, 5])
+    for (const image of page.imageObject!) {
+      expect(image.width).toBe(288); expect(image.height).toBe(144)
+      expect(image.xPosition! + image.width!).toBeLessThanOrEqual(576)
+      expect(image.yPosition! + image.height!).toBeLessThanOrEqual(288)
+    }
+    vi.mocked(bridge.updateImageRawData).mockClear()
+    const first = deferred<ImageRawDataUpdateResult>()
+    vi.mocked(bridge.updateImageRawData).mockImplementationOnce(() => first.promise)
+    const rendered = runtime.render(view('small'))
+    expect(bridge.updateImageRawData).toHaveBeenCalledTimes(1)
+    const newerFooter = runtime.render({ ...view('small'), footer: '音声認識中' })
+    first.resolve(ImageRawDataUpdateResult.success)
+    expect(await rendered).toBe(false)
+    expect(await newerFooter).toBe(true)
+    expect(bridge.updateImageRawData).toHaveBeenCalledTimes(2)
+    vi.mocked(bridge.textContainerUpgrade).mockClear()
+    expect(await runtime.render({ ...view('small'), footer: '音声認識中：最新の言葉' })).toBe(true)
+    expect(bridge.updateImageRawData).toHaveBeenCalledTimes(2)
+    expect(bridge.textContainerUpgrade).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(bridge.textContainerUpgrade).mock.calls[0]![0].containerName).toBe('footer')
+    vi.mocked(bridge.updateImageRawData).mockResolvedValue(ImageRawDataUpdateResult.imageSizeInvalid)
+    expect(await runtime.render(view('fallback'))).toBe(true)
+    expect(bridge.rebuildPageContainer).toHaveBeenCalledOnce()
+    expect(vi.mocked(bridge.rebuildPageContainer).mock.calls[0]![0].containerTotalNum).toBe(3)
+    expect(vi.mocked(bridge.textContainerUpgrade).mock.calls.some(([update]) => update.content === 'fallback-content')).toBe(true)
+    await runtime.dispose()
+  })
+
+  it('does not reuse a bitmap cache after an interrupted pair or a background transition', async () => {
+    const f = fakeBridge()
+    f.bridge.updateImageRawData = vi.fn(async () => ImageRawDataUpdateResult.success)
+    f.bridge.rebuildPageContainer = vi.fn(async () => true)
+    const runtime = new G2Runtime({ bridge: f.bridge, enableImageText: true, renderBitmap: () => [new Uint8Array([1]), new Uint8Array([2])] })
+    await runtime.connect(); await runtime.render(view('original'))
+    vi.mocked(f.bridge.updateImageRawData).mockClear()
+    const first = deferred<ImageRawDataUpdateResult>()
+    vi.mocked(f.bridge.updateImageRawData).mockImplementationOnce(() => first.promise)
+    const interrupted = runtime.render(view('changed'))
+    const restored = runtime.render(view('original'))
+    first.resolve(ImageRawDataUpdateResult.success)
+    expect(await interrupted).toBe(false); expect(await restored).toBe(true)
+    expect(f.bridge.updateImageRawData).toHaveBeenCalledTimes(3)
+    f.event({ sysEvent: { eventType: OsEventTypeList.FOREGROUND_EXIT_EVENT } })
+    f.event({ sysEvent: { eventType: OsEventTypeList.FOREGROUND_ENTER_EVENT } })
+    expect(await runtime.render(view('original'))).toBe(true)
+    expect(f.bridge.updateImageRawData).toHaveBeenCalledTimes(5)
+    await runtime.dispose()
+  })
+
   it.each([1, 2, 3])('rejects startup return code %s', async code => {
     const { bridge } = fakeBridge()
     vi.mocked(bridge.createStartUpPageContainer).mockResolvedValue(code)
@@ -80,6 +160,33 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     expect(onAudio).toHaveBeenCalledOnce()
     expect(f.bridge.audioControl).toHaveBeenLastCalledWith(false)
     expect(runtime.status).toEqual({ state: 'connected', reason: 'duration_limit' })
+    await runtime.dispose()
+  })
+
+  it('accepts more than one minute of continuous PCM until explicit stop closes the microphone', async () => {
+    const f = fakeBridge()
+    const onAudio = vi.fn()
+    const runtime = new G2Runtime({ bridge: f.bridge, onAudio })
+    await runtime.connect()
+    expect(await runtime.startAudio({ continuous: true })).toBe(true)
+    const frame = { audioEvent: { audioPcm: new Uint8Array(32_000), source: AudioInputSource.Glasses } }
+    for (let second = 0; second < 61; second++) {
+      await vi.advanceTimersByTimeAsync(1_000)
+      f.event(frame)
+    }
+    expect(runtime.status.state).toBe('recording')
+    expect(onAudio).toHaveBeenCalledTimes(61)
+    expect(f.bridge.audioControl).toHaveBeenCalledExactlyOnceWith(true, AudioInputSource.Glasses)
+    expect(await runtime.stopAudio()).toBe(true)
+    expect(f.bridge.audioControl).toHaveBeenLastCalledWith(false)
+    f.event(frame)
+    expect(onAudio).toHaveBeenCalledTimes(61)
+    // A subsequent ordinary start still has the original 30-second protection.
+    expect(await runtime.startAudio()).toBe(true)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(runtime.status).toEqual({ state: 'connected', reason: 'duration_limit' })
+    f.event(frame)
+    expect(onAudio).toHaveBeenCalledTimes(61)
     await runtime.dispose()
   })
 
@@ -253,12 +360,12 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     await runtime.dispose()
   })
 
-  it('stops in the background and does not replay a card or restart the microphone on return', async () => {
+  it.each([false, true])('stops in the background without automatic replay or recording (continuous=%s)', async continuous => {
     const f = fakeBridge()
     const onAudio = vi.fn()
     const runtime = new G2Runtime({ bridge: f.bridge, onAudio })
     await runtime.connect()
-    await runtime.startAudio()
+    await runtime.startAudio({ continuous })
     f.event({ sysEvent: { eventType: OsEventTypeList.FOREGROUND_EXIT_EVENT } })
     f.event(pcm())
     expect(onAudio).not.toHaveBeenCalled()
@@ -271,12 +378,12 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     await runtime.dispose()
   })
 
-  it('stops on device disconnect, requires explicit reconnect, and disposes subscriptions', async () => {
+  it.each([false, true])('stops on disconnect and requires explicit reconnect (continuous=%s)', async continuous => {
     const f = fakeBridge()
     const onAudio = vi.fn()
     const runtime = new G2Runtime({ bridge: f.bridge, onAudio })
     await runtime.connect()
-    await runtime.startAudio()
+    await runtime.startAudio({ continuous })
     f.device('disconnected')
     expect(await runtime.startAudio()).toBe(false)
     f.device('connected')

@@ -37,6 +37,97 @@ function fixture(reply: (input: SelectionInput) => unknown = () => emptyAssessme
 const hasLoneSurrogate = (text: string) => [...text].some(character => character.length === 1 && character.charCodeAt(0) >= 0xd800 && character.charCodeAt(0) <= 0xdfff);
 
 describe('bounded evidence selection — mocked model, no network or assertion of semantic identity', () => {
+  it.each([
+    '新型コロナワクチンの副反応について話しながら公開イベントに登壇しました。',
+    'I write books and discuss my medication side effects.',
+  ])('rejects an entire mixed health fact while retaining safe facts and the source: %s', async sensitive => {
+    const original = source('primary', `${target.companyName}の${target.personName}です。${sensitive} ${FACT}`);
+    const f = fixture(data => {
+      const facts = data.sources[0]!.excerpts.flatMap(excerpt => excerpt.facts.map(fact => fact.text));
+      expect(facts.some(fact => fact.includes(sensitive))).toBe(false);
+      expect(facts).toContain(FACT);
+      return { ...emptyAssessment(), cards: [select(data)] };
+    });
+    const result = await f.assess([original]);
+    expect(result.value.cards.map(card => card.fact)).toEqual([FACT]);
+    expect(f.inputs[0]!.sources[0]!.text).toContain(sensitive);
+  });
+
+  it.each(['suggestedQuestion', 'displayQuestion'] as const)('rejects a sensitive generated %s even when the fact is safe', async field => {
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), [field]: 'ワクチンの副反応は？' }] }));
+    expect((await f.assess()).value.cards).toEqual([]);
+  });
+
+  it('selects exact source facts for an unregistered public figure without a company, preserving primary-evidence assessment', async () => {
+    const subject = { personName: '架空作家', companyName: '' };
+    const original = source('primary', `${subject.personName}の公式プロフィールです。${FACT}`);
+    const f = fixture(data => ({ ...emptyAssessment(), publicPersonVerified: true, publicIdentitySourceIds: ['primary'], cards: [select(data)] }));
+    const result = await f.assess([original], subject);
+    expect(result.value).toMatchObject({ publicPersonVerified: true, publicIdentitySourceIds: ['primary'], cards: [{ sourceId: 'primary', fact: FACT, excerpt: original.text }] });
+    expect(f.inputs[0]!.sources[0]!.cardEligible).toBe(true);
+    expect(f.api).toHaveBeenCalledOnce();
+  });
+
+  it('uses a curated public nickname only on its verified account and does not treat co-occurrence as proof', async () => {
+    const subject = { personName: '西村博之', companyName: '' };
+    const profile = { ...source('primary', `公開プロフィール: ひろゆき (@hirox246)\n${FACT}`), kind: 'x' as const, url: 'https://x.com/hirox246' };
+    const other = { ...source('other', `ひろゆきです。${OTHER_FACT}`), url: 'https://x.com/unrelated' };
+    const f = fixture(() => ({ ...emptyAssessment(), identityVerified: false, publicPersonVerified: false, publicIdentitySourceIds: [], needsConfirmation: true }));
+    const result = await f.assess([profile, other], subject);
+    expect(f.inputs[0]!.sources.find(item => item.sourceId === 'primary')?.cardEligible).toBe(true);
+    expect(f.inputs[0]!.sources.find(item => item.sourceId === 'other')?.cardEligible).toBe(false);
+    expect(result.value).toMatchObject({ identityVerified: false, needsConfirmation: true, cards: [] });
+    expect(f.inputs[0]!.sources).toHaveLength(2);
+  });
+
+  it('adds a concise exact display phrase and complete question in the same assessment without replacing evidence', async () => {
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), displayFact: '設計手法を紹介しました。', displayQuestion: '研究会で印象に残った質問は？' }] }));
+    const result = await f.assess();
+    expect(result.value.cards[0]).toMatchObject({ fact: FACT, excerpt: primary().text, displayFact: '設計手法を紹介しました。', displayQuestion: '研究会で印象に残った質問は？' });
+    expect(f.api).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['新しい設計を発明しました。', '活動で得た学びは？'],
+    ['設計手法…', '活動で得た学びは…'],
+    ['長'.repeat(29), '問'.repeat(26) + '？'],
+    [42, '途中で切れた問い'],
+  ])('drops invalid display helpers but retains the original source-backed card %#', async (displayFact, displayQuestion) => {
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), displayFact, displayQuestion }] }));
+    const card = (await f.assess()).value.cards[0]!;
+    expect(card.fact).toBe(FACT); expect(card).not.toHaveProperty('displayFact');
+    if (displayQuestion !== '活動で得た学びは？') expect(card).not.toHaveProperty('displayQuestion');
+  });
+
+  it('rejects a raw substring that would remove a negation from the selected fact', async () => {
+    const fact = '公開研究会に登壇したことはありません。';
+    const original = source('primary', `${target.companyName}の${target.personName}です。${fact}`);
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data, 'primary', fact), displayFact: '公開研究会に登壇', displayQuestion: '研究会との関わりは？' }] }));
+    const card = (await f.assess([original])).value.cards[0]!;
+    expect(card.fact).toBe(fact); expect(card).not.toHaveProperty('displayFact');
+  });
+
+  it('allows four selected raw facts and rejects a fifth rather than changing research-call limits', async () => {
+    const facts = ['第一の公開活動です。', '第二の公開活動です。', '第三の公開活動です。', '第四の公開活動です。', '第五の公開活動です。'];
+    const original = source('primary', `${target.companyName}の${target.personName}です。${facts.join('')}`);
+    const f = fixture(data => ({ ...emptyAssessment(), cards: facts.slice(0, 4).map(fact => select(data, 'primary', fact)) }));
+    expect((await f.assess([original])).value.cards.map(card => card.fact)).toEqual(facts.slice(0, 4));
+    const over = fixture(data => ({ ...emptyAssessment(), cards: facts.map(fact => select(data, 'primary', fact)) }));
+    await expect(over.assess([original])).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+  });
+
+  it('uses only verified alias equivalents as eligibility clues while preserving ambiguity and literal facts', async () => {
+    const known = { personName: '千代田まどか', companyName: 'Microsoft' };
+    // Synthetic sentences exercise attribution handling, not real biography.
+    const matched = source('primary', `Madoka Chiyoda (Chomado), Microsoft. ${FACT}`);
+    const other = source('other-company', 'ちょまど。別会社の記述です。');
+    const f = fixture(data => ({ ...emptyAssessment(), identityVerified: false, needsConfirmation: true, cards: [] }));
+    const result = await f.assess([matched, other], known);
+    expect(f.inputs[0]!.sources.map(item => [item.sourceId, item.cardEligible])).toEqual([['primary', true], ['other-company', false]]);
+    expect(f.inputs[0]!.sources[0]!.excerpts[0]!.facts.some(fact => fact.text === FACT)).toBe(true);
+    expect(result.value).toMatchObject({ identityVerified: false, needsConfirmation: true, cards: [] });
+  });
+
   it('maps a known selection to the exact original source and raw contiguous excerpt', async () => {
     const f = fixture(data => ({ ...emptyAssessment(), cards: [select(data)] }));
     const original = primary();
