@@ -48,4 +48,15 @@ AWSを使う場合は以下を準備する。
 - [ ] 合成データ、ログのマスキング、保存期間、デモ後の削除を決める。
 - [ ] 障害時の停止・復旧手順と、イベント後のリソース撤去時刻を記録する。
 
-テーマ未定の段階では、VPC、DB、キュー等の具体構成や常時稼働する有料リソースを確定しない。
+配備先は未決定。G2プラグインから認証付きバックエンドへ接続し、STT・検索・モデルの秘密をサーバー側で管理する。必要な範囲から構成を決める。
+
+## 今回のサービスで追加する準備
+
+- Even G2：[既存方式と実機確認](EVEN_G2_INTEGRATION.md)。
+- STT：PCM 16kHz mono入力、日本語の人名/会社名、遅延、課金、保持条件を短い許可済み音声で検証する。OrcaRouterのSTT対応は未確認なので前提にしない。
+- Web検索：利用可能なAPIを選び、検索と本文取得の権限・費用・サイズ/時間制限を決める。検索抜粋だけを裏取り済みとしない。
+- X：公式の人物検索APIは候補取得に利用可能。開発者アクセスと従量課金の確認が必要。未契約ならMVPの必須経路から外す。[人物検索](https://docs.x.com/x-api/users/search/introduction)、[料金](https://docs.x.com/x-api/getting-started/pricing)
+- Facebook：Pages向けAPIと個人プロフィールを区別する。任意人物のプロフィールを取得できるとは未確認。必要な許可と読取可能性が確認できるまで公式サイト中心で進める。[Meta公式サンプルのアクセス前提](https://github.com/fbsamples/reels_publishing_apis/blob/main/insta_reels_publishing_api_sample/README.md#before-you-start)
+- 削除/非公開後も検索結果に古い内容が残り得るため、取得本文を確認できない主張をカードに載せない。[X公式説明](https://help.x.com/en/safety-and-security/remove-x-profile-from-google-search)
+
+確認日：2026-09-22。SNS API契約・資格情報・実リクエストは未確認。金額上限と送信先・保持条件を設定してからliveで接続する。
