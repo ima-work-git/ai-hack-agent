@@ -9,7 +9,7 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getEleme
 const app = document.getElementById('app')!;
 app.innerHTML = `
 <header class="masthead"><div class="wordmark"><span class="mark" aria-hidden="true">◌</span><div><div class="eyebrow">AI HACK · EVEN G2</div><h1>会話アシスタント <span class="muted">/ 仮称</span></h1></div></div><span class="pill" id="connection">スマートフォン表示</span></header>
-<section class="panel login hidden" id="login"><div class="eyebrow">WELCOME BACK</div><h2>セッションを始める</h2><p class="muted">会話のデータは最長15分で削除されます。再開時もマイクは自動で起動しません。</p><form id="login-form"><label for="access-code">利用コード</label><input type="password" id="access-code" autocomplete="current-password" minlength="16"><div class="controls"><button class="primary" type="submit">開始する</button></div><p class="status" id="login-status" role="status"></p></form></section>
+<section class="panel login hidden" id="login"><div class="eyebrow">WELCOME BACK</div><h2>セッションを始める</h2><p class="muted">会話のデータは最長15分で削除されます。再開時もマイクは自動で起動しません。</p><form id="login-form"><label for="access-code">利用コード</label><input type="password" id="access-code" autocomplete="current-password" minlength="16"><label class="check"><input id="remember-device" type="checkbox" checked><span>この端末では12時間、利用コードの入力を省略する</span></label><div class="controls"><button class="primary" type="submit">開始する</button></div><p class="status" id="login-status" role="status"></p></form></section>
 <main class="workspace hidden" id="workspace"><div class="intro"><div><div class="eyebrow">LESS SEARCHING, MORE CONVERSATION</div><h1>目の前の会話に、次のきっかけを。</h1><p>公開情報の調査と根拠の確認を、エージェントに任せる。</p></div><span class="mode-badge" id="mode-badge">体験デモ · 架空の人物・固定データ</span></div>
 <div class="notice hidden" id="resume-notice">前のセッションがあります。内容を表示するには、再開してください。<div class="controls"><button id="resume">前の内容を再開</button></div></div>
 <div class="grid"><div><section class="panel"><div class="section-head"><h2>会話から調べる</h2><span class="section-number">01 / INPUT</span></div><p class="muted">氏名と会社名を手がかりに、公開情報を確認します。</p>
@@ -18,7 +18,7 @@ app.innerHTML = `
 <div class="controls"><button id="sample">架空の会話を入力</button><button id="connect">G2を接続</button></div>
 <label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。音声は最大30秒で停止し、文字起こし後に破棄します。</span></label>
 <div class="controls"><button id="record" disabled>音声で入力</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
-<div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><div id="candidates" class="candidates"></div>
+<div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><div id="candidates" class="candidates"></div>
 </section><section class="panel"><div class="section-head"><h2>エージェントの判断</h2><span class="section-number">02 / PROCESS</span></div><p id="trace-empty" class="empty-trace">調査中の判断と復旧の記録がここに表示されます。</p><ol id="trace" class="trace" aria-label="調査の処理履歴"></ol><details><summary>実APIの設定状況</summary><p class="muted" id="configuration"></p><p class="muted">APIキーと費用上限はサーバー側で設定します。</p></details></section></div>
 <div><div class="section-head"><h2>会話のヒント</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="グラス表示のプレビュー"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="hud-body"><p class="hud-fact" id="fact">話題は、根拠とともに。</p><p class="hud-question" id="question">会話を入力して調査を始めると、<br>確認した情報と質問のヒントが届きます。</p></div><div class="hud-foot"><span id="hud-source">公開情報だけを調査</span><span id="hud-expiry">MAX 3 CARDS</span></div></section><nav class="card-nav" aria-label="カード切替"><button id="previous" aria-label="前のカード" disabled>←</button><span id="card-count">0 / 0</span><button id="next" aria-label="次のカード" disabled>→</button></nav>
 <div class="notice" id="result-note">体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。</div><div class="metrics"><div class="metric"><strong id="metric-time">—</strong><span>調査にかかった時間</span></div><div class="metric"><strong id="metric-calls">—</strong><span>AI / 検索 / 本文</span></div><div class="metric"><strong id="metric-cost">—</strong><span id="cost-label">実費は未計測</span></div></div><section class="panel evidence-panel"><div class="section-head"><h2>情報の根拠</h2><span class="section-number">04 / EVIDENCE</span></div><p class="muted" id="source-empty">本文の引用・出典・取得時刻を、カードごとに確認できます。</p><div id="sources"></div></section></div></div></main>
@@ -26,6 +26,8 @@ app.innerHTML = `
 
 let runtimeStatus: RuntimeStatus;
 let token = '';
+let authGeneration = 0;
+let authBusy = false;
 let revision = 0;
 let currentId = '';
 let viewToken = 'initial';
@@ -114,21 +116,63 @@ function showResult(value: ResearchResult) {
   renderCard();
 }
 async function api(path: string, init: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(init.headers); if (token) headers.set('Authorization', `Bearer ${token}`);
+  const sentToken = token; const sentGeneration = authGeneration;
+  const headers = new Headers(init.headers); if (sentToken) headers.set('Authorization', `Bearer ${sentToken}`);
   const response = await fetch(path, { ...init, headers, cache: 'no-store', credentials: 'same-origin' });
-  if (!response.ok) { const body = await response.json().catch(() => ({})); if (response.status === 401) { token = ''; clearResult(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); } throw new Error(body.message || '処理できませんでした。接続・設定・入力を確認してください。'); }
+  if (!response.ok) { const body = await response.json().catch(() => ({})); if (response.status === 401 && token === sentToken && authGeneration === sentGeneration) { token = ''; expiresAt = 0; controller?.abort(); controller = null; running = false; currentId = crypto.randomUUID(); newViewToken(); void stopRecording(false); clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = 'ログインの有効期限が切れました。再読み込みするか、利用コードで開始してください。'; } throw new Error(body.message || '処理できませんでした。接続・設定・入力を確認してください。'); }
   return response;
 }
 const json = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+function acceptSession(data: { token: string; revision: number; expiresAt: number; hasPrevious: boolean; interrupted: boolean }) {
+  token = data.token; revision = data.revision; expiresAt = data.expiresAt;
+  $<HTMLInputElement>('access-code').value = ''; $('login').classList.add('hidden'); $('workspace').classList.remove('hidden');
+  $<HTMLInputElement>('consent').checked = false;
+  $('resume-notice').classList.toggle('hidden', !data.hasPrevious && !data.interrupted);
+  if (data.interrupted) status('前の調査が中断されました。マイクは停止しています。必要なら再調査してください。');
+  refreshControls();
+}
+function setAuthBusy(busy: boolean) {
+  authBusy = busy;
+  for (const control of $('login-form').querySelectorAll<HTMLInputElement | HTMLButtonElement>('input, button')) control.disabled = busy;
+}
 async function login() {
+  if (authBusy) return; setAuthBusy(true);
+  const generation = ++authGeneration;
   try {
-    const response = await api('/api/session', json({ accessCode: $<HTMLInputElement>('access-code').value }));
-    const data = await response.json(); token = data.token; revision = data.revision; expiresAt = data.expiresAt;
-    $<HTMLInputElement>('access-code').value = ''; $('login').classList.add('hidden'); $('workspace').classList.remove('hidden');
-    $('resume-notice').classList.toggle('hidden', !data.hasPrevious && !data.interrupted);
-    if (data.interrupted) status('前の調査が中断されました。マイクは停止しています。必要なら再調査してください。');
-    refreshControls();
-  } catch (error) { $('login-status').textContent = error instanceof Error ? error.message : '開始できませんでした。'; }
+    const response = await api('/api/session', json({ accessCode: $<HTMLInputElement>('access-code').value, rememberDevice: runtimeStatus.accessCodeRequired && $<HTMLInputElement>('remember-device').checked }));
+    const data = await response.json(); if (generation !== authGeneration) return;
+    acceptSession(data);
+  } catch (error) { if (generation === authGeneration) $('login-status').textContent = error instanceof Error ? error.message : '開始できませんでした。'; }
+  finally { setAuthBusy(false); }
+}
+async function restoreLogin(): Promise<boolean> {
+  if (authBusy) return false; setAuthBusy(true);
+  const generation = ++authGeneration;
+  const abort = new AbortController(); const timeout = setTimeout(() => abort.abort(), 8_000);
+  try {
+    const response = await fetch('/api/session/restore', { ...json({}), credentials: 'same-origin', cache: 'no-store', signal: abort.signal });
+    if (!response.ok) {
+      if (response.status !== 401 && generation === authGeneration) $('login-status').textContent = 'ログインを再開できませんでした。利用コードで開始できます。';
+      return false;
+    }
+    const data = await response.json(); if (generation !== authGeneration) return false;
+    acceptSession(data); return true;
+  } catch {
+    if (generation === authGeneration) $('login-status').textContent = '接続を確認して再読み込みするか、利用コードで開始してください。';
+    return false;
+  } finally { clearTimeout(timeout); setAuthBusy(false); }
+}
+function clearConversation() {
+  clearResult(); lastInput = null; $<HTMLTextAreaElement>('text').value = '';
+  $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
+  $('resume-notice').classList.add('hidden'); $<HTMLInputElement>('consent').checked = false;
+}
+async function expireSession() {
+  const generation = ++authGeneration; expiresAt = 0;
+  await cancel(); if (generation !== authGeneration) return;
+  token = ''; clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden');
+  $('login-status').textContent = '15分経過したため会話データを削除しました。';
+  if (await restoreLogin()) status('前の会話データを削除し、新しいセッションを開始しました。マイクは停止しています。');
 }
 async function research(selectedCandidateId?: string, preparedId?: string) {
   const text = $<HTMLTextAreaElement>('text').value.trim(); if (!text) { status('会社名と氏名、または会話を入力してください。'); return; }
@@ -242,13 +286,13 @@ $('resume').onclick = async () => {
     } else status('再表示できる有効なカードはありません。必要なら再調査してください。');
   } catch (e) { if (token === expectedToken && viewToken === expectedView) status(e instanceof Error ? e.message : '再開できませんでした。'); }
 };
-$('end').onclick = async () => { await cancel(); try { await api('/api/session', { method: 'DELETE' }); token = ''; expiresAt = 0; lastInput = null; $<HTMLTextAreaElement>('text').value = ''; $('trace').replaceChildren(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = 'セッションの会話データを削除しました。'; } catch (e) { status(e instanceof Error ? e.message : '削除を確認できませんでした。'); } };
+$('end').onclick = async () => { if (authBusy) return; setAuthBusy(true); authGeneration++; await cancel(); try { await api('/api/session/forget', json({})); token = ''; expiresAt = 0; clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = '会話データと、この端末のログインの記憶を削除しました。'; } catch (e) { status(e instanceof Error ? e.message : '削除を確認できませんでした。'); } finally { setAuthBusy(false); } };
 document.addEventListener('visibilitychange', () => { if (document.hidden) { void cancel(); } });
-window.addEventListener('pagehide', () => { audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
-setInterval(() => { if (result?.cards.some(card => Date.parse(card.expiresAt) <= Date.now())) renderCard(); if (token && expiresAt <= Date.now()) { void cancel(); token = ''; clearResult(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = '15分経過したため終了しました。再度開始してください。'; } }, 15_000);
+window.addEventListener('pagehide', () => { authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
+setInterval(() => { if (result?.cards.some(card => Date.parse(card.expiresAt) <= Date.now())) renderCard(); if (token && expiresAt > 0 && expiresAt <= Date.now()) void expireSession(); }, 15_000);
 try {
   runtimeStatus = await (await fetch('/api/status', { cache: 'no-store' })).json();
   $('live-option').toggleAttribute('disabled', !runtimeStatus.liveEnabled); $('configuration').textContent = runtimeStatus.liveEnabled ? '実APIでの調査を利用できます。課金額は設定した上限内で予約します。' : `未設定：${runtimeStatus.missing.join('、')}`;
   if (runtimeStatus.sttEnabled) $('audio-hint').textContent = 'G2接続時はグラス、未接続時はスマートフォンのマイクを使用';
-  $('login').classList.remove('hidden'); if (!runtimeStatus.accessCodeRequired) { $('access-code').classList.add('hidden'); document.querySelector('label[for="access-code"]')?.classList.add('hidden'); await login(); }
+  $('login').classList.remove('hidden'); if (!runtimeStatus.accessCodeRequired) { $('access-code').classList.add('hidden'); document.querySelector('label[for="access-code"]')?.classList.add('hidden'); await login(); } else await restoreLogin();
 } catch { $('login').classList.remove('hidden'); $('login-status').textContent = 'サーバーに接続できません。再読み込みしてください。'; }

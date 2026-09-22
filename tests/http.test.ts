@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -25,8 +25,9 @@ async function fixture(options: { config?: Partial<AppConfig>; provider?: (input
     ORCAROUTER_API_KEY: 'test-not-a-key', ORCAROUTER_MODEL: 'test-model', TAVILY_API_KEY: 'test-not-a-key',
     STT_API_KEY: 'test-not-a-key', STT_API_BASE_URL: 'https://example.invalid/v1', STT_MODEL: 'test-model',
   } : {}) }), ...options.config };
-  const store = new SessionStore(directory, () => now);
-  const api = createApiHandler(config, { store, now: () => now, provider: options.provider, liveProvider: options.liveProvider });
+  let store = new SessionStore(directory, () => now);
+  const createHandler = () => createApiHandler(config, { store, now: () => now, provider: options.provider, liveProvider: options.liveProvider });
+  let api = createHandler();
   cleanups.push(async () => { api.close(); await rm(directory, { recursive: true, force: true }); });
   const request = async (path: string, init: { method?: string; headers?: Record<string, string>; body?: string | Uint8Array } = {}) => {
     const headers = Object.fromEntries(Object.entries({ Host: 'localhost:4173', Origin: 'http://localhost:4173', ...init.headers }).map(([key, value]) => [key.toLowerCase(), value]));
@@ -40,7 +41,7 @@ async function fixture(options: { config?: Partial<AppConfig>; provider?: (input
     const emitter = new EventEmitter();
     const res = Object.assign(emitter, {
       destroyed: false, writableEnded: false, headersSent: false, statusCode: 200,
-      setHeader(name: string, value: string) { responseHeaders.set(name, value); },
+      setHeader(name: string, value: string | string[]) { responseHeaders.delete(name); for (const item of Array.isArray(value) ? value : [value]) responseHeaders.append(name, item); },
       writeHead(status: number, extra: Record<string, string> = {}) { this.statusCode = status; for (const [k, v] of Object.entries(extra)) responseHeaders.set(k, v); this.headersSent = true; ready(); return this; },
       flushHeaders() { this.headersSent = true; ready(); },
       write(value: string) { chunks.push(value); return true; },
@@ -50,9 +51,9 @@ async function fixture(options: { config?: Partial<AppConfig>; provider?: (input
     await headersDone;
     return { status: res.statusCode, headers: responseHeaders, text: () => bodyDone, json: async () => JSON.parse(await bodyDone) };
   };
-  const login = async (cookie?: string, accessCode = 'test-access-code-123') => {
-    const response = await request('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) }, body: JSON.stringify({ accessCode }) });
-    return { response, body: await response.json(), cookie: response.headers.get('set-cookie')?.split(';')[0] ?? '' };
+  const login = async (cookie?: string, accessCode = 'test-access-code-123', rememberDevice = false) => {
+    const response = await request('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) }, body: JSON.stringify({ accessCode, rememberDevice }) });
+    return { response, body: await response.json(), cookie: response.headers.getSetCookie().map(value => value.split(';')[0]).join('; ') };
   };
   const body = (revision = 1, extra: Record<string, unknown> = {}) => ({ text: DEMO_TEXT, requestId: randomUUID(), subjectRevision: revision, mode: 'demo', scenario: 'normal', ...extra });
   const research = async (token: string, data = body()) => {
@@ -60,9 +61,157 @@ async function fixture(options: { config?: Partial<AppConfig>; provider?: (input
     const text = await response.text();
     return { response, events: text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) };
   };
-  return { config, directory, store, api, request, login, body, research, advance: (duration: number) => { now += duration; } };
+  return { config, directory, get store() { return store; }, get api() { return api; }, request, login, body, research, advance: (duration: number) => { now += duration; },
+    restart: (accessCode?: string) => { api.close(); if (accessCode !== undefined) config.accessCode = accessCode; store = new SessionStore(directory, () => now); api = createHandler(); } };
 }
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
+
+describe('remembered-device HTTP authentication', () => {
+  const post = (f: Awaited<ReturnType<typeof fixture>>, path: 'restore' | 'forget', cookie: string, headers: Record<string, string> = {}, body = '{}') =>
+    f.request(`/api/session/${path}`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json', ...headers }, body });
+  const remembered = (cookie: string) => cookie.split('; ').find(value => value.startsWith('rememberedDevice='))!;
+
+  it('requires opt-in and refuses to restore from a conversation cookie alone', async () => {
+    const f = await fixture();
+    const response = await f.request('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessCode: f.config.accessCode }) });
+    expect(response.status).toBe(200);
+    const cookie = response.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
+    expect(response.headers.getSetCookie().find(value => value.startsWith('rememberedDevice='))).toContain('Max-Age=0');
+    expect((await post(f, 'restore', cookie)).status).toBe(401);
+  });
+
+  it('restores a valid session, rotates its bearer, and neither extends either TTL nor returns or executes its previous data', async () => {
+    const provider = vi.fn(() => createFixtureProvider('normal'));
+    const liveProvider = { ...createFixtureProvider('normal'), transcribe: vi.fn(async () => ({ value: DEMO_TEXT })) };
+    const f = await fixture({ provider, liveProvider });
+    const auth = await f.login(undefined, undefined, true);
+    const first = await f.research(auth.body.token);
+    expect(first.events.at(-1).result.status).toBe('ready');
+    const before = await readFile(join(f.directory, 'device-logins.json'), 'utf8');
+    f.advance(60_000);
+    const restored = await post(f, 'restore', auth.cookie);
+    const body = await restored.json();
+    expect(restored.status).toBe(200);
+    expect(body).toMatchObject({ expiresAt: auth.body.expiresAt, hasPrevious: true, revision: 1 });
+    expect(body.token).not.toBe(auth.body.token);
+    expect(body.token.split('.')[0]).toBe(auth.body.token.split('.')[0]);
+    expect(body).not.toHaveProperty('result'); expect(body).not.toHaveProperty('input');
+    expect(restored.headers.getSetCookie()).toHaveLength(1);
+    expect(restored.headers.get('set-cookie')).not.toContain('rememberedDevice');
+    expect(await readFile(join(f.directory, 'device-logins.json'), 'utf8')).toBe(before);
+    expect((await f.request('/api/session/resume', { method: 'POST', headers: { Authorization: `Bearer ${auth.body.token}` } })).status).toBe(401);
+    expect(provider).toHaveBeenCalledOnce(); expect(liveProvider.transcribe).not.toHaveBeenCalled();
+  });
+
+  it('survives restart while creating an empty session after the original conversation expires at fifteen minutes', async () => {
+    const f = await fixture(); const auth = await f.login(undefined, undefined, true);
+    await f.research(auth.body.token);
+    f.restart();
+    expect((await post(f, 'restore', auth.cookie)).status).toBe(200);
+    f.advance(900_000);
+    const restored = await post(f, 'restore', auth.cookie); const body = await restored.json();
+    expect(restored.status).toBe(200);
+    expect(body).toMatchObject({ hasPrevious: false, revision: 0, interrupted: false });
+    expect(body.token.split('.')[0]).not.toBe(auth.body.token.split('.')[0]);
+    expect(await readdir(join(f.directory, 'sessions'))).not.toContain(`${auth.body.token.split('.')[0]}.enc`);
+    const previous = await f.request('/api/session/resume', { method: 'POST', headers: { Authorization: `Bearer ${body.token}` } });
+    expect(await previous.json()).toMatchObject({ result: null, input: null });
+  });
+
+  it('expires device access at twelve hours without sliding the expiry on restore', async () => {
+    const f = await fixture(); const auth = await f.login(undefined, undefined, true);
+    f.advance(12 * 60 * 60_000 - 1);
+    expect((await post(f, 'restore', auth.cookie)).status).toBe(200);
+    f.advance(1);
+    expect((await post(f, 'restore', auth.cookie)).status).toBe(401);
+  });
+
+  it('requires same-origin JSON for restore and forget, rejects extra data and altered cookies', async () => {
+    const f = await fixture(); const auth = await f.login(undefined, undefined, true);
+    for (const path of ['restore', 'forget'] as const) {
+      for (const Origin of ['', 'https://attacker.invalid', 'http://127.0.0.1:4173']) expect((await post(f, path, auth.cookie, { Origin })).status).toBe(403);
+      expect((await post(f, path, auth.cookie, { 'Content-Type': 'text/plain' })).status).toBe(415);
+      expect((await post(f, path, auth.cookie, {}, '{"accessCode":"injected"}')).status).toBe(400);
+    }
+    const original = remembered(auth.cookie); const token = original.split('=')[1]!;
+    const wrong = `${original.split('=')[0]}=${token[0] === 'a' ? 'b' : 'a'}${token.slice(1)}`;
+    expect((await post(f, 'restore', wrong)).status).toBe(401);
+    expect((await post(f, 'restore', `${auth.cookie}; ${original}`)).status).toBe(401);
+    expect((await post(f, 'restore', auth.cookie)).status).toBe(200);
+  });
+
+  it('sets HTTPS-only device cookies and revokes the server record on authenticated logout', async () => {
+    const f = await fixture({ config: { origin: 'https://fixture.invalid' } });
+    const auth = await f.login(undefined, undefined, true);
+    const cookies = auth.response.headers.getSetCookie();
+    expect(cookies).toHaveLength(2);
+    for (const cookie of cookies) expect(cookie).toContain('Path=/api; HttpOnly; SameSite=Strict; Secure; Expires=');
+    const logout = await f.request('/api/session', { method: 'DELETE', headers: { Authorization: `Bearer ${auth.body.token}`, Cookie: auth.cookie } });
+    expect(logout.status).toBe(200);
+    expect(logout.headers.getSetCookie()).toHaveLength(2);
+    for (const cookie of logout.headers.getSetCookie()) expect(cookie).toContain('Max-Age=0');
+    f.restart();
+    expect((await post(f, 'restore', auth.cookie)).status).toBe(401);
+    expect(JSON.parse(await readFile(join(f.directory, 'device-logins.json'), 'utf8')).devices).toEqual([]);
+  });
+
+  it('forgets both credentials and conversation data without a live bearer after expiry', async () => {
+    const f = await fixture(); const auth = await f.login(undefined, undefined, true);
+    await f.research(auth.body.token); f.advance(900_001);
+    const forgotten = await post(f, 'forget', auth.cookie);
+    expect(forgotten.status).toBe(200);
+    expect(await forgotten.json()).toEqual({ ended: true });
+    expect(forgotten.headers.getSetCookie()).toHaveLength(2);
+    expect(await readdir(join(f.directory, 'sessions'))).toEqual([]);
+    expect((await post(f, 'restore', auth.cookie)).status).toBe(401);
+  });
+
+  it('forget stops an active request and discards a delayed result', async () => {
+    const provider = createFixtureProvider('normal');
+    let release!: () => void; let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    provider.search = async () => { started(); await new Promise<void>(resolve => { release = resolve; }); return { value: [], actualUsd: 0 }; };
+    const f = await fixture({ provider: () => provider }); const auth = await f.login(undefined, undefined, true);
+    const pending = f.research(auth.body.token); await entered;
+    expect((await post(f, 'forget', auth.cookie)).status).toBe(200);
+    const response = await pending;
+    expect(response.events.at(-1).type).toBe('error');
+    expect(response.events.some(event => event.type === 'result')).toBe(false);
+    release();
+    expect(await readdir(join(f.directory, 'sessions'))).toEqual([]);
+  });
+
+  it('remember=false revokes an old device record and a new explicit code login rotates remembered credentials', async () => {
+    const f = await fixture(); const original = await f.login(undefined, undefined, true);
+    const rotated = await f.login(original.cookie, undefined, true);
+    expect(remembered(rotated.cookie)).not.toBe(remembered(original.cookie));
+    expect((await post(f, 'restore', original.cookie)).status).toBe(401);
+    expect((await post(f, 'restore', rotated.cookie)).status).toBe(200);
+    const plain = await f.login(rotated.cookie);
+    expect(plain.response.status).toBe(200);
+    expect(plain.response.headers.getSetCookie().find(value => value.startsWith('rememberedDevice='))).toContain('Max-Age=0');
+    expect((await post(f, 'restore', rotated.cookie)).status).toBe(401);
+  });
+
+  it('fails closed on changed access codes or corrupt persistence but permits fresh verified code login', async () => {
+    const f = await fixture(); const original = await f.login(undefined, undefined, true);
+    f.restart('replacement-fixture-code');
+    expect((await post(f, 'restore', original.cookie)).status).toBe(401);
+    const fresh = await f.login(original.cookie, 'replacement-fixture-code', true);
+    expect(fresh.response.status).toBe(200);
+    await writeFile(join(f.directory, 'device-logins.json'), '{corrupt');
+    expect((await post(f, 'restore', fresh.cookie)).status).toBe(401);
+  });
+
+  it('rate-limits restore attempts independently from the access-code route', async () => {
+    const f = await fixture();
+    for (let attempt = 0; attempt < 20; attempt++) expect((await post(f, 'restore', '')).status).toBe(401);
+    expect((await post(f, 'restore', '')).status).toBe(429);
+    expect((await f.login()).response.status).toBe(200);
+    f.advance(60_000);
+    expect((await post(f, 'restore', '')).status).toBe(401);
+  });
+});
 
 describe('authenticated HTTP boundary', () => {
   it('rejects hostile Origin/Host and leaves non-API routes to the app', async () => {
