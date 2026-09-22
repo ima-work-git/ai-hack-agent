@@ -119,6 +119,64 @@ describe('conversation-wide audio and research budget', () => {
     } finally { spy.mockRestore(); }
   });
 
+  it('selects only saved search candidates, reuses the conversation budget, and issues a once-only research window', async () => {
+    let takeTicket!: (ticket: string) => streamingRelay.StreamGrant;
+    const reset = vi.fn(() => true);
+    const spy = vi.spyOn(streamingRelay, 'createStreamingRelay').mockImplementation(options => {
+      takeTicket = options.takeTicket;
+      return { upgrade: () => false, resetConversation: reset, closeConversation: vi.fn(), close: vi.fn() };
+    });
+    try {
+      const normal = createFixtureProvider('normal'); const search = vi.fn(normal.search);
+      const provider: ResearchProvider = { ...normal, mode: 'live', search, plan: async (input, signal) => ({ ...await normal.plan(input, signal), actualUsd: 0.001 }) };
+      const f = await fixture({ live: true, liveProvider: provider, config: { maximumCosts: { llm: 0.001, search: 0.001, page: 0 }, streamingApiKey: 'fake-key', streamingModel: 'gpt-live-transcribe', streamingAudioMaxPerMinute: 0.03 } });
+      f.config.status.streamingEnabled = true;
+      const auth = await f.login(); const other = await f.login(); const group = await (await start(f, auth.body.token)).json();
+      const post = (path: string, body: unknown, token = auth.body.token, origin = 'http://localhost:4173') => f.request(path, { method: 'POST', headers: { Authorization: `Bearer ${token}`, Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const issued = await post('/api/conversation/stream', { conversationId: group.conversationId });
+      takeTicket((await issued.json()).ticket).onFinal(DEMO_TEXT);
+      const identified = await post('/api/conversation/identify', { conversationId: group.conversationId, requestId: randomUUID(), subjectRevision: 1, text: DEMO_TEXT });
+      const candidates = (await identified.json()).searchCandidates;
+      expect(candidates.length).toBeGreaterThan(1);
+      const choice = candidates.find((candidate: { query: string }) => candidate.query.includes('公開活動')) ?? candidates[1];
+      const body = { conversationId: group.conversationId, choiceId: choice.id };
+      expect((await post('/api/conversation/search-choice', body, other.body.token)).status).toBe(409);
+      expect((await post('/api/conversation/search-choice', body, auth.body.token, 'https://foreign.invalid')).status).toBe(403);
+      expect((await post('/api/conversation/search-choice', { ...body, choiceId: 'forged' })).status).toBe(409);
+      expect((await post('/api/conversation/search-choice', { ...body, target: { personName: 'Injected', companyName: '' } })).status).toBe(400);
+      const selected = await post('/api/conversation/search-choice', body); expect(selected.status).toBe(200);
+      const prepared = await selected.json(); expect(prepared.target).toEqual(choice.target); expect(prepared.query).toBe(choice.query); expect(reset).toHaveBeenCalledWith(group.conversationId);
+      const input = f.body(prepared.subjectRevision, { mode: 'live', conversationId: group.conversationId, requestId: prepared.requestId, text: choice.query });
+      expect((await f.research(auth.body.token, input)).response.status).toBe(200);
+      expect(search.mock.calls[0]![0]).toContain(choice.target.personName);
+      if (choice.query.includes('公開活動')) expect(search.mock.calls[0]![0]).toContain('公開活動');
+      expect((await f.research(auth.body.token, input)).response.status).toBe(409);
+      const ledger = JSON.parse(await readFile(join(f.directory, 'budget.json'), 'utf8')); expect(Object.keys(ledger.runs)).toEqual([group.conversationId]);
+      await post('/api/conversation/reset', { conversationId: group.conversationId });
+      expect((await post('/api/conversation/search-choice', body)).status).toBe(409);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('expires saved keyword choices with conversation data even if authentication is kept alive', async () => {
+    let takeTicket!: (ticket: string) => streamingRelay.StreamGrant;
+    const spy = vi.spyOn(streamingRelay, 'createStreamingRelay').mockImplementation(options => {
+      takeTicket = options.takeTicket; return { upgrade: () => false, closeConversation: vi.fn(), close: vi.fn() };
+    });
+    try {
+      const normal = createFixtureProvider('normal');
+      const f = await fixture({ live: true, liveProvider: { ...normal, mode: 'live' }, config: { streamingApiKey: 'fake-key', streamingModel: 'gpt-live-transcribe', streamingAudioMaxPerMinute: 0.03 } });
+      f.config.status.streamingEnabled = true;
+      const auth = await f.login(); const group = await (await start(f, auth.body.token)).json();
+      const post = (path: string, body: unknown) => f.request(path, { method: 'POST', headers: { Authorization: `Bearer ${auth.body.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const issued = await post('/api/conversation/stream', { conversationId: group.conversationId }); takeTicket((await issued.json()).ticket).onFinal(DEMO_TEXT);
+      const response = await post('/api/conversation/identify', { conversationId: group.conversationId, requestId: randomUUID(), subjectRevision: 1, text: DEMO_TEXT });
+      const choice = (await response.json()).searchCandidates[0]; expect(choice).toBeDefined();
+      f.advance(14 * 60_000); expect((await post('/api/conversation/keepalive', { conversationId: group.conversationId })).status).toBe(200);
+      f.advance(60_001);
+      expect((await post('/api/conversation/search-choice', { conversationId: group.conversationId, choiceId: choice.id })).status).toBe(409);
+    } finally { spy.mockRestore(); }
+  });
+
   it('reserves STT, research and later windows against one server-issued parent budget', async () => {
     const provider: ResearchProvider = { ...createFixtureProvider('normal'), mode: 'live', transcribe: vi.fn(async () => ({ value: DEMO_TEXT })) };
     const f = await fixture({ live: true, liveProvider: provider }); const auth = await f.login();

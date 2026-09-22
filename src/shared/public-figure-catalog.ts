@@ -1,6 +1,7 @@
 /** Search/correction candidates, not an identity-verification allowlist.
  * Names/readings below were checked against the linked primary profiles on
- * 2026-09-22. A romanized reading is transliterated to kana, not a quoted furigana.
+ * each record's checkedOn date. A romanized reading is transliterated to kana,
+ * not a quoted furigana.
  * commonASRHomophones are possible correction prompts (not measured error rates,
  * verified aliases, or permission to silently replace a name in raw speech).
  * A same-sounding/private person may be intended. Resolve ambiguity separately;
@@ -12,6 +13,8 @@ export interface PublicFigureCatalogEntry {
   readonly kana: string;
   readonly publicNames: readonly string[];
   readonly commonASRHomophones: readonly string[];
+  /** Keep an uncertain ASR spelling selectable even when a company corroborates it. */
+  readonly asrCorrectionRequiresConfirmation?: boolean;
   readonly officialProfileUrl: string;
   readonly readingSourceUrl?: string;
   readonly readingBasis?: 'kana-primary-source' | 'romanized-primary-source';
@@ -63,6 +66,38 @@ export const PUBLIC_FIGURE_CATALOG: readonly PublicFigureCatalogEntry[] = [
     readingBasis: 'romanized-primary-source',
     xHandle: 'chomado', xHandleSourceUrl: 'https://developer.microsoft.com/ja-jp/advocates/madoka-chiyoda',
     checkedOn: '2026-09-22',
+  },
+  {
+    id: 'kazunari-ito', canonicalName: '伊東和成', kana: 'いとうかずなり',
+    publicNames: ['かずなり', 'MacopeninSUTABA', '@MacopeninSUTABA'],
+    // User-reported ASR variants are correction candidates, never public aliases.
+    commonASRHomophones: ['かすなり', '数なり', 'かつなり'],
+    asrCorrectionRequiresConfirmation: true,
+    officialProfileUrl: 'https://third-scope.com/about/',
+    readingSourceUrl: 'https://ai-reskilling.jp/', readingBasis: 'kana-primary-source',
+    xHandle: 'macopeninsutaba', xHandleSourceUrl: 'https://qiita.com/KNR109',
+    companyClues: [{ name: '株式会社サードスコープ', aliases: ['サードスコープ', 'Third Scope'], sourceUrl: 'https://third-scope.com/about/' }],
+    checkedOn: '2026-09-23',
+  },
+  {
+    id: 'taishi-yamasaki', canonicalName: '山崎大志', kana: 'やまさきたいし',
+    publicNames: ['Taishi', 'たいし', 'Taishi Yamasaki', 'taishiyade', '@taishiyade'],
+    commonASRHomophones: [],
+    officialProfileUrl: 'https://taishiyade.com/',
+    readingSourceUrl: 'https://gist.github.com/Taishi-Y', readingBasis: 'romanized-primary-source',
+    xHandle: 'taishiyade', xHandleSourceUrl: 'https://note.com/taishiyade/n/n64b013945dfc',
+    companyClues: [{ name: '株式会社AlphaByte', aliases: ['AlphaByte', 'AlphaByte株式会社', 'アルファバイト'], sourceUrl: 'https://taishiyade.com/' }],
+    checkedOn: '2026-09-23',
+  },
+  {
+    id: 'tre-conigli', canonicalName: '宇佐美良治', kana: 'うさみりょうじ',
+    publicNames: ['宇佐美 良治', 'tre_conigli', '@tre_conigli'], commonASRHomophones: [],
+    officialProfileUrl: 'https://cyberace.co.jp/event/2259/',
+    readingSourceUrl: 'https://www.wantedly.com/companies/company_5212273/post_articles/889192',
+    readingBasis: 'kana-primary-source',
+    xHandle: 'tre_conigli', xHandleSourceUrl: 'https://techplay.jp/event/973052',
+    companyClues: [{ name: '株式会社CyberACE', aliases: ['CyberACE', 'サイバーエース', '株式会社サイバーエース'], sourceUrl: 'https://cyberace.co.jp/event/2259/' }],
+    checkedOn: '2026-09-23',
   },
   {
     id: 'masayoshi-son', canonicalName: '孫正義', kana: 'そんまさよし',

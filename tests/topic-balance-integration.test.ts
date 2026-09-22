@@ -69,7 +69,7 @@ describe('balanced topics through the complete agent', () => {
     expect(result.cards.map(card => card.topic)).toEqual(['recent_x', 'recent_x', 'popular_x', 'profile']);
     expect(result.cards.map(card => card.sourceId)).toEqual(['post-2', 'post-1', 'post-3', 'web-1']);
     expect(f.order).toEqual(['search-1', 'x-profile', 'post-1', 'post-2', 'post-3', 'search-2', 'web-1', 'web-2', 'assess']);
-    expect(f.provider.search).toHaveBeenNthCalledWith(1, expect.stringContaining('@chomado'), expect.any(AbortSignal));
+    expect(f.provider.search).toHaveBeenNthCalledWith(1, expect.stringContaining('@chomado'), expect.any(AbortSignal), expect.any(Function));
     expect(vi.mocked(f.provider.search).mock.calls[1]![0]).not.toContain('@');
     expect(result.usage).toMatchObject({ searches: 2, pages: 6, llm: 2 });
     expect(result.usage.llm).toBeLessThanOrEqual(3); expect(f.provider.assess).toHaveBeenCalledOnce();
@@ -242,7 +242,7 @@ describe('OrcaRouter balanced assessment candidate boundaries', () => {
     const provider = createLiveProvider({ orcaApiKey: 'fixture-only', orcaModel: 'fixture-model', tavilyApiKey: 'fixture-only' }, { fetch: api });
     const result = await provider.assess(target, all, new AbortController().signal);
     expect(api).toHaveBeenCalledOnce(); expect(result.value.cards).toHaveLength(4);
-    expect(result.value.cards.find(card => card.sourceId === 'post-3')?.suggestedQuestion).toBe('2021年、投稿のきっかけは？');
+    expect(result.value.cards.find(card => card.sourceId === 'post-3')?.suggestedQuestion).toBe('当時、その活動で印象に残ったことは？');
     for (const card of result.value.cards) {
       const original = all.find(source => source.sourceId === card.sourceId)!;
       expect(original.text).toContain(card.excerpt); expect(card.excerpt).toContain(card.fact);

@@ -1,5 +1,5 @@
 import { TargetSchema, type Target } from '../src/shared/contracts.ts';
-import { normalizeIdentity, VERIFIED_IDENTITY_ALIASES } from '../src/shared/identity-aliases.ts';
+import { isIdentityNameSpan, normalizeIdentity, VERIFIED_IDENTITY_ALIASES } from '../src/shared/identity-aliases.ts';
 import { PUBLIC_FIGURE_CATALOG, type PublicFigureCatalogEntry } from '../src/shared/public-figure-catalog.ts';
 import { LunaCorrectionSchema, type createLunaCorrection } from './luna-correction.ts';
 import { ProviderError } from './provider-contract.ts';
@@ -24,8 +24,7 @@ function literal(text: string, value: string): string | undefined {
   while (from <= normalized.length) {
     const found = normalized.indexOf(needle, from); if (found < 0) return undefined;
     const start = spans[found]?.start; const end = spans[found + needle.length - 1]?.end;
-    if (start !== undefined && end !== undefined && (!/^[a-z0-9]+$/u.test(needle) ||
-        !/[a-z0-9]/iu.test(text[start - 1] ?? '') && !/[a-z0-9]/iu.test(text[end] ?? ''))) return text.slice(start, end);
+    if (start !== undefined && end !== undefined && isIdentityNameSpan(text, value, start, end)) return text.slice(start, end);
     from = found + 1;
   }
   return undefined;
@@ -128,6 +127,7 @@ export async function resolvePersonTarget(input: {
       return { target: rawTarget, candidate: { personName: entry.canonicalName, companyName: '' }, hint: '同音・別名の公開人物候補はありますが、会話で指定された会社と一致しません。入力された人物と会社をそのまま調べます。', usedLuna: false };
     }
     const clue = rawTarget.companyName || companyClue(entry, current, previous);
+    if (!exact.length && entry.asrCorrectionRequiresConfirmation) return confirmation(entry, clue);
     if (exact.length || clue) return { target: { personName: entry.canonicalName, companyName: clue }, usedLuna: false,
       ...(normalizedName(rawName) !== normalizedName(entry.canonicalName) ? { hint: `「${rawName}」を${clue ? '会社名の手掛かり' : '確認済みの公開表記'}から「${entry.canonicalName}」の候補として調べます。` } : {}),
     };
@@ -159,7 +159,7 @@ export async function resolvePersonTarget(input: {
     hint: '人名の補正候補と会話中の会社が一致しないため、人物と会社の入力を維持します。',
   };
   // Confidence alone never permits replacing a person's name.
-  if (!correction.needsConfirmation && correction.confidence >= 0.9 && compatible(entry, rawTarget.companyName)) {
+  if (!entry.asrCorrectionRequiresConfirmation && !correction.needsConfirmation && correction.confidence >= 0.9 && compatible(entry, rawTarget.companyName)) {
     return { target: { personName: entry.canonicalName, companyName: rawTarget.companyName }, usedLuna: true,
       hint: `「${rawName}」を会社名と音声補正から「${entry.canonicalName}」の候補として調べます。`,
     };

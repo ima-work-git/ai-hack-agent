@@ -28,6 +28,11 @@ const companyAliases: readonly VerifiedIdentityAlias[] = [{
 const existingPublicSources: Readonly<Record<string, readonly string[]>> = {
   'hiroyuki-nishimura': ['https://guild.to/', 'https://guild.to/news/弊社のメンバー達がノンタイトルで激突すること/', 'https://shueisha.online/list/persons/65a92f368ce1158c700000ca'],
   'takafumi-horie': ['https://snsgroup.jp/', 'https://zeroichi.media/', 'https://columbia.jp/artist-info/horiemon/prof.html', 'https://www.youtube.com/watch?v=uFkcC8UYQy4'],
+  // The two-page follow-up allowance must include the public activity profile
+  // and the self-published account link; reading references remain available later.
+  'kazunari-ito': ['https://third-scope.com/about/', 'https://qiita.com/KNR109'],
+  'taishi-yamasaki': ['https://taishiyade.com/', 'https://note.com/taishiyade/n/n64b013945dfc'],
+  'tre-conigli': ['https://cyberace.co.jp/event/2259/', 'https://zenn.dev/tre_conigli', 'https://code-agents.connpass.com/event/342240/'],
 };
 const unique = (values: readonly string[]) => [...new Set(values)];
 const catalogAliases: VerifiedIdentityAlias[] = PUBLIC_FIGURE_CATALOG.flatMap(record => {
@@ -48,50 +53,44 @@ const catalogAliases: VerifiedIdentityAlias[] = PUBLIC_FIGURE_CATALOG.flatMap(re
   ];
 });
 
-// Public links checked on 2026-09-22; the X profile lookups were also verified.
-// Readings absent from primary sources are deliberately not guessed. These
-// records choose research candidates, not proof of the conversation partner.
-const judgeAliases: VerifiedIdentityAlias[] = [
-  {
-    id: 'taishi-yamasaki', canonicalName: '山崎大志',
-    personNames: ['山崎大志', 'Taishi Yamasaki', 'taishiyade', '@taishiyade'],
-    companyName: '株式会社AlphaByte', companyNames: ['AlphaByte', 'AlphaByte株式会社', '株式会社AlphaByte', 'アルファバイト'],
-    xHandle: 'taishiyade',
-    sourceUrls: ['https://taishiyade.com/', 'https://note.com/taishiyade/n/n64b013945dfc'],
-  },
-  {
-    id: 'tre-conigli', canonicalName: '宇佐美良治', personNames: ['宇佐美良治', 'tre_conigli', '@tre_conigli'],
-    companyName: '株式会社CyberACE', companyNames: ['CyberACE', '株式会社CyberACE', 'サイバーエース', '株式会社サイバーエース'],
-    xHandle: 'tre_conigli',
-    sourceUrls: ['https://cyberace.co.jp/event/2259/', 'https://zenn.dev/tre_conigli', 'https://code-agents.connpass.com/event/342240/'],
-  },
-  {
-    id: 'kazunari-ito', canonicalName: '伊東和成', personNames: ['伊東和成', 'かずなり', 'いとうかずなり', 'MacopeninSUTABA', '@MacopeninSUTABA'],
-    companyName: '株式会社サードスコープ', companyNames: ['株式会社サードスコープ', 'サードスコープ', 'Third Scope'],
-    xHandle: 'macopeninsutaba',
-    sourceUrls: ['https://third-scope.com/about/', 'https://qiita.com/KNR109', 'https://ai-reskilling.jp/'],
-  },
-].flatMap(record => {
-  const common = { scope: 'public-person' as const, personNames: record.personNames, xHandle: record.xHandle,
-    checkedOn: '2026-09-22', sourceUrls: record.sourceUrls };
-  return [
-    { ...common, id: record.id, target: { personName: record.canonicalName, companyName: '' }, companyNames: [] },
-    { ...common, id: `${record.id}-company`, target: { personName: record.canonicalName, companyName: record.companyName }, companyNames: record.companyNames },
-  ];
-});
-
-export const VERIFIED_IDENTITY_ALIASES: readonly VerifiedIdentityAlias[] = [...companyAliases, ...catalogAliases, ...judgeAliases];
+export const VERIFIED_IDENTITY_ALIASES: readonly VerifiedIdentityAlias[] = [...companyAliases, ...catalogAliases];
 
 export const normalizeIdentity = (value: string) => value.normalize('NFKC').replace(/[ァ-ヶ]/gu, character => String.fromCharCode(character.charCodeAt(0) - 0x60)).replace(/\s+/g, '').toLocaleLowerCase('ja');
 const normalize = normalizeIdentity;
 const personName = (value: string) => normalize(value).replace(/(?:さん|氏|様)$/, '');
 const listed = (value: string, names: readonly string[]) => names.some(name => normalize(name) === normalize(value));
+
+/** Validate a name match at UTF-16 offsets in the supplied text. Short kana
+ * names also occur inside everyday words, e.g. たいし in たいしたことない. */
+export function isIdentityNameSpan(text: string, name: string, start: number, end: number): boolean {
+  const needle = personName(name);
+  if (/^@?[a-z0-9_]+$/u.test(needle)) {
+    const before = (text[start - 1] ?? '').normalize('NFKC').toLowerCase();
+    const after = (text[end] ?? '').normalize('NFKC').toLowerCase();
+    return !/[a-z0-9_]/u.test(before) && !/[a-z0-9_]/u.test(after);
+  }
+  const before = normalize(text.slice(0, start)).at(-1) ?? '';
+  const after = normalize(text.slice(end));
+  if (/^[ぁ-ゖー]{2,3}$/u.test(needle)) {
+    if (/[ぁ-ゖー]/u.test(before) && !/[のはがをにとで]/u.test(before)) return false;
+    if (/^[ぁ-ゖー]/u.test(after) && !/^(?:さん|さま|くん|ちゃん|です|は|が|を|に|の|と|で)/u.test(after)) return false;
+  }
+  return true;
+}
+
 function contains(text: string, name: string): boolean {
   const haystack = normalize(text); const needle = normalize(name);
   if (!needle) return false;
   // Latin aliases must be whole names, not substrings of another identity.
   if (/^[a-z0-9]+$/.test(needle)) return new RegExp(`(^|[^a-z0-9])${Array.from(needle).join('\\s*')}(?=$|[^a-z0-9])`, 'u').test(text.normalize('NFKC').toLocaleLowerCase('ja'));
-  return haystack.includes(needle);
+  let from = 0;
+  while (from <= haystack.length) {
+    const found = haystack.indexOf(needle, from);
+    if (found < 0) return false;
+    if (isIdentityNameSpan(haystack, needle, found, found + needle.length)) return true;
+    from = found + 1;
+  }
+  return false;
 }
 
 export function verifiedAliasForTarget(target: Target): VerifiedIdentityAlias | undefined {

@@ -1,4 +1,10 @@
-import type { Assessment, EvidenceSource, PlanDecision, ResearchInput, SearchHit, Target } from '../src/shared/contracts.ts';
+import type { Assessment, EvidenceSource, PlanDecision, ResearchInput, SearchHit, SearchOperation, Target } from '../src/shared/contracts.ts';
+
+/** Describes the adapter's actual request, never its raw transcript or credentials. */
+export type SearchObserver = (search: SearchOperation) => void;
+export function notifySearch(observer: SearchObserver | undefined, search: SearchOperation): void {
+  try { observer?.(search); } catch { /* Display observers cannot alter provider execution. */ }
+}
 
 export interface ProviderResult<T> {
   value: T;
@@ -14,9 +20,9 @@ export interface ProviderResult<T> {
 export interface ResearchProvider {
   readonly mode: 'demo' | 'live';
   plan(input: ResearchInput, signal: AbortSignal): Promise<ProviderResult<PlanDecision>>;
-  search(query: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>>;
-  searchRecent?(query: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>>;
-  searchArchive?(query: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>>;
+  search(query: string, signal: AbortSignal, onSearch?: SearchObserver): Promise<ProviderResult<SearchHit[]>>;
+  searchRecent?(query: string, signal: AbortSignal, onSearch?: SearchObserver): Promise<ProviderResult<SearchHit[]>>;
+  searchArchive?(query: string, signal: AbortSignal, onSearch?: SearchObserver): Promise<ProviderResult<SearchHit[]>>;
   fetchPage(hit: SearchHit, signal: AbortSignal): Promise<ProviderResult<EvidenceSource>>;
   assess(target: Target, sources: EvidenceSource[], signal: AbortSignal): Promise<ProviderResult<Assessment>>;
   transcribe?(bytes: Uint8Array, mimeType: string, signal: AbortSignal, context?: string): Promise<ProviderResult<string>>;

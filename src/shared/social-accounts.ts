@@ -30,7 +30,7 @@ export const VERIFIED_SOCIAL_IDENTITIES: readonly VerifiedSocialIdentity[] = [
   },
   {
     id: 'taishi-yamasaki', canonicalName: '山崎大志',
-    personNames: ['山崎大志', 'Taishi Yamasaki', 'taishiyade', '@taishiyade'],
+    personNames: ['山崎大志', 'やまさきたいし', 'Taishi', 'たいし', 'Taishi Yamasaki', 'taishiyade', '@taishiyade'],
     companyNames: ['AlphaByte', 'AlphaByte株式会社', '株式会社AlphaByte', 'アルファバイト'],
     accounts: [
       { platform: 'instagram', handle: 'taishi_jade', profileUrl: 'https://www.instagram.com/taishi_jade', identitySourceUrl: 'https://taishiyade.com/' },

@@ -34,7 +34,13 @@ describe('bounded balanced X topics', () => {
   it('makes exactly one lookup, one five-post recent page, and one twenty-post full-archive page', async () => {
     const api = apiMock();
     const { provider, page } = providerWith(api);
-    const result = await provider.search('@fixture_person', signal());
+    const observed = vi.fn();
+    const result = await provider.search('@fixture_person', signal(), observed);
+    expect(observed.mock.calls.map(([search]) => search)).toEqual([
+      { provider: 'x', operation: 'account_lookup', query: '@fixture_person' },
+      { provider: 'x', operation: 'recent_posts', query: '@fixture_person' },
+      { provider: 'x', operation: 'archive_search', query: 'from:fixture_person -is:retweet -is:reply' },
+    ]);
     expect(api).toHaveBeenCalledTimes(3);
     const urls = api.mock.calls.map(call => new URL(String(call[0])));
     expect(urls.map(url => url.origin)).toEqual(Array(3).fill('https://api.x.com'));
@@ -198,7 +204,14 @@ describe('bounded balanced X topics', () => {
       })), meta: { result_count: 10, next_token: 'must-not-follow' } });
       return base(input, init);
     });
-    const { value: hits } = await providerWith(api).provider.search('@fixture_person', signal());
+    const onSearch = vi.fn();
+    const { value: hits } = await providerWith(api).provider.search('@fixture_person', signal(), onSearch);
+    expect(onSearch.mock.calls.map(([search]) => search)).toEqual([
+      { provider: 'x', operation: 'account_lookup', query: '@fixture_person' },
+      { provider: 'x', operation: 'recent_posts', query: '@fixture_person' },
+      { provider: 'x', operation: 'archive_search', query: 'from:fixture_person -is:retweet -is:reply' },
+      { provider: 'x', operation: 'recent_posts', query: 'from:fixture_person -is:retweet -is:reply' },
+    ]);
     expect(hits.slice(0, 4).map(hit => [hit.url.split('/').at(-1), hit.topic])).toEqual([
       ['fixture_person', 'profile'], ['109', 'recent_x'], ['108', 'recent_x'], ['200', 'popular_x'],
     ]);

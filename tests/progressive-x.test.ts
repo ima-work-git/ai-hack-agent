@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createLiveProvider } from '../server/providers.ts';
 import type { ProviderConfig } from '../server/provider-contract.ts';
-import type { EvidenceSource } from '../src/shared/contracts.ts';
+import type { EvidenceSource, SearchOperation } from '../src/shared/contracts.ts';
 
 const now = new Date('2026-09-22T00:00:00.000Z');
 const config: ProviderConfig = { orcaApiKey: 'fixture-orca', orcaModel: 'fixture-model', tavilyApiKey: 'fixture-search',
@@ -27,6 +27,51 @@ const providerWith = (api: typeof fetch) => createLiveProvider(config, { fetch: 
 afterEach(() => vi.useRealTimers());
 
 describe('progressive X retrieval', () => {
+  it('observes actual lookup, recent and archive inputs before each API call, without claiming a cached lookup ran', async () => {
+    const actual: SearchOperation[] = []; const api = apiMock(); const base = api.getMockImplementation()!;
+    api.mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      const expected = url.pathname.endsWith('/search/all')
+        ? { provider: 'x', operation: 'archive_search', query: url.searchParams.get('query') }
+        : { provider: 'x', operation: url.pathname.endsWith('/tweets') ? 'recent_posts' : 'account_lookup', query: '@fixture_person' };
+      expect(actual.at(-1)).toEqual(expected);
+      expect(actual).toHaveLength(api.mock.calls.length);
+      return base(input, init);
+    });
+    const provider = providerWith(api); const observe = (search: SearchOperation) => { actual.push(search); };
+    await provider.searchRecent!('@FIXTURE_PERSON', signal(), observe);
+    expect(actual.map(search => search.operation)).toEqual(['account_lookup', 'recent_posts']);
+    await provider.searchRecent!('@fixture_person', signal(), observe);
+    expect(actual).toHaveLength(2);
+    await provider.searchArchive!('@fixture_person', signal(), observe);
+    expect(actual.at(-1)).toEqual({ provider: 'x', operation: 'archive_search', query: 'from:fixture_person -is:retweet -is:reply' });
+    expect(JSON.stringify(actual)).not.toContain(config.xBearerToken);
+  });
+
+  it('keeps per-call observers isolated and does not notify a cancelled request', async () => {
+    const api = apiMock(); const provider = providerWith(api);
+    const first = vi.fn(); const second = vi.fn();
+    await Promise.all([provider.searchRecent!('@first_fixture', signal(), first), provider.searchRecent!('@other_fixture', signal(), second)]);
+    expect(first.mock.calls.map(([search]) => search.query)).toEqual(['@first_fixture', '@first_fixture']);
+    expect(second.mock.calls.map(([search]) => search.query)).toEqual(['@other_fixture', '@other_fixture']);
+    const controller = new AbortController(); controller.abort();
+    await expect(provider.searchRecent!('@third_fixture', controller.signal, first)).rejects.toBeDefined();
+    expect(first).toHaveBeenCalledTimes(2); expect(api).toHaveBeenCalledTimes(4);
+    await expect(provider.searchRecent!('@last_fixture', signal(), () => { throw new Error('display failed'); })).resolves.toBeDefined();
+  });
+
+  it('observes the precise web query sent to the search API', async () => {
+    const observed = vi.fn();
+    const api = vi.fn<typeof fetch>(async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      expect(observed).toHaveBeenLastCalledWith({ provider: 'web', operation: 'web_search', query: body.query });
+      return json({ results: [] });
+    });
+    await providerWith(api).searchRecent!('架空花子 架空会社 公開活動', signal(), observed);
+    expect(observed).toHaveBeenCalledOnce();
+    expect(JSON.stringify(observed.mock.calls)).not.toContain(config.tavilyApiKey);
+  });
+
   it('returns profile and latest posts with two calls and never starts an archive request', async () => {
     const api = apiMock();
     const base = api.getMockImplementation()!;
@@ -182,5 +227,44 @@ describe('social assessment facts', () => {
       return json({ choices: [{ message: { content: JSON.stringify(assessment) } }] });
     });
     await providerWith(api).assess(target, [socialSource('instagram', '別の本文。'), identity], signal());
+  });
+});
+
+describe('specific historical questions', () => {
+  const body = '模擬の製品展示で木製の試作機を披露しました。';
+  const target = { personName: '千代田まどか', companyName: 'Microsoft' };
+  const source: EvidenceSource = { sourceId: 'historic-fixture', kind: 'x', topic: 'popular_x', url: 'https://x.com/chomado/status/123',
+    title: '模擬の過去投稿', retrievedAt: now.toISOString(), text: `公開プロフィール: 千代田まどか (@chomado)\nMicrosoftの模擬プロフィールです。\n公開投稿: ${body}`,
+    xPost: { id: '123', authorId: '456', username: 'chomado', createdAt: '2020-01-01T00:00:00.000Z',
+      likeCount: 10, repostCount: 1, replyCount: 0, quoteCount: 0, selectionScope: 'full_archive_sample', text: body } };
+  async function assessQuestion(suggestedQuestion: string, displayQuestion?: string) {
+    const api = vi.fn<typeof fetch>(async (_input, init) => {
+      const request = JSON.parse(String(init!.body)); const data = JSON.parse(request.messages[1].content);
+      expect(request.messages[0].content).toContain('Ask for an answer the fact does not already give');
+      expect(request.messages[0].content).toContain('preserve the same specific focus');
+      const fact = data.sources[0].excerpts.flatMap((excerpt: { facts: { factId: string; text: string }[] }) => excerpt.facts)
+        .find((fact: { text: string }) => fact.text === body);
+      expect(fact).toBeDefined();
+      return json({ choices: [{ message: { content: JSON.stringify({ identityVerified: true, needsConfirmation: false,
+        candidates: [], followUpQuery: null, reason: '模擬の一致', cards: [{ factId: fact.factId, suggestedQuestion, ...(displayQuestion ? { displayQuestion } : {}) }] }) } }] });
+    });
+    return (await providerWith(api).assess(target, [source], signal())).value.cards;
+  }
+  it('adds historical context while preserving the concrete subject instead of injecting a generic question', async () => {
+    const [card] = await assessQuestion('試作機を木製にした理由は？', '木製を選んだ理由は？');
+    expect(card?.suggestedQuestion).toBe('当時、試作機を木製にした理由は？');
+    expect(card?.displayQuestion).toBe('当時、木製を選んだ理由は？');
+    expect(card?.fact).toBe(body);
+  });
+  it('preserves a specific historical full question when a short display helper is absent', async () => {
+    const question = '当時、木製の試作機を展示するまでにどのような試行錯誤がありましたか？';
+    const [card] = await assessQuestion(question);
+    expect(card?.suggestedQuestion).toBe(question); expect(card).not.toHaveProperty('displayQuestion');
+  });
+  it('omits a short helper that cannot fit the qualifier, leaving the full question available', async () => {
+    const short = '木製の試作機を展示する際に一番工夫した点は何ですか？';
+    expect(short.length).toBeLessThanOrEqual(26);
+    const [card] = await assessQuestion('当時、木製の試作機で最も工夫したことは？', short);
+    expect(card?.suggestedQuestion).toContain('木製の試作機'); expect(card).not.toHaveProperty('displayQuestion');
   });
 });

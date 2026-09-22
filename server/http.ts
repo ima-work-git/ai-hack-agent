@@ -16,11 +16,12 @@ import { ProviderError } from './provider-contract.ts';
 import { createStreamingRelay } from './ws-relay.ts';
 import { createLunaCorrection } from './luna-correction.ts';
 import { resolvePersonTarget } from './person-resolver.ts';
+import { buildSearchCandidates, type SearchCandidate } from '../src/shared/search-candidates.ts';
 import { isTargetGroundedInTranscript } from '../src/shared/identity-aliases.ts';
 import { createSocialProvider, type SocialProvider } from './social-provider.ts';
 
-interface ConversationWindow { revision: number; transcribed: boolean; researchStarted: boolean; target?: Target }
-interface Conversation { id: string; expiresAt: number; dataExpiresAt: number; dataGeneration: number; companyClue: string; transcriptContext: string; finalTexts: string[]; requests: Map<string, ConversationWindow> }
+interface ConversationWindow { revision: number; transcribed: boolean; researchStarted: boolean; target?: Target; query?: string }
+interface Conversation { id: string; expiresAt: number; dataExpiresAt: number; dataGeneration: number; companyClue: string; transcriptContext: string; finalTexts: string[]; searchCandidates: SearchCandidate[]; requests: Map<string, ConversationWindow> }
 
 interface HttpDependencies {
   store?: SessionStore;
@@ -90,7 +91,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   const pruneConversationData = (group: Conversation) => {
     if (group.dataExpiresAt > now()) return;
     group.dataGeneration++;
-    group.transcriptContext = ''; group.companyClue = ''; group.finalTexts.length = 0;
+    group.transcriptContext = ''; group.companyClue = ''; group.finalTexts.length = 0; group.searchCandidates = [];
     group.requests.clear();
     group.dataExpiresAt = now() + 15 * 60_000;
   };
@@ -287,11 +288,31 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         session.revision = Math.max(session.revision, ...[...group.requests.values()].map(window => window.revision)) + 1;
         identifying.get(session.id)?.controller.abort(); identifying.delete(session.id);
         store.cancel(session.id); active.delete(session.id);
-        group.requests.clear(); group.finalTexts.length = 0;
+        group.requests.clear(); group.finalTexts.length = 0; group.searchCandidates = [];
         group.transcriptContext = group.companyClue;
         delete session.result; delete session.lastInput; store.save(session);
         relay.resetConversation?.(group.id);
         sendJson(res, 200, { revision: session.revision, resetAt: now() }); return true;
+      }
+      if (req.method === 'POST' && path === '/api/conversation/search-choice') {
+        sameOrigin(req);
+        const body = z.object({ conversationId: z.string().uuid(), choiceId: z.string().min(1).max(100) }).strict().parse(await jsonBody(req));
+        const group = conversationFor(session.id, body.conversationId);
+        const choice = group.searchCandidates.find(candidate => candidate.id === body.choiceId);
+        if (!choice) throw new HttpError(409, 'この検索候補は更新または失効しました。最新の候補から選び直してください。');
+        // This endpoint accepts only a server-offered research candidate. A
+        // human choice is not evidence of identity; source verification remains.
+        identifying.get(session.id)?.controller.abort(); identifying.delete(session.id);
+        session.revision = Math.max(session.revision, ...[...group.requests.values()].map(window => window.revision)) + 1;
+        store.cancel(session.id); active.delete(session.id);
+        group.requests.clear(); group.finalTexts.length = 0;
+        group.companyClue = choice.target.companyName; group.transcriptContext = choice.target.companyName;
+        delete session.result; delete session.lastInput; store.save(session);
+        relay.resetConversation?.(group.id);
+        relay.updateKeywordsConversation?.(group.id, [choice.target.personName, choice.target.companyName].filter(Boolean));
+        const requestId = randomUUID(); const subjectRevision = session.revision + 1;
+        addWindow(group, requestId, { revision: subjectRevision, transcribed: true, researchStarted: false, target: choice.target, query: choice.query });
+        sendJson(res, 200, { requestId, subjectRevision, revision: session.revision, target: choice.target, query: choice.query }); return true;
       }
       if (req.method === 'POST' && path === '/api/conversation/stream') {
         sameOrigin(req);
@@ -346,8 +367,10 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
             if (targets[0]!.companyName) group.companyClue = targets[0]!.companyName;
             relay.updateKeywordsConversation?.(group.id, [targets[0]!.personName, targets[0]!.companyName].filter(Boolean));
           }
+          const choices = buildSearchCandidates({ targets, transcript: body.text, companyContext: previousContext });
+          if (choices.length) group.searchCandidates = choices;
           window.transcribed = true; identifying.delete(session.id);
-          sendJson(res, 200, { text: body.text, targets, hasPersonMention: targets.length > 0 || !!correctionCandidate || plan.hasPersonMention !== false, correctionHint, correctionCandidate });
+          sendJson(res, 200, { text: body.text, targets, searchCandidates: group.searchCandidates, hasPersonMention: targets.length > 0 || !!correctionCandidate || plan.hasPersonMention !== false, correctionHint, correctionCandidate });
         } catch (error) {
           if (controller.signal.aborted) throw new HttpError(409, '停止または失効した解析です。');
           throw error;
@@ -359,7 +382,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         if (!store.authenticate(authorization!.slice(7))) throw new HttpError(401, '再ログインしてください。');
         if (session.running) throw new HttpError(409, '処理が進行中です。停止してから開始してください。');
         if ((!config.status.sttEnabled && !config.status.streamingEnabled) || !config.status.liveEnabled || !budget) throw new HttpError(403, '会話モードの音声・実API設定が未完了です。');
-        const conversation: Conversation = { id: randomUUID(), expiresAt: session.expiresAt, dataExpiresAt: now() + 15 * 60_000, dataGeneration: 0, companyClue: '', transcriptContext: '', finalTexts: [], requests: new Map() };
+        const conversation: Conversation = { id: randomUUID(), expiresAt: session.expiresAt, dataExpiresAt: now() + 15 * 60_000, dataGeneration: 0, companyClue: '', transcriptContext: '', finalTexts: [], searchCandidates: [], requests: new Map() };
         dropConversation(session.id); conversations.set(session.id, conversation);
         sendJson(res, 200, { conversationId: conversation.id, expiresAt: conversation.expiresAt }); return true;
       }
@@ -437,7 +460,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
             // This target came from a once-consumed ASR final, not a client field.
             // Public source identity and exact evidence checks still run below.
             const target = window.target;
-            provider = { ...provider, plan: async () => ({ value: { target, needsConfirmation: false, candidates: [], query: `${target.personName} ${target.companyName} 公式 プロフィール`, reason: '会話と会社の手掛かりから補正した調査候補です。公開情報で照合します。' }, actualUsd: 0 }) };
+            provider = { ...provider, plan: async () => ({ value: { target, needsConfirmation: false, candidates: [], query: window.query ?? `${target.personName} ${target.companyName} 公式 プロフィール`, reason: '会話と会社の手掛かりから補正した調査候補です。公開情報で照合します。' }, actualUsd: 0 }) };
           }
           if (confirmedTarget && input.mode === 'live') {
             const original = provider;
