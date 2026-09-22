@@ -574,23 +574,38 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(rows.filter(row => row.includes('事:未確認'))).toHaveLength(4 - count);
   });
 
-  it('marks shortened pairs with an ellipsis and retains the full original in source details', async () => {
+  it('shows complete concise pairs without ellipses and retains the full original in source details', async () => {
     const value = researchResult();
     const fact = '😀架空の検証対象が公開した活動記録を紹介しています。'.repeat(3);
     const question = '今回の公開活動でどのようなことを学びましたか？'.repeat(3);
-    value.cards[0] = { ...value.cards[0]!, fact, suggestedQuestion: question, excerpt: fact };
+    const displayFact = '公開した活動記録'; const displayQuestion = '活動で学んだことは？';
+    value.cards[0] = { ...value.cards[0]!, fact, suggestedQuestion: question, excerpt: fact, displayFact, displayQuestion };
     value.sources[0]!.text = fact;
     routes.set('/api/session/resume', async () => jsonResponse({ result: value }));
     await boot(); click('connect'); await flush(); click('resume'); await flush();
-    expect(element('fact').textContent).toMatch(/…$/);
-    expect(element('question').textContent).toMatch(/…$/);
+    expect(element('fact').textContent).toBe(displayFact);
+    expect(element('question').textContent).toBe(displayQuestion);
     expect(element('sources').querySelector('.source-fact')!.textContent).toBe(`事実（全文）：${fact}`);
     expect(element('sources').querySelector('blockquote')!.textContent).toBe(fact);
     const firstRow = (devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content.split('\n')[0]!;
-    expect(firstRow).toContain('事:'); expect(firstRow).toContain('問:'); expect(firstRow.match(/…/g)).toHaveLength(2);
+    expect(firstRow).toContain(`事:${displayFact}`); expect(firstRow).toContain(`問:${displayQuestion}`); expect(firstRow).not.toContain('…');
     expect(firstRow).not.toContain('\ufffd');
     const width = Array.from(firstRow).reduce((sum, character) => sum + (/^[\x20-\x7e]$/.test(character) ? 1 : 2), 0);
     expect(width).toBeLessThanOrEqual(45);
+  });
+
+  it('does not silently use the phone microphone when the selected G2 is unavailable', async () => {
+    await boot(); chooseLiveAndConsent();
+    element<HTMLSelectElement>('microphone').value = 'g2';
+    devices.g2!.connect.mockResolvedValue(false);
+    click('conversation'); await flush();
+    expect(devices.g2!.connect).toHaveBeenCalledOnce();
+    expect(devices.phone!.start).not.toHaveBeenCalled();
+    expect(requests('/api/conversation')).toHaveLength(0);
+    expect(element('status').textContent).toContain('G2のマイクに接続できません');
+    element<HTMLSelectElement>('microphone').value = 'phone';
+    click('conversation'); await flush();
+    expect(devices.phone!.start).toHaveBeenCalledWith({ continuous: true });
   });
 
   it.each([0, 0.00846])('keeps the reserved cost primary when a live result reports preliminary USD %s', async reportedUsd => {

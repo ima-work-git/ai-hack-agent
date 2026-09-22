@@ -29,7 +29,23 @@ export const PlanDecisionSchema = z.object({
   candidates: z.array(CandidateSchema).max(5), query: z.string().max(300), reason: z.string().max(600),
 }).strict();
 export type PlanDecision = z.infer<typeof PlanDecisionSchema>;
-export const ProposedCardSchema = z.object({ fact: z.string().min(1).max(200), suggestedQuestion: z.string().min(1).max(180), sourceId: z.string().max(100), excerpt: z.string().min(1).max(1000) }).strict();
+const withoutOmission = (value: string) => !/[…⋯]|\.{3}|。{3}|[\r\n]/u.test(value);
+const DisplayFactSchema = z.string().trim().min(1).max(28).refine(withoutOmission);
+const DisplayQuestionSchema = z.string().trim().min(2).max(26).refine(withoutOmission).refine(value => /[?？]$/u.test(value));
+export const ProposedCardSchema = z.object({ fact: z.string().min(1).max(200), suggestedQuestion: z.string().min(1).max(180), sourceId: z.string().max(100), excerpt: z.string().min(1).max(1000),
+  displayFact: DisplayFactSchema.optional(), displayQuestion: DisplayQuestionSchema.optional(),
+}).strict();
+
+/** Display helpers never replace the complete source-backed fact. Invalid
+ * helpers are omitted so existing callers can still show the original card. */
+export function validatedCardDisplay(fact: string, excerpt: string, displayFact: unknown, displayQuestion: unknown): { displayFact?: string; displayQuestion?: string } {
+  const shortFact = DisplayFactSchema.safeParse(displayFact);
+  const question = DisplayQuestionSchema.safeParse(displayQuestion);
+  // Do not turn a denial, former role or future plan into a current assertion.
+  const qualified = /ない|ません|なかった|なく|未経験|未実施|予定|計画|かつて|以前|前職|過去|\b(?:not|never|no|former|previously|planned|if|unless|without)\b/iu.test(fact);
+  const factValid = shortFact.success && fact.includes(shortFact.data) && excerpt.includes(shortFact.data) && (!qualified || shortFact.data === fact);
+  return { ...(factValid ? { displayFact: shortFact.data } : {}), ...(question.success ? { displayQuestion: question.data } : {}) };
+}
 export const AssessmentSchema = z.object({
   identityVerified: z.boolean(), needsConfirmation: z.boolean(), candidates: z.array(CandidateSchema).max(5),
   cards: z.array(ProposedCardSchema).max(4), followUpQuery: z.string().max(300).nullable(), reason: z.string().max(600),

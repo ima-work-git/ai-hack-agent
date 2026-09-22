@@ -13,6 +13,18 @@ const input = (extra: Partial<ResearchInput> = {}): ResearchInput => ({ text: DE
 afterEach(() => { vi.useRealTimers(); });
 
 describe('bounded evidence research', () => {
+  it('revalidates display facts independently of provider output without losing a valid full card', async () => {
+    const provider = createFixtureProvider('normal');
+    const assess = provider.assess.bind(provider);
+    provider.assess = async (...args) => {
+      const result = await assess(...args);
+      result.value.cards = result.value.cards.map(card => ({ ...card, displayFact: '出典にない短い断定', displayQuestion: '活動で印象に残ったことは？' }));
+      return result;
+    };
+    const result = await runAgent(input(), provider);
+    expect(result.status).toBe('ready'); expect(result.cards).toHaveLength(2);
+    expect(result.cards.every(card => card.displayFact === undefined && card.displayQuestion === '活動で印象に残ったことは？')).toBe(true);
+  });
   it('executes a visible autonomous follow-up and produces only source-backed fictional cards', async () => {
     const result = await runAgent(input(), createFixtureProvider('normal'));
     expect(result.status).toBe('ready');

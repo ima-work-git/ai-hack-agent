@@ -29,6 +29,7 @@ app.innerHTML = `
 <label for="text">会社名と氏名、または会話の文字起こし</label><p class="muted">事前登録・入力は不要です。会話モードを開始すると、会話から人物と会社を見つけて調べます。</p><textarea id="text" maxlength="2000" placeholder="会話モードでは自動で文字が入ります。手入力もできます。" spellcheck="false"></textarea>
 <div class="controls"><button id="sample">架空の会話を入力</button><button id="connect">G2を接続</button></div>
 <label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。会話モードは音声をOpenAIへ逐次送信して認識し、OrcaRouterで調査します。音声は保存しません。短い録音は最大30秒です。</span></label>
+<label for="microphone">使うマイク</label><select id="microphone"><option value="g2" ${conversationLaunch ? 'selected' : ''}>Even G2のマイク</option><option value="phone" ${conversationLaunch ? '' : 'selected'}>スマートフォンのマイク</option></select>
 <div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
 <div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><div id="candidates" class="candidates"></div>
 </section><section class="panel"><div class="section-head"><h2>エージェントの判断</h2><span class="section-number">02 / PROCESS</span></div><p id="trace-empty" class="empty-trace">調査中の判断と復旧の記録がここに表示されます。</p><ol id="trace" class="trace" aria-label="調査の処理履歴"></ol><details><summary>実APIの設定状況</summary><p class="muted" id="configuration"></p><p class="muted">APIキーと費用上限はサーバー側で設定します。</p></details></section></div>
@@ -57,6 +58,7 @@ let audioChunks: Uint8Array[] = [];
 let audioBytes = 0;
 let audioTimer: ReturnType<typeof setTimeout> | undefined;
 let audioSource: 'g2' | 'phone' = 'phone';
+let microphoneConnecting = false;
 let conversation: StreamingAudio | null = null;
 let pendingTranscript: { itemId: string; text: string } | null = null;
 let identifyingTranscript = false;
@@ -78,11 +80,12 @@ let glassesView = emptyGlassesView();
 const status = (text: string, error = false) => { $('status').textContent = text; $('status').classList.toggle('error', error); };
 function refreshControls() {
   $('research').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
-  $('cancel').toggleAttribute('disabled', !running && !recording && !audioBusy);
+  $('cancel').toggleAttribute('disabled', !running && !recording && !audioBusy && !microphoneConnecting);
+  $('microphone').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning || microphoneConnecting);
   $('mode').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
   $('scenario').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
-  $('record').toggleAttribute('disabled', !recording && (audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked));
-  $('conversation').toggleAttribute('disabled', recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked);
+  $('record').toggleAttribute('disabled', !recording && (microphoneConnecting || audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked));
+  $('conversation').toggleAttribute('disabled', microphoneConnecting || recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked);
   $('record').textContent = recording ? conversationRunning ? '会話モードを終了' : '録音を止めて調べる' : '音声で入力';
   if (voicePhase !== 'off') queueVoiceDisplay();
 }
@@ -103,8 +106,8 @@ function renderBoard(cards: Card[]) {
     slot.setAttribute('aria-pressed', String(!!card && index === cardIndex));
     slot.setAttribute('aria-label', card ? `${index + 1}件目の原文と出典を表示` : `${index + 1}件目は未確認`);
     slot.querySelector('.topic-number')!.textContent = `${index + 1} / ${card ? '原文・出典 ↗' : '未確認'}`;
-    slot.querySelector('.topic-fact')!.textContent = card ? shortText(card.fact, 72) : '未確認';
-    slot.querySelector('.topic-question')!.textContent = card ? shortText(card.suggestedQuestion, 56) : '確認後に表示';
+    slot.querySelector('.topic-fact')!.textContent = card ? card.displayFact || card.fact : '未確認';
+    slot.querySelector('.topic-question')!.textContent = card ? card.displayQuestion || card.suggestedQuestion : '確認後に表示';
     slot.onclick = card ? () => { cardIndex = index; renderCard(); } : null;
   }
 }
@@ -116,7 +119,7 @@ function clearResult() {
   $('card-count').textContent = '0 / 0'; $('previous').setAttribute('disabled', ''); $('next').setAttribute('disabled', '');
 }
 async function sendView(header: string, content: string, footer: string) {
-  glassesView = { header: header.slice(0, 60), content: content.slice(0, 380), footer: footer.slice(0, 100) };
+  glassesView = { header: header.slice(0, 60), content: content.slice(0, 1800), footer: footer.slice(0, 100) };
   await renderGlassesView();
 }
 async function renderGlassesView() {
@@ -159,7 +162,7 @@ function renderCard() {
   const source = result!.sources.find(s => s.sourceId === card.sourceId)!;
   renderBoard(cards);
   $('hud-target').textContent = result!.target?.personName || '';
-  $('hud-source').textContent = '…は省略。原文・出典はカードを選択';
+  $('hud-source').textContent = '短い事実と質問 / 原文・出典はカードを選択';
   $('hud-expiry').textContent = `${cards.length} / 4件確認`;
   $('card-count').textContent = `${cardIndex + 1} / ${cards.length}`;
   $('previous').toggleAttribute('disabled', cards.length < 2); $('next').toggleAttribute('disabled', cards.length < 2);
@@ -176,7 +179,7 @@ function renderCard() {
   $('sources').append(evidence);
   const rows = Array.from({ length: 4 }, (_, index) => {
     const entry = cards[index];
-    return entry ? `${index + 1} 事:${shortText(entry.fact, 20)} 問:${shortText(entry.suggestedQuestion, 16)}` : `${index + 1} 事:未確認 問:—`;
+    return entry ? `${index + 1} 事:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')} 問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事:未確認 問:—`;
   });
   void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件`, rows.join('\n'), '事=事実 問=質問 / 原文はスマホ');
 }
@@ -399,11 +402,12 @@ async function drainTranscripts(generation: number) {
   } finally { identifyingTranscript = false; if (pendingTranscript && conversationRunning) void drainTranscripts(audioGeneration); }
 }
 async function startConversation() {
-  if (!runtimeStatus.streamingEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || recording || audioBusy || conversationRunning) return;
+  if (!runtimeStatus.streamingEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || recording || audioBusy || conversationRunning || microphoneConnecting) return;
+  if ($<HTMLSelectElement>('microphone').value === 'g2' && !connected) { if (await prepareGlassesMicrophone()) void startConversation(); return; }
   const generation = ++audioGeneration; conversationRunning = true; recording = true;
   conversationId = ''; conversationRequestRevision = 0; conversationLastKey = ''; conversationLastAt = 0;
   completedTranscript = ''; partialTranscripts.clear(); pendingTranscript = null;
-  audioSource = connected ? 'g2' : 'phone'; currentId = crypto.randomUUID(); newViewToken(); clearResult();
+  audioSource = $<HTMLSelectElement>('microphone').value === 'g2' ? 'g2' : 'phone'; currentId = crypto.randomUUID(); newViewToken(); clearResult();
   setVoicePhase('connecting');
   conversation = new StreamingAudio({
     onDelta: (itemId, delta) => {
@@ -441,10 +445,11 @@ async function startConversation() {
   } catch (error) { if (generation === audioGeneration) { await stopRecording(false); setVoicePhase('error'); status(error instanceof Error ? error.message : '会話モードを開始できませんでした。', true); } }
 }
 async function startRecording() {
-  if (!runtimeStatus.sttEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || audioBusy) return;
+  if (!runtimeStatus.sttEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || audioBusy || microphoneConnecting) return;
+  if ($<HTMLSelectElement>('microphone').value === 'g2' && !connected) { if (await prepareGlassesMicrophone()) void startRecording(); return; }
   setVoicePhase('off');
   const generation = ++audioGeneration;
-  audioSource = connected ? 'g2' : 'phone'; audioChunks = []; audioBytes = 0; recording = true; currentId = crypto.randomUUID();
+  audioSource = $<HTMLSelectElement>('microphone').value === 'g2' ? 'g2' : 'phone'; audioChunks = []; audioBytes = 0; recording = true; currentId = crypto.randomUUID();
   newViewToken(); clearResult(); void sendView('会話アシスタント', '録音中・最大30秒', '停止はスマートフォンから'); status('録音しています。30秒以内に停止します。'); refreshControls();
   const ok = audioSource === 'g2' ? await g2.startAudio() : await phone.start();
   if (generation !== audioGeneration) return;
@@ -487,7 +492,18 @@ $('research').onclick = () => { void research(); }; $('cancel').onclick = () => 
 $('previous').onclick = () => { cardIndex--; renderCard(); }; $('next').onclick = () => { cardIndex++; renderCard(); };
 async function connectGlasses() {
   const ok = await g2.connect({ header: '会話アシスタント', content: '登録は不要です。スマートフォンで同意を確認し、会話モードを開始してください。', footer: 'マイクは停止中' }, viewToken);
+  if (ok) $<HTMLSelectElement>('microphone').value = 'g2';
   if (!ok) status('Evenアプリからこの画面を開いて接続してください。通常のブラウザーではプレビューを利用できます。');
+  return ok;
+}
+async function prepareGlassesMicrophone() {
+  const generation = audioGeneration; const expectedToken = token;
+  microphoneConnecting = true; status('G2のマイクへ接続しています…'); refreshControls();
+  try {
+    const ok = await connectGlasses();
+    if (!ok) status('G2のマイクに接続できません。Evenアプリとグラスの接続を確認してください。スマホを使う場合はマイクを選び直してください。', true);
+    return ok && connected && generation === audioGeneration && !!token && token === expectedToken && !document.hidden && !pageLeaving;
+  } finally { microphoneConnecting = false; refreshControls(); }
 }
 $('connect').onclick = () => { void connectGlasses(); };
 $('consent').onchange = () => { if (!$<HTMLInputElement>('consent').checked) void stopRecording(false); refreshControls(); };
@@ -516,6 +532,6 @@ setInterval(() => { if (result?.cards.some(card => Date.parse(card.expiresAt) <=
 try {
   runtimeStatus = await (await fetch('/api/status', { cache: 'no-store' })).json();
   $('live-option').toggleAttribute('disabled', !runtimeStatus.liveEnabled); $('configuration').textContent = runtimeStatus.liveEnabled ? '実APIでの調査を利用できます。課金額は設定した上限内で予約します。' : `未設定：${runtimeStatus.missing.join('、')}`;
-  if (runtimeStatus.streamingEnabled || runtimeStatus.sttEnabled) $('audio-hint').textContent = 'G2接続時はグラス、未接続時はスマートフォンのマイクを使用';
+  if (runtimeStatus.streamingEnabled || runtimeStatus.sttEnabled) $('audio-hint').textContent = 'G2のマイクを使えます。接続できない場合もスマホへ自動では切り替えません。';
   $('login').classList.remove('hidden'); if (!runtimeStatus.accessCodeRequired) { $('access-code').classList.add('hidden'); document.querySelector('label[for="access-code"]')?.classList.add('hidden'); await login(); } else if (await restoreLogin()) { qrLoginTicket = ''; } else await redeemQrLogin();
 } catch { $('login').classList.remove('hidden'); $('login-status').textContent = 'サーバーに接続できません。再読み込みしてください。'; }

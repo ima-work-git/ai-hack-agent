@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, ResearchInputSchema, ResearchResultSchema, SearchHitSchema,
+  AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, ResearchInputSchema, ResearchResultSchema, SearchHitSchema, validatedCardDisplay,
 } from '../src/shared/contracts.ts';
 import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, Target, TraceEvent } from '../src/shared/contracts.ts';
 import { extractExplicitXHandles } from '../src/shared/x-account.ts';
@@ -189,7 +189,8 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
         emit('discard', '出典、対象名・所属、本文引用の検査に通らないカードを棄却しました。'); continue;
       }
       if (cards.some(c => normalize(c.fact) === normalize(proposal.fact)) || cards.length >= 4) continue;
-      cards.push({ ...proposal, cardId: randomUUID(), expiresAt: new Date(now() + 300_000).toISOString(), requestId: input.requestId, subjectRevision: input.subjectRevision });
+      const { displayFact, displayQuestion, ...verifiedProposal } = proposal;
+      cards.push({ ...verifiedProposal, ...validatedCardDisplay(proposal.fact, proposal.excerpt, displayFact, displayQuestion), cardId: randomUUID(), expiresAt: new Date(now() + 300_000).toISOString(), requestId: input.requestId, subjectRevision: input.subjectRevision });
     }
     emit('verify', `${cards.length}件のカードが本文引用と対象照合の検査を通りました。`);
     return true;

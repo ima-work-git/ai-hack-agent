@@ -37,6 +37,33 @@ function fixture(reply: (input: SelectionInput) => unknown = () => emptyAssessme
 const hasLoneSurrogate = (text: string) => [...text].some(character => character.length === 1 && character.charCodeAt(0) >= 0xd800 && character.charCodeAt(0) <= 0xdfff);
 
 describe('bounded evidence selection — mocked model, no network or assertion of semantic identity', () => {
+  it('adds a concise exact display phrase and complete question in the same assessment without replacing evidence', async () => {
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), displayFact: '設計手法を紹介しました。', displayQuestion: '研究会で印象に残った質問は？' }] }));
+    const result = await f.assess();
+    expect(result.value.cards[0]).toMatchObject({ fact: FACT, excerpt: primary().text, displayFact: '設計手法を紹介しました。', displayQuestion: '研究会で印象に残った質問は？' });
+    expect(f.api).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['新しい設計を発明しました。', '活動で得た学びは？'],
+    ['設計手法…', '活動で得た学びは…'],
+    ['長'.repeat(29), '問'.repeat(26) + '？'],
+    [42, '途中で切れた問い'],
+  ])('drops invalid display helpers but retains the original source-backed card %#', async (displayFact, displayQuestion) => {
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data), displayFact, displayQuestion }] }));
+    const card = (await f.assess()).value.cards[0]!;
+    expect(card.fact).toBe(FACT); expect(card).not.toHaveProperty('displayFact');
+    if (displayQuestion !== '活動で得た学びは？') expect(card).not.toHaveProperty('displayQuestion');
+  });
+
+  it('rejects a raw substring that would remove a negation from the selected fact', async () => {
+    const fact = '公開研究会に登壇したことはありません。';
+    const original = source('primary', `${target.companyName}の${target.personName}です。${fact}`);
+    const f = fixture(data => ({ ...emptyAssessment(), cards: [{ ...select(data, 'primary', fact), displayFact: '公開研究会に登壇', displayQuestion: '研究会との関わりは？' }] }));
+    const card = (await f.assess([original])).value.cards[0]!;
+    expect(card.fact).toBe(fact); expect(card).not.toHaveProperty('displayFact');
+  });
+
   it('allows four selected raw facts and rejects a fifth rather than changing research-call limits', async () => {
     const facts = ['第一の公開活動です。', '第二の公開活動です。', '第三の公開活動です。', '第四の公開活動です。', '第五の公開活動です。'];
     const original = source('primary', `${target.companyName}の${target.personName}です。${facts.join('')}`);
