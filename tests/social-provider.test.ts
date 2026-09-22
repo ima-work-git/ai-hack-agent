@@ -294,4 +294,47 @@ describe('social cancellation and bounded cache', () => {
     await bounded.lookup(target, signal());
     expect(api).toHaveBeenCalledTimes(12);
   });
+
+  it('releases overwritten and evicted entry timers so only current cache entries retain post data', async () => {
+    vi.useFakeTimers();
+    try {
+      const api = apiMock();
+      const live = provider(api, { cacheMaximumEntries: 1 });
+      // Both requests initially miss: the later write replaces the same key.
+      await Promise.all([
+        live.lookupPlatform(target, 'instagram', signal()),
+        live.lookupPlatform(target, 'instagram', signal()),
+      ]);
+      expect(api).toHaveBeenCalledTimes(4);
+      expect(vi.getTimerCount()).toBe(1);
+      // A different platform evicts the prior key without retaining its timer.
+      await live.lookupPlatform(target, 'facebook', signal());
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(vi.getTimerCount()).toBe(0);
+      // The injected date has not moved: only physical timer expiry removed it.
+      await live.lookupPlatform(target, 'facebook', signal());
+      expect(api).toHaveBeenCalledTimes(8);
+      expect(vi.getTimerCount()).toBe(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('clears timers during a clock-based expiry sweep and physically expires negative entries', async () => {
+    vi.useFakeTimers();
+    try {
+      let clock = NOW;
+      const api = apiMock(() => []);
+      const live = provider(api, { now: () => clock });
+      await live.lookupPlatform(target, 'instagram', signal());
+      expect(vi.getTimerCount()).toBe(1);
+      // Wall clock can move before the corresponding real timer has fired.
+      clock = new Date(NOW.getTime() + 30_000);
+      await live.lookupPlatform(target, 'facebook', signal());
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(vi.getTimerCount()).toBe(0);
+      await live.lookupPlatform(target, 'facebook', signal());
+      expect(api).toHaveBeenCalledTimes(6);
+    } finally { vi.useRealTimers(); }
+  });
 });

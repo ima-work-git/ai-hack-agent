@@ -30,6 +30,7 @@ export interface SocialProviderDependencies {
 }
 interface Run { id: string; status: string; defaultDatasetId?: string; usageTotalUsd?: number }
 interface ActorResult { source?: EvidenceSource; reportedUsd?: number }
+interface CacheEntry { expiresAt: number; value: EvidenceSource[]; expiry?: ReturnType<typeof setTimeout> }
 const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const identifier = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(value);
 const amount = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
@@ -117,7 +118,12 @@ export function createSocialProvider(config: { apiToken: string; maximumChargeUs
   if (!config.apiToken.trim() || !Number.isFinite(maximum) || maximum <= 0 || maximum > 0.20) throw new Error('Invalid social provider configuration');
   const requestedCapacity = dependencies.cacheMaximumEntries ?? 32;
   const capacity = Number.isFinite(requestedCapacity) ? Math.max(1, Math.min(32, Math.floor(requestedCapacity))) : 32;
-  const cache = new Map<string, { expiresAt: number; value: EvidenceSource[] }>();
+  const cache = new Map<string, CacheEntry>();
+  const deleteCached = (key: string) => {
+    const entry = cache.get(key);
+    if (entry?.expiry) clearTimeout(entry.expiry);
+    cache.delete(key);
+  };
 
   async function api(path: string, signal: AbortSignal, body?: unknown, timeoutMs = 8_000): Promise<unknown> {
     const url = new URL(path, API_ORIGIN);
@@ -197,7 +203,7 @@ export function createSocialProvider(config: { apiToken: string; maximumChargeUs
       const account = identity?.accounts.find(value => value.platform === platform);
       if (!identity || !account) return { value: [], actualUsd: 0 };
       const clock = now().getTime();
-      for (const [key, entry] of cache) if (entry.expiresAt <= clock) cache.delete(key);
+      for (const [key, entry] of cache) if (entry.expiresAt <= clock) deleteCached(key);
       const key = `${identity.id}:${platform}`;
       const existing = cache.get(key);
       if (existing) { cache.delete(key); cache.set(key, existing); return { value: structuredClone(existing.value), actualUsd: 0 }; }
@@ -205,11 +211,12 @@ export function createSocialProvider(config: { apiToken: string; maximumChargeUs
       signal.throwIfAborted();
       const value = outcome.source ? [outcome.source] : [];
       const ttl = value.length ? 300_000 : 30_000;
-      const entry = { value: structuredClone(value), expiresAt: now().getTime() + ttl };
+      const entry: CacheEntry = { value: structuredClone(value), expiresAt: now().getTime() + ttl };
+      deleteCached(key);
       cache.set(key, entry);
-      const expiry = setTimeout(() => { if (cache.get(key) === entry) cache.delete(key); }, ttl);
-      expiry.unref();
-      while (cache.size > capacity) cache.delete(cache.keys().next().value!);
+      entry.expiry = setTimeout(() => { if (cache.get(key) === entry) deleteCached(key); }, ttl);
+      entry.expiry.unref();
+      while (cache.size > capacity) deleteCached(cache.keys().next().value!);
       return { value, ...(outcome.reportedUsd !== undefined ? { reportedUsd: outcome.reportedUsd } : {}) };
   };
   return {
