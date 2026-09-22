@@ -37,7 +37,7 @@ app.innerHTML = `
 <div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="retry-listening" disabled>聞き直す</button><button id="lock-person" disabled>この人物で固定</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
 <p class="muted" id="person-state" role="status">G2：下スクロールで出典、質問の上スクロールで聞き直しを確認。1回で実行・2回で取消。質問の2回で人物一覧。固定はスマホで操作。</p><div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><section id="search-panel" class="search-panel hidden" aria-label="検索キーワード"><h3>検索キーワード</h3><p id="current-search" role="status"></p><p class="muted">別候補を選ぶと、今の調査を止めてその語で調べ直します。候補は本人確認済みという意味ではありません。</p><div id="search-choices" class="candidates"></div></section><p class="status hidden" id="correction-hint" role="status"></p><div id="candidates" class="candidates"></div>
 </section><section class="panel"><div class="section-head"><h2>エージェントの判断</h2><span class="section-number">02 / PROCESS</span></div><p id="trace-empty" class="empty-trace">調査中の判断と復旧の記録がここに表示されます。</p><ol id="trace" class="trace" aria-label="調査の処理履歴"></ol><details><summary>実APIの設定状況</summary><p class="muted" id="configuration"></p><p class="muted">APIキーと費用上限はサーバー側で設定します。</p></details></section></div>
-<div><section class="panel people-panel" id="people-panel" tabindex="-1" aria-label="認識した人物"><div class="section-head"><h2>認識した人物</h2><span id="people-count" class="section-number">0人</span></div><p class="muted">認識した順に追加します。人物を選ぶと、その人の質問を表示します。未確認の候補は本人確認済みではありません。</p><p id="people-empty" class="muted">会話に人物が出てくると、ここに追加されます。</p><ol id="people-list" class="people-list"></ol><div class="controls"><button id="show-people">人物一覧へ戻る</button><button id="show-latest">最新の調査を表示</button></div><p class="muted">G2：質問で2回→人物一覧。上下で選択、1回で開く。</p></section><div class="section-head"><h2>調査結果と質問 · 4件一覧</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="4件の調査結果と質問"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="topic-board" id="card-board">${BOARD_MARKUP}</div><div class="hud-foot"><span id="hud-source">各カードを押すと原文・出典を表示</span><span id="hud-expiry">0 / 4件確認</span></div></section><nav class="card-nav" aria-label="出典詳細の選択"><button id="previous" aria-label="前の出典" disabled>← 前の出典</button><span id="card-count">0 / 0</span><button id="next" aria-label="次の出典" disabled>次の出典 →</button></nav>
+<div><section class="panel people-panel" id="people-panel" tabindex="-1" aria-label="認識した人物"><div class="section-head"><h2>認識した人物</h2><span id="people-count" class="section-number">0人</span></div><p class="muted">会話中はこの一覧に人物を順に追加します。選んだときだけ、その人の質問を開きます。未確認の候補は本人確認済みではありません。</p><p id="people-empty" class="muted">会話に人物が出てくると、ここに追加されます。</p><ol id="people-list" class="people-list"></ol><div class="controls"><button id="show-people">人物一覧へ戻る</button><button id="show-latest">最新の調査を表示</button></div><p class="muted">G2：質問で2回→人物一覧。上下で選択、1回で開く。</p></section><div class="section-head"><h2>調査結果と質問 · 4件一覧</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="4件の調査結果と質問"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="topic-board" id="card-board">${BOARD_MARKUP}</div><div class="hud-foot"><span id="hud-source">各カードを押すと原文・出典を表示</span><span id="hud-expiry">0 / 4件確認</span></div></section><nav class="card-nav" aria-label="出典詳細の選択"><button id="previous" aria-label="前の出典" disabled>← 前の出典</button><span id="card-count">0 / 0</span><button id="next" aria-label="次の出典" disabled>次の出典 →</button></nav>
 <div class="notice" id="result-note">体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。</div><div class="metrics"><div class="metric"><strong id="metric-time">—</strong><span>調査にかかった時間</span></div><div class="metric"><strong id="metric-calls">—</strong><span>AI / 検索 / 本文</span></div><div class="metric"><strong id="metric-cost">—</strong><span id="cost-label">実費は未計測</span></div></div><section class="panel evidence-panel" id="evidence-panel" tabindex="-1"><div class="section-head"><h2>情報の根拠</h2><span class="section-number">04 / EVIDENCE</span></div><p class="muted" id="source-empty">本文の引用・出典・取得時刻を、カードごとに確認できます。</p><div id="sources"></div></section></div></div></main>
 <footer class="footer"><span>AI HACK 2026 · 業務を自律化するAIエージェント</span><span>人の確認が必要なときは、立ち止まる。</span></footer>`;
 
@@ -222,7 +222,7 @@ function movePeopleFocus(direction: 1 | -1) {
 }
 function showPeopleList() {
   if (!token || document.hidden || pageLeaving) return;
-  peopleScreen = 'list'; resetPersonNavigation(); renderPeopleList(); refreshControls(); renderPeopleGlasses();
+  peopleScreen = 'list'; resetPersonNavigation(); clearDisplayedCards(); renderPeopleList(); refreshControls(); renderPeopleGlasses();
 }
 function selectPerson(id: string) {
   if (!token || document.hidden || pageLeaving || !personHistory.get(id)) return;
@@ -431,7 +431,7 @@ async function renderGlassesView() {
   }
   if (!pendingNavigation && !pendingAudioAction && !pendingSearchChoice && voicePhase !== 'error') {
     const listening = voicePhase === 'listening' ? ' / 聞取中' : '';
-    if (peopleScreen === 'list') footer = `上下=選択 1回=質問${listening}`;
+    if (peopleScreen === 'list' && voicePhase !== 'connecting' && voicePhase !== 'paused') footer = `上下=選択 1回=質問${listening}${voicePhase === 'listening' && voicePreview ? '｜' + Array.from(voicePreview).slice(-6).join('') : ''}`;
     else if (displayedResult()?.cards.length || peopleScreen === 'person') footer = `2回=${sourcePage >= 0 ? '質問へ戻る' : '人物一覧'}${listening}${voicePreview ? '｜' + Array.from(voicePreview).slice(-8).join('') : ''}`;
   }
   if (pendingAudioAction) footer = `${pendingAudioAction.action === 'retry' ? '人物を聞き直す' : '音声を再開する'}？ 1回=実行 2回=そのまま`;
@@ -477,6 +477,9 @@ function renderResultSummary(value: ResearchResult, message = value.message) {
   if (peopleScreen === 'person') $('result-note').textContent = `${value.target?.personName ?? '選択した人物'}さんの保存された調査結果です。${conversationRunning ? '会話の聞き取りと新しい人物の調査は続いています。' : ''}`;
 }
 function renderCard() {
+  // Research continues in the background; the list is a destination, not an
+  // intermediate loading screen. Only selectPerson may open its questions.
+  if (peopleScreen === 'list') { clearDisplayedCards(); refreshControls(); renderPeopleGlasses(); return; }
   const visible = displayedResult();
   if (peopleScreen === 'person' && (!selectedPersonId || !personHistory.get(selectedPersonId))) { showPeopleList(); return; }
   if (visible) renderResultSummary(visible, isProgressive(visible) ? `速報・追加調査中。${visible.message}` : visible.message);
@@ -546,7 +549,6 @@ function renderCard() {
     return entry ? `${index + 1}${label ? ` ${label}` : ''} 事実:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')}\n推奨質問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事実:未確認\n推奨質問:—`;
   });
   refreshControls();
-  if (peopleScreen === 'list') { renderPeopleGlasses(); return; }
   if (pendingNavigation || pendingSearchChoice || pendingAudioAction) { void renderGlassesView(); return; }
   if (sourcePosition) sourcePage = pageAt(cards, sourcePosition);
   if (sourcePage >= 0) {
@@ -1066,14 +1068,14 @@ async function startConversation() {
   }
   if (!runtimeStatus.streamingEnabled || $<HTMLSelectElement>('mode').value !== 'live' || running || recording || audioBusy || conversationRunning || microphoneConnecting) return;
   if ($<HTMLSelectElement>('microphone').value === 'g2' && !connected) { if (await prepareGlassesMicrophone()) void startConversation(); return; }
-  clearSearch(); clearPeople();
+  clearSearch(); clearPeople(); peopleScreen = 'list';
   const generation = ++audioGeneration; conversationRunning = true; recording = true;
   conversationId = ''; conversationRequestRevision = 0; conversationLastKey = ''; conversationLastAt = 0;
   completedTranscript = ''; partialTranscripts.clear(); pendingTranscript = null; ignoredTranscriptItems.clear(); resettingConversation = false; conversationSubjectGeneration++;
   $('correction-hint').textContent = ''; $('correction-hint').classList.add('hidden');
   audioSource = $<HTMLSelectElement>('microphone').value === 'g2' ? 'g2' : 'phone'; currentId = crypto.randomUUID(); newViewToken(); clearResult();
   const source = audioSource;
-  setVoicePhase('connecting');
+  setVoicePhase('connecting'); renderPeopleGlasses();
   const stream = new StreamingAudio({
     onDelta: (itemId, delta) => {
       if (generation !== audioGeneration || !conversationRunning) return;
@@ -1169,7 +1171,12 @@ async function stopRecording(transcribe: boolean) {
 }
 $('login-form').onsubmit = event => { event.preventDefault(); void login(); };
 $('show-people').onclick = () => { showPeopleList(); $('people-panel').focus({ preventScroll: true }); $('people-panel').scrollIntoView?.({ behavior: 'smooth', block: 'start' }); };
-$('show-latest').onclick = () => { peopleScreen = 'live'; selectedPersonId = null; resetPersonNavigation(); renderCard(); if (!hasCurrentCards()) void sendView('会話モード', '人物を認識すると調査します', '音声認識の状態を確認'); };
+$('show-latest').onclick = () => {
+  // This is an explicit one-person selection, never a switch to automatic
+  // following of everyone subsequently mentioned in the conversation.
+  const latest = result && personHistory.entries().find(entry => entry.result?.requestId === result!.requestId && entry.result?.subjectRevision === result!.subjectRevision);
+  if (latest) selectPerson(latest.id); else showPeopleList();
+};
 $('sample').onclick = () => { $<HTMLTextAreaElement>('text').value = DEMO_TEXT; };
 $('research').onclick = () => { void research(); }; $('cancel').onclick = () => { void cancel(); };
 $('previous').onclick = () => { cardIndex--; renderCard(); }; $('next').onclick = () => { cardIndex++; renderCard(); };
