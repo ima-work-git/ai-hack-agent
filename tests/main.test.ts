@@ -461,7 +461,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     devices.streaming!.options.onError(new Error(message)); await flush();
     const lastView = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
     expect(lastView.footer).toContain(label);
-    expect(element('status').textContent).toBe(message);
+    expect(element('status').textContent).toContain(message);
     expect(element('conversation').textContent).toBe('会話モードを再開');
     expect(element<HTMLButtonElement>('conversation').disabled).toBe(false);
     click('conversation'); await flush();
@@ -754,6 +754,94 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     old.resolve(new Response(`${JSON.stringify({ type: 'result', result: stale })}\n`)); await flush();
     expect(element('card-board').textContent).toBe(currentBoard);
     expect(element('card-board').textContent).not.toContain('古い無効'); expect(stream.cancel).not.toHaveBeenCalled();
+  });
+
+  it.each(['glasses-double', 'phone-button'] as const)('locks the current person using %s while ASR continues, and single tap permits a fresh identity', async action => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    stream.options.onFinal('first', '架空の検証参加者です'); await flush();
+    if (action === 'glasses-double') devices.g2!.options.onAction?.('lock'); else click('lock-person');
+    await flush();
+    expect(element('person-state').textContent).toContain('架空の検証参加者さんを固定中');
+    expect(element('hud-target').textContent).toContain('固定：');
+    stream.options.onDelta('next', '別の架空人物');
+    stream.options.onFinal('next', '別の架空人物の話です'); await flush();
+    expect(element<HTMLTextAreaElement>('text').value).toContain('別の架空人物');
+    expect(requests('/api/conversation/identify')).toHaveLength(1);
+    expect(requests('/api/research')).toHaveLength(1);
+    expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.startAudio).toHaveBeenCalledOnce(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+    devices.g2!.options.onAction?.('retry'); await flush();
+    expect(requests('/api/conversation/reset')).toHaveLength(1);
+    expect(element('person-state').textContent).not.toContain('固定中');
+    stream.options.onFinal('fresh', '架空の検証参加者です'); await flush();
+    expect(requests('/api/research')).toHaveLength(2);
+  });
+
+  it('discards a delayed identification on lock but accepts enrichment of the locked person', async () => {
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    stream.options.onFinal('first', '架空の検証参加者です'); await flush();
+    pushResearchEvent(streams[0]!.body, { type: 'update', result: fourCardResult(streams[0]!.input) }); await flush();
+    const delayed = deferred<Response>(); routes.set('/api/conversation/identify', () => delayed.promise);
+    stream.options.onFinal('late', '次の別人の話です'); await flush();
+    const pending = requests('/api/conversation/identify').at(-1)!;
+    devices.g2!.options.onAction?.('lock'); await flush();
+    expect(pending.signal!.aborted).toBe(true); expect(streams[0]!.signal.aborted).toBe(false);
+    delayed.resolve(jsonResponse({ text: '別人', targets: [{ personName: '別人', companyName: '' }], hasPersonMention: true })); await flush();
+    pushResearchEvent(streams[0]!.body, { type: 'result', result: fourCardResult(streams[0]!.input, '追加確認', 'COMPLETE') }); streams[0]!.body.close(); await flush();
+    expect(requests('/api/research')).toHaveLength(1);
+    expect(element('person-state').textContent).toContain('固定中');
+    expect(element('card-board').textContent).toContain('追加確認');
+  });
+
+  it('cannot lock an unverified target and clears the lock on consent withdrawal', async () => {
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    devices.g2!.options.onAction?.('lock'); await flush();
+    expect(element('person-state').textContent).not.toContain('固定中');
+    devices.streaming!.options.onFinal('first', '架空の検証参加者です'); await flush();
+    click('lock-person'); await flush(); expect(element('person-state').textContent).toContain('固定中');
+    element<HTMLInputElement>('consent').checked = false; element('consent').dispatchEvent(new Event('change')); await flush();
+    expect(element('person-state').textContent).not.toContain('固定中');
+    expect(element<HTMLButtonElement>('lock-person').disabled).toBe(true);
+  });
+
+  it('allows a deliberate single tap to restart G2 audio after a rate error, without automatic restart', async () => {
+    await boot(); chooseLiveAndConsent(); element<HTMLSelectElement>('microphone').value = 'g2';
+    click('connect'); await flush(); click('conversation'); await flush();
+    const old = devices.streaming!;
+    old.options.onError(new Error('音声の送信速度が上限を超えました。')); await flush();
+    expect(element('status').textContent).toContain('1回タップ');
+    expect(devices.g2!.startAudio).toHaveBeenCalledOnce();
+    devices.g2!.options.onAction?.('retry'); await flush();
+    expect(devices.streaming).not.toBe(old);
+    expect(devices.g2!.startAudio).toHaveBeenCalledTimes(2);
+    expect(requests('/api/conversation')).toHaveLength(2);
+    expect(element('status').textContent).toContain('ストリーミング認識中');
+    old.options.onError(new Error('古い切断')); await flush();
+    expect(devices.streaming!.cancel).not.toHaveBeenCalled();
+  });
+
+  it('waits for the old G2 microphone stop acknowledgement before a single-tap restart', async () => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stopping = deferred<boolean>(); devices.g2!.stopAudio.mockReturnValueOnce(stopping.promise);
+    devices.streaming!.options.onError(new Error('音声の送信速度が上限を超えました。')); await flush();
+    devices.g2!.options.onAction?.('retry'); await flush();
+    expect(requests('/api/conversation')).toHaveLength(1);
+    expect(devices.g2!.startAudio).toHaveBeenCalledOnce();
+    stopping.resolve(true); await flush();
+    expect(requests('/api/conversation')).toHaveLength(2);
+    expect(devices.g2!.startAudio).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not resume from a queued retry after consent is revoked during microphone shutdown', async () => {
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stopping = deferred<boolean>(); devices.g2!.stopAudio.mockReturnValueOnce(stopping.promise);
+    devices.streaming!.options.onError(new Error('音声接続が切れました。')); await flush();
+    devices.g2!.options.onAction?.('retry'); await flush();
+    element<HTMLInputElement>('consent').checked = false; element('consent').dispatchEvent(new Event('change')); await flush();
+    stopping.resolve(true); await flush();
+    expect(requests('/api/conversation')).toHaveLength(1);
   });
 
   it('keeps an active visible conversation alive, updates expiry, and stops heartbeat after consent is removed', async () => {
@@ -1061,7 +1149,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
   it('labels two recent X cards, one past X card and one profile card, with post evidence on the phone', async () => {
     const value = researchResult();
     const topics = ['recent_x', 'recent_x', 'popular_x', 'profile'] as const;
-    const labels = ['最近X', '最近X', '過去X', '人物・会社'];
+    const labels = ['最近X', '最近X', '過去X', '人物・会社 / Web'];
     value.cards = topics.map((topic, index) => ({ ...value.cards[0]!, topic, cardId: `topic-card-${index}`,
       sourceId: `topic-source-${index}`, fact: `公開事実${index + 1}です。`, suggestedQuestion: `活動${index + 1}の工夫は？`, excerpt: `公開事実${index + 1}です。` }));
     value.sources = topics.map((topic, index) => ({ ...value.sources[0]!, topic, sourceId: `topic-source-${index}`,
@@ -1088,6 +1176,45 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('sources').querySelector('.source-topic')!.textContent).toBe('話題：人物・会社');
     expect(element('sources').querySelector('.source-post-metrics')).toBeNull();
     expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toBe(board.content);
+  });
+
+  it.each(['x', 'instagram', 'facebook'] as const)('opens numbered %s source details with actual post text and a safe original link', async kind => {
+    const value = researchResult(); const source = value.sources[0]!;
+    const text = '取得した投稿の全文です。<script>悪意ある文字も文字として表示</script>';
+    source.kind = kind;
+    source.url = kind === 'x' ? 'https://x.com/fixture/status/100' : `https://${kind}.com/p/fixture`;
+    if (kind === 'x') source.xPost = { text, id: '100', authorId: '99', username: 'fixture', createdAt: '2026-09-20T00:00:00Z', likeCount: 0, repostCount: 0, replyCount: 0, quoteCount: 0 };
+    else source.socialPost = { text, platform: kind, authorHandle: 'fixture', profileUrl: source.url, identitySourceUrl: 'https://example.invalid', createdAt: '2026-09-20T00:00:00Z' };
+    routes.set('/api/session/resume', async () => jsonResponse({ result: value }));
+    await boot(); click('resume'); await flush();
+    click('topic-0'); await flush();
+    const label = kind === 'x' ? 'X' : kind === 'instagram' ? 'Instagram' : 'Facebook';
+    expect(element('sources').querySelector('.source-platform')!.textContent).toBe(`出典：${label}`);
+    expect(element('sources').querySelector('.source-original')!.textContent).toBe(text);
+    expect(element('sources').querySelector('script')).toBeNull();
+    const link = element('sources').querySelector('a')!;
+    expect(link.href).toBe(source.url); expect(link.rel).toBe('noopener noreferrer');
+    expect(element('card-board').textContent).toContain(label);
+    expect(document.activeElement).toBe(element('evidence-panel'));
+  });
+
+  it('lets G2 scroll through every quoted character then return to the four-card board', async () => {
+    const value = researchResult();
+    value.cards[0]!.excerpt = '架空の根拠資料についての説明です。'.repeat(15);
+    value.sources[0]!.text = value.cards[0]!.excerpt;
+    routes.set('/api/session/resume', async () => jsonResponse({ result: value }));
+    await boot(); click('connect'); await flush(); click('resume'); await flush();
+    const board = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    let complete = '';
+    for (let i = 0; i < 10; i++) {
+      devices.g2!.options.onAction?.('next'); await flush();
+      const view = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+      if (!view.header.includes('該当文')) { expect(view.content).toBe(board.content); break; }
+      expect(view.content).not.toContain('…');
+      expect(view.content.split('\n').length).toBeLessThanOrEqual(6);
+      complete += view.content.replaceAll('\n', '');
+    }
+    expect(complete).toBe(value.cards[0]!.excerpt);
   });
 
   it('keeps the real category when a profile fills a missing past-X slot, including source-only metadata', async () => {

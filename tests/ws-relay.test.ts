@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BudgetError, type BudgetLedger } from '../server/budget.ts';
 import type { OpenAIStreamingASROptions } from '../server/openai-streaming-asr.ts';
 import { createStreamingRelay } from '../server/ws-relay.ts';
+import { StreamingAudio } from '../src/streaming-audio.ts';
 
 const mocks = vi.hoisted(() => ({ startError: undefined as unknown, servers: [] as EventEmitter[], upstreams: [] as { options: OpenAIStreamingASROptions; append: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>; resetInput: ReturnType<typeof vi.fn>; updateKeywords: ReturnType<typeof vi.fn> }[] }));
 vi.mock('ws', async () => {
@@ -26,6 +27,7 @@ class Socket extends EventEmitter {
   terminate = vi.fn(() => { this.readyState = 3; });
 }
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+const resetAck = (socket: Socket, generation: number) => socket.emit('message', Buffer.from(JSON.stringify({ type: 'reset_ack', generation })), false);
 beforeEach(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
 afterEach(() => { mocks.startError = undefined; mocks.servers.length = 0; mocks.upstreams.length = 0; vi.useRealTimers(); vi.restoreAllMocks(); });
 const setup = () => {
@@ -42,6 +44,17 @@ const setup = () => {
   return { relay, reserve, connect, auth, onFinal, expire: () => { valid = false; } };
 };
 describe('authenticated streaming relay', () => {
+  it('accepts a five-minute PCM stream with a small capture-clock drift without relaxing actual-audio billing', async () => {
+    const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
+    for (let second = 0; second < 300; second++) {
+      socket.emit('message', Buffer.alloc(32_400), true); await flush();
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(socket.terminate).not.toHaveBeenCalled();
+    expect(mocks.upstreams[0]!.append).toHaveBeenCalledTimes(300);
+    expect(f.reserve).toHaveBeenCalledTimes(6);
+    f.relay.close();
+  });
   it('reserves before opening upstream, forwards PCM and bounded events, refuses replay and closes on group cancellation', async () => {
     const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
     expect(f.reserve).toHaveBeenCalledWith('group', 0.03); expect(socket.messages).toContainEqual({ type: 'ready' });
@@ -62,6 +75,9 @@ describe('authenticated streaming relay', () => {
     expect(f.relay.resetConversation?.('other-group')).toBe(false);
     expect(f.relay.resetConversation?.('group')).toBe(true); await flush();
     expect(upstream.resetInput).toHaveBeenCalledOnce(); expect(upstream.append).not.toHaveBeenCalled();
+    expect(socket.messages).toContainEqual({ type: 'reset', generation: 1 });
+    socket.emit('message', Buffer.alloc(16_000), true); await flush();
+    expect(upstream.append).not.toHaveBeenCalled(); resetAck(socket, 1);
     socket.emit('message', Buffer.alloc(16_000), true); await flush();
     expect(upstream.append).toHaveBeenCalledOnce(); expect(upstream.stop).not.toHaveBeenCalled();
     expect(socket.terminate).not.toHaveBeenCalled(); expect(f.reserve).toHaveBeenCalledOnce();
@@ -131,10 +147,120 @@ describe('authenticated streaming relay', () => {
   ])('distinguishes invalid PCM from excessive send rate: %s', async (kind, length, message) => {
     const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
     socket.emit('message', Buffer.alloc(length), true);
-    if (kind === 'rate') socket.emit('message', Buffer.alloc(2), true);
+    if (kind === 'rate') {
+      await flush(); socket.emit('message', Buffer.alloc(length), true);
+      await flush(); socket.emit('message', Buffer.alloc(2), true);
+    }
     await flush();
     expect(socket.messages).toContainEqual({ type: 'error', message });
     expect(socket.terminate).toHaveBeenCalledOnce(); f.relay.close();
+  });
+
+  it('accepts a bounded three-second transport burst and rejects sustained double-speed audio', async () => {
+    const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
+    for (let index = 0; index < 3; index++) socket.emit('message', Buffer.alloc(32_000), true);
+    await flush(); await flush();
+    expect(mocks.upstreams[0]!.append).toHaveBeenCalledTimes(3);
+    expect(socket.terminate).not.toHaveBeenCalled();
+    for (let second = 0; second < 8; second++) {
+      await vi.advanceTimersByTimeAsync(1000); socket.emit('message', Buffer.alloc(64_000), true); await flush();
+    }
+    expect(socket.messages).toContainEqual({ type: 'error', message: '音声の送信速度が上限を超えました。接続を確認して再開してください。' });
+    expect(socket.terminate).toHaveBeenCalledOnce(); f.relay.close();
+  });
+
+  it('uses a monotonic rate clock across a wall-clock correction', async () => {
+    const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
+    for (let second = 0; second < 120; second++) {
+      if (second === 10) vi.setSystemTime(Date.now() - 3_600_000);
+      socket.emit('message', Buffer.alloc(32_400), true); await flush(); await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(socket.terminate).not.toHaveBeenCalled(); expect(mocks.upstreams[0]!.append).toHaveBeenCalledTimes(120);
+    f.relay.close();
+  });
+
+  it('requires the latest reset acknowledgement and drops in-flight audio until then', async () => {
+    const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
+    f.relay.resetConversation?.('group'); f.relay.resetConversation?.('group');
+    resetAck(socket, 1); socket.emit('message', Buffer.alloc(16_000), true); await flush();
+    expect(mocks.upstreams[0]!.append).not.toHaveBeenCalled();
+    resetAck(socket, 2); socket.emit('message', Buffer.alloc(16_000), true); await flush();
+    expect(mocks.upstreams[0]!.append).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(5000); expect(socket.terminate).not.toHaveBeenCalled(); f.relay.close();
+  });
+
+  it('stops a reset that is never acknowledged and does not grant fresh rate credit for resetting', async () => {
+    const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
+    f.relay.resetConversation?.('group'); await vi.advanceTimersByTimeAsync(5000);
+    expect(socket.messages).toContainEqual({ type: 'error', message: '音声入力の切替確認がタイムアウトしました。再開してください。' });
+    expect(socket.terminate).toHaveBeenCalledOnce(); f.relay.close();
+    const next = setup(); const other = next.connect(); next.auth(other); await flush();
+    other.emit('message', Buffer.alloc(64_000), true); await flush();
+    other.emit('message', Buffer.alloc(64_000), true); await flush();
+    next.relay.resetConversation?.('group'); resetAck(other, 1);
+    other.emit('message', Buffer.alloc(2), true); await flush();
+    expect(other.messages).toContainEqual({ type: 'error', message: '音声の送信速度が上限を超えました。接続を確認して再開してください。' }); next.relay.close();
+  });
+
+  it('drops pre-reset PCM stalled behind budget reservation and still bounds that queue', async () => {
+    const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
+    let release!: (value: { id: string }) => void;
+    f.reserve.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    await vi.advanceTimersByTimeAsync(56_000);
+    socket.emit('message', Buffer.alloc(32_000, 1), true);
+    f.relay.resetConversation?.('group');
+    socket.emit('message', Buffer.alloc(32_000, 2), true); resetAck(socket, 1);
+    const forwarded: Buffer[] = [];
+    mocks.upstreams[0]!.append.mockImplementation((data: Buffer) => forwarded.push(Buffer.from(data)));
+    socket.emit('message', Buffer.alloc(3200, 3), true);
+    release({ id: 'reserved' }); await flush(); await flush();
+    expect(forwarded).toEqual([Buffer.alloc(3200, 3)]);
+    expect(socket.terminate).not.toHaveBeenCalled(); f.relay.close();
+
+    const blocked = setup(); const other = blocked.connect(); blocked.auth(other); await flush();
+    let unblock!: (value: { id: string }) => void;
+    blocked.reserve.mockImplementationOnce(() => new Promise(resolve => { unblock = resolve; }));
+    await vi.advanceTimersByTimeAsync(56_000);
+    for (let frame = 0; frame < 3; frame++) other.emit('message', Buffer.alloc(64_000), true);
+    expect(other.messages).toContainEqual({ type: 'error', message: '音声の送信待ちが上限を超えました。接続を確認して再開してください。' });
+    unblock({ id: 'reserved' }); await flush(); await flush();
+    expect(mocks.upstreams.at(-1)!.append).not.toHaveBeenCalled(); blocked.relay.close();
+  });
+
+  it('joins the paced client to the relay and fences old buffered plus in-flight audio during reset', async () => {
+    const f = setup(); const socket = f.connect();
+    const wire: Array<{ raw: Buffer; binary: boolean }> = [];
+    const client = {
+      readyState: 1, bufferedAmount: 0, binaryType: '',
+      onopen: null as (() => void) | null,
+      onmessage: null as ((event: { data: string }) => void) | null,
+      onerror: null as (() => void) | null, onclose: null as (() => void) | null,
+      send(data: string | ArrayBuffer) {
+        const binary = typeof data !== 'string'; const raw = Buffer.from(typeof data === 'string' ? data : new Uint8Array(data));
+        if (!binary && JSON.parse(raw.toString()).type === 'auth') socket.emit('message', raw, false);
+        else wire.push({ raw, binary });
+      },
+      close: vi.fn(),
+    };
+    const sendToClient = socket.send.bind(socket);
+    socket.send = value => { sendToClient(value); client.onmessage?.({ data: value }); };
+    const errors = vi.fn();
+    const audio = new StreamingAudio({ endpoint: 'wss://example.invalid/api/asr', createSocket: () => client as unknown as WebSocket,
+      onDelta: vi.fn(), onFinal: vi.fn(), onError: errors });
+    const starting = audio.start('a'.repeat(64)); client.onopen?.(); await flush(); expect(await starting).toBe(true);
+    audio.append(new Uint8Array(96_000).fill(1));
+    await vi.advanceTimersByTimeAsync(300); // Some old frames are already in flight; the remainder are queued locally.
+    expect(wire.filter(frame => frame.binary).length).toBeGreaterThan(1);
+    f.relay.resetConversation?.('group');
+    audio.append(new Uint8Array(3200).fill(3));
+    const forwarded: Buffer[] = [];
+    mocks.upstreams[0]!.append.mockImplementation((data: Buffer) => forwarded.push(Buffer.from(data)));
+    for (const frame of wire.splice(0)) { socket.emit('message', frame.raw, frame.binary); await flush(); }
+    await vi.advanceTimersByTimeAsync(5000);
+    for (const frame of wire.splice(0)) { socket.emit('message', frame.raw, frame.binary); await flush(); }
+    expect(forwarded).toEqual([Buffer.alloc(3200, 3)]);
+    expect(errors).not.toHaveBeenCalled(); expect(socket.terminate).not.toHaveBeenCalled();
+    audio.cancel(); f.relay.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
 });

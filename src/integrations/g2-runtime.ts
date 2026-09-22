@@ -18,7 +18,7 @@ export interface GlassesView {
   footer: string
 }
 
-export type G2Action = 'primary' | 'retry' | 'previous' | 'next' | 'exit'
+export type G2Action = 'primary' | 'retry' | 'lock' | 'previous' | 'next' | 'exit'
 export type G2State = 'idle' | 'connecting' | 'connected' | 'recording' | 'background'
   | 'disconnected' | 'unavailable' | 'error' | 'disposed'
 export interface G2Status { state: G2State; reason?: string }
@@ -68,6 +68,11 @@ const SAFE_VIEW: GlassesView = {
   header: '接続確認', content: 'スマホで操作を開始してください', footer: '音声取得は停止中',
 }
 
+// SDK 0.0.12 exposes separate CLICK (0) / DOUBLE_CLICK (3) events, but does
+// not specify their relative delivery order or gesture timing. This is the
+// app's coalescing window, not a claimed hardware double-tap threshold.
+const SINGLE_TAP_DELAY_MS = 500
+
 class BridgeTimeout extends Error {}
 
 function nativeHostAvailable(): boolean {
@@ -111,6 +116,8 @@ export class G2Runtime {
   private imageMode = false
   private lastImageContent: string | null = null
   private lastText: Partial<GlassesView> = {}
+  private singleTapTimer: ReturnType<typeof setTimeout> | null = null
+  private singleTapBlockedUntil = 0
 
   constructor(private readonly options: G2RuntimeOptions = {}) {
     this.timeoutMs = Number.isFinite(options.timeoutMs)
@@ -203,6 +210,7 @@ export class G2Runtime {
   }
 
   async stopAudio(reason = 'stopped'): Promise<boolean> {
+    this.cancelSingleTap()
     this.acceptingAudio = false
     this.audioVersion += 1
     if (this.audioTimer !== null) clearTimeout(this.audioTimer)
@@ -287,23 +295,35 @@ export class G2Runtime {
   }
 
   private handleEvent(event: G2Event): void {
-    const eventType = event.sysEvent?.eventType ?? event.textEvent?.eventType
-    if (eventType === OsEventTypeList.FOREGROUND_EXIT_EVENT) {
-      this.suspend('background', 'background')
-      return
-    }
-    if (eventType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
-      this.foreground = true
-      if (this.connected && !this.fatal) this.notify('connected', 'resume_required')
-      return
-    }
-    if ([OsEventTypeList.SYSTEM_EXIT_EVENT, OsEventTypeList.ABNORMAL_EXIT_EVENT, OsEventTypeList.DOUBLE_CLICK_EVENT]
-      .includes(eventType as OsEventTypeList)) {
+    // An absent eventType is protobuf zero only INSIDE an actual envelope.
+    // Check explicit non-zero IDs first, so an empty sibling envelope cannot
+    // turn a double-tap, lifecycle signal or scroll into a single tap.
+    // https://github.com/even-realities/evenhub-templates#handling-input
+    const eventTypes = [event.sysEvent?.eventType, event.textEvent?.eventType]
+    if (eventTypes.some(eventType => eventType === OsEventTypeList.SYSTEM_EXIT_EVENT || eventType === OsEventTypeList.ABNORMAL_EXIT_EVENT)) {
       this.suspend('disconnected', 'host_exit')
       this.action('exit')
       return
     }
+    if (eventTypes.includes(OsEventTypeList.FOREGROUND_EXIT_EVENT)) {
+      this.suspend('background', 'background')
+      return
+    }
+    if (eventTypes.includes(OsEventTypeList.FOREGROUND_ENTER_EVENT)) {
+      this.cancelSingleTap()
+      this.foreground = true
+      if (this.connected && !this.fatal) this.notify('connected', 'resume_required')
+      return
+    }
     if (!this.usable()) return
+    if (eventTypes.includes(OsEventTypeList.DOUBLE_CLICK_EVENT)) {
+      this.cancelSingleTap()
+      if (Date.now() >= this.singleTapBlockedUntil) {
+        this.singleTapBlockedUntil = Date.now() + SINGLE_TAP_DELAY_MS
+        this.action('lock')
+      }
+      return
+    }
     const audio = event.audioEvent
     if (audio && this.acceptingAudio && Date.now() >= this.audioDeadline) {
       void this.stopAudio('duration_limit')
@@ -320,9 +340,26 @@ export class G2Runtime {
       }
       try { this.options.onAudio?.(audio.audioPcm.slice()) } catch { void this.stopAudio('audio_handler_failed') }
     }
-    if (eventType === OsEventTypeList.SCROLL_TOP_EVENT) this.action('previous')
-    else if (eventType === OsEventTypeList.SCROLL_BOTTOM_EVENT) this.action('next')
-    else if (eventType === OsEventTypeList.CLICK_EVENT || event.textEvent && eventType === undefined) this.action('retry')
+    if (eventTypes.includes(OsEventTypeList.SCROLL_TOP_EVENT)) { this.cancelSingleTap(); this.action('previous') }
+    else if (eventTypes.includes(OsEventTypeList.SCROLL_BOTTOM_EVENT)) { this.cancelSingleTap(); this.action('next') }
+    else if (eventTypes.every(eventType => eventType === undefined || eventType === OsEventTypeList.CLICK_EVENT)
+      && (event.sysEvent || event.textEvent)) this.deferSingleTap()
+  }
+
+  private deferSingleTap(): void {
+    if (Date.now() < this.singleTapBlockedUntil) return
+    this.cancelSingleTap()
+    const version = this.connectionVersion
+    const epoch = this.viewEpoch
+    this.singleTapTimer = setTimeout(() => {
+      this.singleTapTimer = null
+      if (this.usable() && version === this.connectionVersion && epoch === this.viewEpoch) this.action('retry')
+    }, SINGLE_TAP_DELAY_MS)
+  }
+
+  private cancelSingleTap(): void {
+    if (this.singleTapTimer !== null) clearTimeout(this.singleTapTimer)
+    this.singleTapTimer = null
   }
 
   private suspend(state: 'background' | 'disconnected', reason: string): void {
@@ -408,6 +445,7 @@ export class G2Runtime {
   private usable(): boolean { return this.connected && this.foreground && !this.disposed && !this.fatal && this.bridge !== null }
 
   private cancelViews(): void {
+    this.cancelSingleTap()
     this.viewEpoch += 1
     this.pending?.resolve(false)
     this.pending = null

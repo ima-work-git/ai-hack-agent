@@ -404,11 +404,122 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     const runtime = new G2Runtime({ bridge: f.bridge, onAction })
     await runtime.connect()
     f.event({ textEvent: {} })
+    await vi.advanceTimersByTimeAsync(500)
     f.event({ sysEvent: { eventType: OsEventTypeList.CLICK_EVENT } })
+    await vi.advanceTimersByTimeAsync(500)
     f.event({ textEvent: { eventType: OsEventTypeList.SCROLL_TOP_EVENT } })
     f.event({ textEvent: { eventType: OsEventTypeList.SCROLL_BOTTOM_EVENT } })
     f.event({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } })
-    expect(onAction.mock.calls.flat()).toEqual(['retry', 'retry', 'previous', 'next', 'exit'])
+    expect(onAction.mock.calls.flat()).toEqual(['retry', 'retry', 'previous', 'next', 'lock'])
+    await runtime.dispose()
+  })
+
+  it.each([
+    { sysEvent: {} }, { textEvent: {} },
+    { sysEvent: { eventType: OsEventTypeList.CLICK_EVENT } },
+    { textEvent: { eventType: OsEventTypeList.CLICK_EVENT } },
+  ])('defers a single tap for double-tap disambiguation, including omitted protobuf zero: %j', async event => {
+    const f = fakeBridge(); const onAction = vi.fn()
+    const runtime = new G2Runtime({ bridge: f.bridge, onAction })
+    await runtime.connect()
+    f.event(event)
+    await vi.advanceTimersByTimeAsync(499)
+    expect(onAction).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('retry')
+    await runtime.dispose()
+  })
+
+  it('cancels a pending retry on double-tap, suppresses duplicate/trailing tap events, and keeps audio running', async () => {
+    const f = fakeBridge(); const onAction = vi.fn(); const onAudio = vi.fn()
+    const runtime = new G2Runtime({ bridge: f.bridge, onAction, onAudio })
+    await runtime.connect(); await runtime.startAudio({ continuous: true })
+    f.event({ sysEvent: {} })
+    await vi.advanceTimersByTimeAsync(250)
+    f.event({ sysEvent: { eventType: OsEventTypeList.CLICK_EVENT } })
+    await vi.advanceTimersByTimeAsync(150)
+    f.event({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } })
+    f.event({ textEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } })
+    f.event({ sysEvent: {} })
+    f.event(pcm())
+    await vi.advanceTimersByTimeAsync(500)
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('lock')
+    expect(runtime.status.state).toBe('recording')
+    expect(onAudio).toHaveBeenCalledOnce()
+    expect(vi.mocked(f.bridge.audioControl).mock.calls.filter(([open]) => !open)).toHaveLength(0)
+    // A later deliberate single tap remains usable after the suppression window.
+    f.event({ sysEvent: {} })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(onAction.mock.calls.flat()).toEqual(['lock', 'retry'])
+    await runtime.dispose()
+  })
+
+  it.each([
+    { sysEvent: {}, textEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } },
+    { sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT }, textEvent: {} },
+    { sysEvent: { eventType: OsEventTypeList.CLICK_EVENT }, textEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } },
+  ])('prioritizes explicit double-tap over an empty or zero-valued sibling envelope: %j', async event => {
+    const f = fakeBridge(); const onAction = vi.fn()
+    const runtime = new G2Runtime({ bridge: f.bridge, onAction })
+    await runtime.connect(); f.event(event)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('lock')
+    expect(runtime.status.state).toBe('connected')
+    await runtime.dispose()
+  })
+
+  it.each(['background', 'foreground', 'system-exit', 'abnormal-exit', 'disconnected', 'connectionFailed', 'dispose', 'stop-audio', 'new-subject', 'scroll'] as const)
+    ('discards a pending single tap during %s rather than applying it to a later state', async transition => {
+      const f = fakeBridge(); const onAction = vi.fn()
+      const runtime = new G2Runtime({ bridge: f.bridge, onAction })
+      await runtime.connect(); await runtime.startAudio({ continuous: true })
+      f.event({ sysEvent: {} })
+      await vi.advanceTimersByTimeAsync(100)
+      if (transition === 'background') f.event({ sysEvent: { eventType: OsEventTypeList.FOREGROUND_EXIT_EVENT } })
+      else if (transition === 'foreground') f.event({ sysEvent: { eventType: OsEventTypeList.FOREGROUND_ENTER_EVENT } })
+      else if (transition === 'system-exit') f.event({ sysEvent: { eventType: OsEventTypeList.SYSTEM_EXIT_EVENT } })
+      else if (transition === 'abnormal-exit') f.event({ sysEvent: { eventType: OsEventTypeList.ABNORMAL_EXIT_EVENT } })
+      else if (transition === 'disconnected' || transition === 'connectionFailed') f.device(transition)
+      else if (transition === 'dispose') await runtime.dispose()
+      else if (transition === 'stop-audio') await runtime.stopAudio()
+      else if (transition === 'new-subject') runtime.invalidateViews('new-person')
+      else if (transition === 'scroll') f.event({ textEvent: { eventType: OsEventTypeList.SCROLL_BOTTOM_EVENT } })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(onAction.mock.calls.flat()).not.toContain('retry')
+      if (transition === 'system-exit' || transition === 'abnormal-exit') {
+        expect(onAction).toHaveBeenCalledExactlyOnceWith('exit')
+        expect(runtime.status.state).toBe('disconnected')
+        expect(f.bridge.audioControl).toHaveBeenLastCalledWith(false)
+      }
+      await runtime.dispose()
+    })
+
+  it('does not reapply an old pending tap or old event subscription after reconnecting', async () => {
+    const f = fakeBridge(); const onAction = vi.fn()
+    const runtime = new G2Runtime({ bridge: f.bridge, onAction })
+    await runtime.connect()
+    const oldEvent = vi.mocked(f.bridge.onEvenHubEvent).mock.calls[0]![0]
+    f.event({ sysEvent: {} }); f.device('disconnected')
+    expect(await runtime.connect()).toBe(true)
+    oldEvent({ sysEvent: {} })
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(onAction).not.toHaveBeenCalled()
+    f.event({ sysEvent: {} })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('retry')
+    await runtime.dispose()
+  })
+
+  it('does not interpret audio or unknown system events as taps, and preserves a real system exit over a double-tap', async () => {
+    const f = fakeBridge(); const onAction = vi.fn()
+    const runtime = new G2Runtime({ bridge: f.bridge, onAction })
+    await runtime.connect(); await runtime.startAudio({ continuous: true })
+    f.event(pcm()); f.event({}); f.event({ sysEvent: { eventType: OsEventTypeList.IMU_DATA_REPORT }, textEvent: {} })
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(onAction).not.toHaveBeenCalled()
+    f.event({ sysEvent: { eventType: OsEventTypeList.SYSTEM_EXIT_EVENT }, textEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } })
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('exit')
+    expect(runtime.status.state).toBe('disconnected')
     await runtime.dispose()
   })
 })

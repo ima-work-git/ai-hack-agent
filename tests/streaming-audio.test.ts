@@ -14,11 +14,11 @@ class FakeSocket {
   open() { this.readyState = 1; this.onopen?.(); }
   event(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
 }
-function fixture() {
+function fixture(monotonicNow?: () => number) {
   const sockets: FakeSocket[] = [];
   const onDelta = vi.fn(); const onFinal = vi.fn(); const onError = vi.fn(); const onClose = vi.fn();
   const createSocket = vi.fn(() => { const socket = new FakeSocket(); sockets.push(socket); return socket as unknown as WebSocket; });
-  const audio = new StreamingAudio({ onDelta, onFinal, onError, onClose, endpoint: 'wss://example.test/api/asr', createSocket });
+  const audio = new StreamingAudio({ onDelta, onFinal, onError, onClose, endpoint: 'wss://example.test/api/asr', createSocket, monotonicNow });
   return { audio, onDelta, onFinal, onError, onClose, createSocket, get socket() { return sockets.at(-1)!; } };
 }
 
@@ -81,6 +81,92 @@ describe('streaming PCM client (mocked WebSocket)', () => {
     f.socket.bufferedAmount = 63_998; f.audio.append(new Uint8Array(2)); expect(f.socket.send).toHaveBeenCalledTimes(2);
     f.socket.bufferedAmount = 64_000; f.audio.append(new Uint8Array(2));
     expect(f.socket.send).toHaveBeenCalledTimes(2); expect(f.onError).toHaveBeenCalledOnce(); expect(f.onClose).toHaveBeenCalledOnce();
+  });
+
+  it('paces a three-second Bluetooth burst into bounded frames without changing PCM order', async () => {
+    const f = fixture(); const starting = f.audio.start('ticket'); f.socket.open(); f.socket.event({ type: 'ready' }); await starting;
+    const burst = Uint8Array.from({ length: 96_000 }, (_, index) => index % 251);
+    f.audio.append(burst);
+    expect(f.onError).not.toHaveBeenCalled();
+    expect(f.socket.send.mock.calls.slice(1).reduce((sum, [value]) => sum + (value as ArrayBuffer).byteLength, 0)).toBeLessThanOrEqual(3200);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.socket.send.mock.calls.slice(1).reduce((sum, [value]) => sum + (value as ArrayBuffer).byteLength, 0)).toBeLessThanOrEqual(3200 + 35_200);
+    await vi.advanceTimersByTimeAsync(2000);
+    const frames = f.socket.send.mock.calls.slice(1).map(([value]) => new Uint8Array(value as ArrayBuffer));
+    expect(frames.every(frame => frame.length <= 3200 && frame.length % 2 === 0)).toBe(true);
+    expect(Buffer.concat(frames)).toEqual(Buffer.from(burst));
+    expect(f.onError).not.toHaveBeenCalled(); f.audio.cancel();
+  });
+
+  it('preserves PCM across a wrapped ring buffer and copies input before later mutation', async () => {
+    const f = fixture(); const starting = f.audio.start('ticket'); f.socket.open(); f.socket.event({ type: 'ready' }); await starting;
+    const first = Uint8Array.from({ length: 96_000 }, (_, i) => i % 251);
+    const second = Uint8Array.from({ length: 64_000 }, (_, i) => (i + 7) % 251);
+    const expected = Buffer.concat([first, second]);
+    f.audio.append(first); first.fill(0); await vi.advanceTimersByTimeAsync(2000);
+    f.audio.append(second); second.fill(0); await vi.advanceTimersByTimeAsync(3000);
+    const frames = f.socket.send.mock.calls.slice(1).map(([value]) => new Uint8Array(value as ArrayBuffer));
+    expect(Buffer.concat(frames)).toEqual(expected); expect(f.onError).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0); f.audio.cancel();
+  });
+
+  it('paces five minutes of mildly faster capture without accumulating a backlog or losing audio', async () => {
+    const f = fixture(); const starting = f.audio.start('ticket'); f.socket.open(); f.socket.event({ type: 'ready' }); await starting;
+    let sent = 0; let largest = 0;
+    f.socket.send.mockImplementation(value => {
+      if (typeof value !== 'string') { sent += value.byteLength; largest = Math.max(largest, value.byteLength); }
+    });
+    for (let second = 0; second < 300; second++) {
+      f.audio.append(new Uint8Array(33_600)); await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(sent).toBe(300 * 33_600); expect(largest).toBeLessThanOrEqual(3200);
+    expect(f.onError).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0); f.audio.cancel();
+  });
+
+  it.each(['one-oversized-burst', 'sustained-double-rate'] as const)('stops %s before the fixed four-second queue can grow further', async kind => {
+    const f = fixture(); const starting = f.audio.start('ticket'); f.socket.open(); f.socket.event({ type: 'ready' }); await starting;
+    if (kind === 'one-oversized-burst') f.audio.append(new Uint8Array(128_002));
+    else {
+      for (let tick = 0; tick < 50; tick++) { f.audio.append(new Uint8Array(6400)); await vi.advanceTimersByTimeAsync(100); }
+    }
+    expect(f.onError).toHaveBeenCalledOnce(); expect(f.onClose).toHaveBeenCalledOnce();
+    expect(f.onError.mock.calls[0]![0].message).toContain('送信待ちが上限');
+    const sent = f.socket.send.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10_000); f.audio.append(new Uint8Array(2));
+    expect(f.socket.send).toHaveBeenCalledTimes(sent); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('clears pending audio before acknowledging a reset and sends only fresh PCM afterward', async () => {
+    const f = fixture(); const starting = f.audio.start('ticket'); f.socket.open(); f.socket.event({ type: 'ready' }); await starting;
+    f.audio.append(new Uint8Array(96_000).fill(1));
+    expect(f.socket.send).toHaveBeenCalledTimes(2);
+    f.socket.event({ type: 'reset', generation: 2 });
+    expect(f.socket.send.mock.calls[2]![0]).toBe(JSON.stringify({ type: 'reset_ack', generation: 2 }));
+    f.audio.append(new Uint8Array([7, 8]));
+    f.socket.event({ type: 'reset', generation: 1 });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.socket.send).toHaveBeenCalledTimes(4);
+    expect([...new Uint8Array(f.socket.send.mock.calls[3]![0] as ArrayBuffer)]).toEqual([7, 8]);
+    expect(f.onError).not.toHaveBeenCalled(); f.audio.cancel(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('erases scheduled PCM on cancel and does not send it on a later connection', async () => {
+    const f = fixture(); const starting = f.audio.start('ticket'); f.socket.open(); f.socket.event({ type: 'ready' }); await starting;
+    const old = f.socket; f.audio.append(new Uint8Array(96_000).fill(1)); f.audio.cancel();
+    const next = f.audio.start('next'); f.socket.open(); f.socket.event({ type: 'ready' }); await next;
+    f.audio.append(new Uint8Array([9, 10])); await vi.advanceTimersByTimeAsync(5000);
+    expect(old.send).toHaveBeenCalledTimes(2); expect(f.socket.send).toHaveBeenCalledTimes(2);
+    expect([...new Uint8Array(f.socket.send.mock.calls[1]![0] as ArrayBuffer)]).toEqual([9, 10]);
+    f.audio.cancel(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not replay stale buffered audio after the event loop has been stalled for over four seconds', async () => {
+    let now = 0;
+    const f = fixture(() => now); const starting = f.audio.start('ticket'); f.socket.open(); f.socket.event({ type: 'ready' }); await starting;
+    f.audio.append(new Uint8Array(96_000)); expect(f.socket.send).toHaveBeenCalledTimes(2);
+    now = 5000; await vi.advanceTimersByTimeAsync(100);
+    expect(f.onError).toHaveBeenCalledOnce(); expect(f.socket.send).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('cancels preparation and ignores delayed events from the previous connection after restart', async () => {

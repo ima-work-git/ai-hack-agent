@@ -21,6 +21,7 @@ interface RelayOptions {
   allowOrigin: (req: IncomingMessage) => boolean;
   takeTicket: (ticket: string) => StreamGrant;
   now: () => number;
+  monotonicNow?: () => number;
 }
 
 const relayErrors = {
@@ -33,12 +34,17 @@ const relayErrors = {
   NOT_READY: '音声認識の接続準備が完了していません。もう一度開始してください。',
   AUDIO_FORMAT: '音声データの形式またはサイズが不正なため停止しました。',
   CONTROL_FORMAT: '音声接続の操作形式が不正なため停止しました。',
+  RESET_TIMEOUT: '音声入力の切替確認がタイムアウトしました。再開してください。',
   QUEUE_BACKPRESSURE: '音声の送信待ちが上限を超えました。接続を確認して再開してください。',
   RATE_LIMIT: '音声の送信速度が上限を超えました。接続を確認して再開してください。',
   CONNECTION: '音声認識との接続に失敗しました。接続を確認して再開してください。',
   ASR_ERROR: '音声認識サービスの処理でエラーが発生しました。',
 } as const;
 type RelayErrorCode = keyof typeof relayErrors;
+// 16 kHz mono PCM16 is 32,000 B/s. Allow bounded capture-clock/scheduling
+// variation, not an unlimited stream: at most four seconds burst + 1.15x rate.
+const RATE_BURST_BYTES = 128_000;
+const RATE_BYTES_PER_MS = 32 * 1.15;
 const catalogKeywords = PUBLIC_FIGURE_CATALOG.slice(0, 15).map(entry => entry.publicNames[0] ?? entry.canonicalName);
 const recognitionKeywords = (values: readonly string[]) => [...new Set([...values, ...catalogKeywords])].filter(word => typeof word === 'string' && word.trim() && word.length <= 80 && !/[<>\r\n]/u.test(word)).slice(0, 20);
 const safeStartErrors = new Set(['音声接続を終了しました。', '音声認識の設定が不足しています。', '対応していない音声モデルです。', '音声認識の用語設定を確認してください。', '音声認識は接続されていません。']);
@@ -53,6 +59,7 @@ export interface StreamingRelay {
 
 /** Same-origin, one-use authentication. Only server-side credentials reach upstream. */
 export function createStreamingRelay(options: RelayOptions): StreamingRelay {
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
   const server = new WebSocketServer({ noServer: true, maxPayload: 64_000, perMessageDeflate: false });
   const connections = new Map<WebSocket, { grant?: StreamGrant; close: () => void; reset: () => boolean; updateKeywords: (keywords: readonly string[]) => boolean }>();
   server.on('connection', socket => {
@@ -60,9 +67,10 @@ export function createStreamingRelay(options: RelayOptions): StreamingRelay {
     let upstream: OpenAIStreamingASR | undefined;
     let grant: StreamGrant | undefined;
     let bytes = 0; let reservedMinutes = 0; let queuedBytes = 0;
-    let allowance = 64_000; let lastFrameAt = options.now(); let connectedAt = options.now();
+    let allowance = RATE_BURST_BYTES; let lastFrameAt = monotonicNow(); let connectedAt = options.now();
     let pending = Promise.resolve();
     let inputGeneration = 0; let resetRequested = false;
+    let awaitingResetAck: number | undefined; let resetAckTimer: ReturnType<typeof setTimeout> | undefined;
     let keywords: readonly string[] = catalogKeywords;
     const send = (value: unknown) => {
       if (ended || socket.readyState !== WebSocket.OPEN) return;
@@ -76,6 +84,7 @@ export function createStreamingRelay(options: RelayOptions): StreamingRelay {
         try { socket.send(JSON.stringify({ type: 'closed' })); } catch { /* Teardown must still close upstream. */ }
       }
       clearTimeout(authTimer); clearInterval(expiryTimer);
+      clearTimeout(resetAckTimer);
       upstream?.stop(); connections.delete(socket); socket.terminate();
     };
     const fail = (code: RelayErrorCode, message: string = relayErrors[code]) => {
@@ -109,6 +118,11 @@ export function createStreamingRelay(options: RelayOptions): StreamingRelay {
     const reset = () => {
       if (ended || !grant?.valid()) return false;
       inputGeneration++; resetRequested = true;
+      awaitingResetAck = inputGeneration;
+      clearTimeout(resetAckTimer);
+      resetAckTimer = setTimeout(() => fail('RESET_TIMEOUT'), 5000);
+      send({ type: 'reset', generation: inputGeneration });
+      if (ended) return false;
       if (ready && upstream) { resetRequested = false; return upstream.resetInput(); }
       return true;
     };
@@ -159,14 +173,24 @@ export function createStreamingRelay(options: RelayOptions): StreamingRelay {
         return;
       }
       if (!binary) {
-        try { if (JSON.parse(data.toString()).type === 'stop') { finish(); return; } } catch { /* Invalid control fails closed. */ }
+        try {
+          const control = JSON.parse(data.toString());
+          if (control.type === 'stop') { finish(); return; }
+          if (control.type === 'reset_ack' && Number.isSafeInteger(control.generation) && control.generation > 0 && control.generation <= inputGeneration) {
+            if (control.generation === awaitingResetAck) { awaitingResetAck = undefined; clearTimeout(resetAckTimer); }
+            return;
+          }
+        } catch { /* Invalid control fails closed. */ }
         fail('CONTROL_FORMAT'); return;
       }
       if (!grant?.valid()) { fail('AUTH_EXPIRED'); return; }
       if (!ready) { fail('NOT_READY'); return; }
       if (!data.length || data.length > 64_000 || data.length % 2) { fail('AUDIO_FORMAT'); return; }
+      // Ignore in-flight old audio until the client has cleared its queue and
+      // acknowledged the latest reset on this same ordered WebSocket.
+      if (awaitingResetAck !== undefined) return;
       if (queuedBytes + data.length > 128_000) { fail('QUEUE_BACKPRESSURE'); return; }
-      const at = options.now(); allowance = Math.min(64_000, allowance + Math.max(0, at - lastFrameAt) * 32); lastFrameAt = at;
+      const at = Math.max(lastFrameAt, monotonicNow()); allowance = Math.min(RATE_BURST_BYTES, allowance + (at - lastFrameAt) * RATE_BYTES_PER_MS); lastFrameAt = at;
       if (data.length > allowance) { fail('RATE_LIMIT'); return; }
       allowance -= data.length; queuedBytes += data.length;
       const copy = Buffer.from(data); const ownGrant = grant; const audioGeneration = inputGeneration;
