@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { evidenceMatchesTarget, isTargetGroundedInTranscript, isVerifiedPublicSource, normalizeIdentity, verifiedAliasForInputTarget, verifiedAliasForTarget } from '../src/shared/identity-aliases.ts';
+import { evidenceMatchesTarget, isTargetGroundedInTranscript, isVerifiedPublicSource, normalizeIdentity, verifiedAliasForInputTarget, verifiedAliasForTarget, VERIFIED_IDENTITY_ALIASES } from '../src/shared/identity-aliases.ts';
+import { PUBLIC_FIGURE_CATALOG } from '../src/shared/public-figure-catalog.ts';
 
 const target = { personName: '千代田まどか', companyName: 'Microsoft' };
 describe('public-source verified identity aliases', () => {
@@ -54,5 +55,67 @@ describe('public-person discovery and kana equivalence', () => {
     expect(evidenceMatchesTarget('ひろゆきです。', publicTarget, 'https://x.com/another')).toBe(false);
     expect(isVerifiedPublicSource('https://x.com.evil.example/hirox246', publicTarget)).toBe(false);
     expect(isVerifiedPublicSource('https://www.youtube.com/watch?v=other', { personName: '堀江貴文', companyName: '' })).toBe(false);
+  });
+});
+
+describe('catalog names stay separate from ASR corrections', () => {
+  it.each(PUBLIC_FIGURE_CATALOG)('accepts the source-backed kana of $canonicalName without inventing an X account', record => {
+    const companyName = record.id === 'madoka-chiyoda' ? 'Microsoft' : '';
+    const alias = verifiedAliasForTarget({ personName: record.kana, companyName });
+    expect(alias?.target).toEqual({ personName: record.canonicalName, companyName });
+    expect(alias?.xHandle).toBe(record.xHandle);
+    expect(isTargetGroundedInTranscript(`${record.kana}さんの話です。${companyName}`, '', alias!.target)).toBe(true);
+  });
+
+  it('never treats ASR homophones as verified names or current-transcript grounding', () => {
+    const target = { personName: '西村博之', companyName: '' };
+    expect(verifiedAliasForTarget({ personName: '広行', companyName: '' })).toBeUndefined();
+    expect(verifiedAliasForInputTarget('広行さんの話題です', target)).toBeUndefined();
+    expect(isTargetGroundedInTranscript('広行さんの話題です', 'ひろゆき', target)).toBe(false);
+    expect(evidenceMatchesTarget('広行さんが公開イベントに登壇します。', target, 'https://modein.co.jp/corp/')).toBe(false);
+    for (const record of PUBLIC_FIGURE_CATALOG) for (const spelling of record.commonASRHomophones) {
+      expect(VERIFIED_IDENTITY_ALIASES.some(alias => alias.personNames.includes(spelling))).toBe(false);
+    }
+  });
+
+  it('preserves the existing company-scoped Chomado rule', () => {
+    expect(verifiedAliasForTarget({ personName: 'ちょまど', companyName: '' })).toBeUndefined();
+    expect(verifiedAliasForTarget({ personName: 'ちよだまどか', companyName: 'Microsoft' })?.xHandle).toBe('chomado');
+    expect(verifiedAliasForTarget({ personName: 'ちよだまどか', companyName: 'made in Japan' })).toBeUndefined();
+  });
+
+  it('does not grant unknown accounts or nonstandard ports to catalog entries', () => {
+    const target = { personName: '孫正義', companyName: '' };
+    expect(verifiedAliasForTarget(target)?.xHandle).toBeUndefined();
+    expect(isVerifiedPublicSource('https://x.com/masason', target)).toBe(false);
+    expect(isVerifiedPublicSource('https://group.softbank:444/about/officer/son', target)).toBe(false);
+    expect(isVerifiedPublicSource('https://group.softbank/about/officer/son', target)).toBe(true);
+    expect(evidenceMatchesTarget('Masayoshi Son', target, 'https://unrelated.example/profile')).toBe(false);
+  });
+});
+
+describe('explicit source-backed company relationships', () => {
+  const canonical = { personName: '西村博之', companyName: '株式会社made in Japan' };
+  const sourceUrl = 'https://modein.co.jp/corp/';
+  it.each(['株式会社メイドインジャパン', 'メイドインジャパン', 'made in Japan', '株式会社made in Japan'])(
+    'keeps both identity and the requested company when canonicalizing %s', companyName => {
+      const alias = verifiedAliasForTarget({ personName: 'ひろゆき', companyName });
+      expect(alias?.target).toEqual(canonical);
+      expect(alias?.sourceUrls[0]).toBe(sourceUrl);
+      expect(verifiedAliasForInputTarget(`${companyName}のひろゆきさん`, canonical)?.target).toEqual(canonical);
+      expect(evidenceMatchesTarget('株式会社made in Japan。代表取締役社長 西村博之。', { personName: '西村博之', companyName }, sourceUrl)).toBe(true);
+    },
+  );
+  it('requires a company clue in the input and evidence, even on the approved domain', () => {
+    expect(verifiedAliasForInputTarget('ひろゆきさん', canonical)).toBeUndefined();
+    expect(verifiedAliasForInputTarget('別会社のひろゆきさん', canonical)).toBeUndefined();
+    expect(isTargetGroundedInTranscript('ひろゆきさん', 'メイドインジャパンの話です', canonical)).toBe(true);
+    expect(isTargetGroundedInTranscript('メイドインジャパンです', 'ひろゆきさん', canonical)).toBe(false);
+    expect(isTargetGroundedInTranscript('ひろゆきさん', '別会社', canonical)).toBe(false);
+    expect(evidenceMatchesTarget('西村博之は別会社の代表です。', canonical, sourceUrl)).toBe(false);
+    expect(evidenceMatchesTarget('株式会社made in Japan。別人が代表です。', canonical, sourceUrl)).toBe(false);
+    expect(evidenceMatchesTarget('ひろゆき。Notmade in Japanの代表です。', canonical, sourceUrl)).toBe(false);
+    expect(verifiedAliasForTarget({ personName: 'ひろゆき', companyName: 'Microsoft' })).toBeUndefined();
+    expect(verifiedAliasForTarget({ personName: 'ホリエモン', companyName: 'made in Japan' })).toBeUndefined();
   });
 });

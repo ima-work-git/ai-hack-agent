@@ -21,7 +21,7 @@ const BOARD_MARKUP = Array.from({ length: 4 }, (_, index) => `<button type="butt
 const app = document.getElementById('app')!;
 app.innerHTML = `
 <header class="masthead"><div class="wordmark"><span class="mark" aria-hidden="true">◌</span><div><div class="eyebrow">AI HACK · EVEN G2</div><h1>これで誰でも雑談マスター</h1></div></div><span class="pill" id="connection">スマートフォン表示</span></header>
-<section class="panel login hidden" id="login"><div class="eyebrow">WELCOME BACK</div><h2>セッションを始める</h2><p class="muted">会話のデータは最長15分で削除されます。再開時もマイクは自動で起動しません。</p><form id="login-form"><label for="access-code">利用コード</label><input type="password" id="access-code" autocomplete="current-password" minlength="16"><label class="check"><input id="remember-device" type="checkbox" checked><span>この端末では12時間、利用コードの入力を省略する</span></label><div class="controls"><button class="primary" type="submit">開始する</button></div><p class="status" id="login-status" role="status"></p></form></section>
+<section class="panel login hidden" id="login"><div class="eyebrow">WELCOME BACK</div><h2>セッションを始める</h2><p class="muted">会話データは15分保持し、その後削除します。終了・バックグラウンドでは録音を停止します。再開時もマイクは自動で起動しません。</p><form id="login-form"><label for="access-code">利用コード</label><input type="password" id="access-code" autocomplete="current-password" minlength="16"><label class="check"><input id="remember-device" type="checkbox" checked><span>この端末では12時間、利用コードの入力を省略する</span></label><div class="controls"><button class="primary" type="submit">開始する</button></div><p class="status" id="login-status" role="status"></p></form></section>
 <main class="workspace hidden" id="workspace"><div class="intro"><div><div class="eyebrow">LESS SEARCHING, MORE CONVERSATION</div><h1>目の前の会話に、次のきっかけを。</h1><p>公開情報の調査と根拠の確認を、エージェントに任せる。</p></div><span class="mode-badge" id="mode-badge">体験デモ · 架空の人物・固定データ</span></div>
 <div class="notice hidden" id="resume-notice">前のセッションがあります。内容を表示するには、再開してください。<div class="controls"><button id="resume">前の内容を再開</button></div></div>
 <div class="grid"><div><section class="panel"><div class="section-head"><h2>会話から調べる</h2><span class="section-number">01 / INPUT</span></div><p class="muted">氏名と会社名を手がかりに、公開情報を確認します。</p>
@@ -30,8 +30,8 @@ app.innerHTML = `
 <div class="controls"><button id="sample">架空の会話を入力</button><button id="connect">G2を接続</button></div>
 <label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。会話モードは音声をOpenAIへ逐次送信して認識し、OrcaRouterで調査します。音声は保存しません。短い録音は最大30秒です。</span></label>
 <label for="microphone">使うマイク</label><select id="microphone"><option value="g2" ${conversationLaunch ? 'selected' : ''}>Even G2のマイク</option><option value="phone" ${conversationLaunch ? '' : 'selected'}>スマートフォンのマイク</option></select>
-<div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
-<div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><div id="candidates" class="candidates"></div>
+<div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="retry-listening" disabled>聞き直す</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
+<div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><p class="status hidden" id="correction-hint" role="status"></p><div id="candidates" class="candidates"></div>
 </section><section class="panel"><div class="section-head"><h2>エージェントの判断</h2><span class="section-number">02 / PROCESS</span></div><p id="trace-empty" class="empty-trace">調査中の判断と復旧の記録がここに表示されます。</p><ol id="trace" class="trace" aria-label="調査の処理履歴"></ol><details><summary>実APIの設定状況</summary><p class="muted" id="configuration"></p><p class="muted">APIキーと費用上限はサーバー側で設定します。</p></details></section></div>
 <div><div class="section-head"><h2>調査結果と質問 · 4件一覧</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="4件の調査結果と質問"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="topic-board" id="card-board">${BOARD_MARKUP}</div><div class="hud-foot"><span id="hud-source">各カードを押すと原文・出典を表示</span><span id="hud-expiry">0 / 4件確認</span></div></section><nav class="card-nav" aria-label="出典詳細の選択"><button id="previous" aria-label="前の出典" disabled>← 前の出典</button><span id="card-count">0 / 0</span><button id="next" aria-label="次の出典" disabled>次の出典 →</button></nav>
 <div class="notice" id="result-note">体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。</div><div class="metrics"><div class="metric"><strong id="metric-time">—</strong><span>調査にかかった時間</span></div><div class="metric"><strong id="metric-calls">—</strong><span>AI / 検索 / 本文</span></div><div class="metric"><strong id="metric-cost">—</strong><span id="cost-label">実費は未計測</span></div></div><section class="panel evidence-panel"><div class="section-head"><h2>情報の根拠</h2><span class="section-number">04 / EVIDENCE</span></div><p class="muted" id="source-empty">本文の引用・出典・取得時刻を、カードごとに確認できます。</p><div id="sources"></div></section></div></div></main>
@@ -62,6 +62,11 @@ let microphoneConnecting = false;
 let conversation: StreamingAudio | null = null;
 let pendingTranscript: { itemId: string; text: string } | null = null;
 let identifyingTranscript = false;
+let transcriptDrainId = 0;
+let conversationSubjectGeneration = 0;
+let resettingConversation = false;
+let keepaliveController: AbortController | null = null;
+const ignoredTranscriptItems = new Set<string>();
 let completedTranscript = '';
 const partialTranscripts = new Map<string, string>();
 let conversationRunning = false;
@@ -87,6 +92,7 @@ function refreshControls() {
   $('scenario').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
   $('record').toggleAttribute('disabled', !recording && (microphoneConnecting || audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked));
   $('conversation').toggleAttribute('disabled', microphoneConnecting || recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked);
+  $('retry-listening').toggleAttribute('disabled', !conversationRunning || !conversationId || resettingConversation);
   $('conversation').textContent = voicePhase === 'error' ? '会話モードを再開' : '会話モードを開始';
   $('record').textContent = recording ? conversationRunning ? '会話モードを終了' : '録音を止めて調べる' : '音声で入力';
   if (voicePhase !== 'off') queueVoiceDisplay();
@@ -229,7 +235,7 @@ async function api(path: string, init: RequestInit = {}): Promise<Response> {
   const sentToken = token; const sentGeneration = authGeneration;
   const headers = new Headers(init.headers); if (sentToken) headers.set('Authorization', `Bearer ${sentToken}`);
   const response = await fetch(path, { ...init, headers, cache: 'no-store', credentials: 'same-origin' });
-  if (!response.ok) { const body = await response.json().catch(() => ({})); if (response.status === 401 && token === sentToken && authGeneration === sentGeneration) { token = ''; expiresAt = 0; controller?.abort(); controller = null; running = false; currentId = crypto.randomUUID(); newViewToken(); void stopRecording(false); clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = 'ログインの有効期限が切れました。再読み込みするか、利用コードで開始してください。'; } throw new Error(body.message || '処理できませんでした。接続・設定・入力を確認してください。'); }
+  if (!response.ok) { const body = await response.json().catch(() => ({})); if (response.status === 401 && token === sentToken && authGeneration === sentGeneration) { token = ''; expiresAt = 0; controller?.abort(); controller = null; running = false; currentId = crypto.randomUUID(); newViewToken(); void stopRecording(false); clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = 'ログインの有効期限が切れました。再読み込みするか、利用コードで開始してください。'; } throw Object.assign(new Error(typeof body?.message === 'string' ? body.message : '処理できませんでした。接続・設定・入力を確認してください。'), { status: response.status, code: typeof body?.code === 'string' ? body.code : undefined }); }
   return response;
 }
 const json = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -293,6 +299,7 @@ async function redeemQrLogin(): Promise<boolean> {
   } finally { clearTimeout(timeout); setAuthBusy(false); }
 }
 function clearConversation() {
+  $('correction-hint').textContent = ''; $('correction-hint').classList.add('hidden');
   clearResult(); lastInput = null; $<HTMLTextAreaElement>('text').value = '';
   $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
   $('resume-notice').classList.add('hidden'); $<HTMLInputElement>('consent').checked = false;
@@ -301,7 +308,7 @@ async function expireSession() {
   const generation = ++authGeneration; expiresAt = 0;
   await cancel(); if (generation !== authGeneration) return;
   token = ''; clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden');
-  $('login-status').textContent = '15分経過したため会話データを削除しました。';
+  $('login-status').textContent = '利用期限が切れたため会話データを削除しました。';
   if (await restoreLogin()) status('前の会話データを削除し、新しいセッションを開始しました。マイクは停止しています。');
 }
 async function research(selectedCandidateId?: string, preparedId?: string, activeConversationId?: string) {
@@ -327,11 +334,11 @@ async function research(selectedCandidateId?: string, preparedId?: string, activ
         if (!line.trim()) continue; const message = JSON.parse(line);
         if (message.type === 'trace') addTrace(message.event);
         else if (message.type === 'result') { const parsed = ResearchResultSchema.parse(message.result); if (parsed.requestId === ownId && parsed.subjectRevision === revision) { gotResult = true; showResult(parsed); } }
-        else if (message.type === 'error') throw new Error(message.message);
+        else if (message.type === 'error') throw Object.assign(new Error(message.message), { code: typeof message.code === 'string' ? message.code : undefined });
       }
     }
     if (!gotResult && !ownController.signal.aborted) throw new Error('接続が中断されました。再調査してください。');
-  } catch (error) { if (currentId === ownId && !ownController.signal.aborted) { status(error instanceof Error ? error.message : '調査を完了できませんでした。', true); await sendView('これで誰でも雑談マスター', '調査を完了できませんでした。', '入力・設定・接続を確認'); } }
+  } catch (error) { if (currentId === ownId && !ownController.signal.aborted) { if (activeConversationId) { if (preparedId) throw error; if (mustStopConversation(error)) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話の調査を続けられませんでした。'); } else await waitForNextUtterance(error instanceof Error ? error.message : '調査を完了できませんでした。'); return; } status(error instanceof Error ? error.message : '調査を完了できませんでした。', true); await sendView('これで誰でも雑談マスター', '調査を完了できませんでした。', '入力・設定・接続を確認'); } }
   finally { if (controller === ownController) { running = false; controller = null; refreshControls(); } }
 }
 async function cancel() {
@@ -354,11 +361,13 @@ function acceptAudio(chunk: Uint8Array) {
   if (!recording || audioBytes + chunk.length > 960_000) return;
   audioChunks.push(chunk.slice()); audioBytes += chunk.length;
 }
-g2 = new G2Runtime({ onStatus: g2Status, onAudio: acceptAudio, onAction: action => { if (action === 'next') { cardIndex++; renderCard(); } else if (action === 'previous') { cardIndex--; renderCard(); } else if (action === 'exit') void cancel(); } });
+g2 = new G2Runtime({ onStatus: g2Status, onAudio: acceptAudio, onAction: action => { if (action === 'next') { cardIndex++; renderCard(); } else if (action === 'previous') { cardIndex--; renderCard(); } else if (action === 'retry') { if (conversationRunning) void retryConversation(); else { cardIndex++; renderCard(); } } else if (action === 'exit') void cancel(); } });
 const phone = new PhoneAudio({ onAudio: acceptAudio, onStopped: reason => { if (recording && audioSource === 'phone') { if (conversationRunning) void cancel(); else void stopRecording(reason !== 'error'); } }, onError: message => status(message, true) });
 function abortConversation() {
   const wasActive = conversationRunning;
   const group = conversationId;
+  conversationSubjectGeneration++; transcriptDrainId++; identifyingTranscript = false; resettingConversation = false; ignoredTranscriptItems.clear();
+  keepaliveController?.abort(); keepaliveController = null;
   const stream = conversation; conversation = null; conversationRunning = false; conversationId = ''; pendingTranscript = null; partialTranscripts.clear(); completedTranscript = ''; stream?.cancel();
   if (wasActive) setVoicePhase('stopped');
   if (group && token) {
@@ -366,8 +375,21 @@ function abortConversation() {
     void api('/api/cancel', json({ requestId: currentId, subjectRevision: conversationRequestRevision || Math.max(1, revision + 1), conversationId: group })).catch(() => {});
   }
 }
+function mustStopConversation(error: unknown): boolean {
+  const details = error && typeof error === 'object' ? error as { status?: number; code?: string; message?: string } : {};
+  return details.status === 401 || details.status === 403 || details.status === 429 && !details.code ||
+    /^(?:BUDGET_|AUTH_|SESSION_|CONVERSATION_EXPIRED|CONVERSATION_NOT_FOUND)/u.test(details.code ?? '') ||
+    /費用|予算|認証|ログイン|利用期限|(?:セッション|会話モード).*(?:終了|失効|期限)/u.test(details.message ?? '');
+}
+async function waitForNextUtterance(message: string) {
+  conversationLastKey = ''; conversationLastAt = 0;
+  newViewToken(); clearResult();
+  status(`${message} 聞き取りは続いています。名前や所属を言い直してください。`);
+  await sendView('聞き取りを続けています', '調査を完了できませんでした。名前や所属を言い直してください。', '次の発話を待っています');
+}
 async function processConversationTranscript(text: string, generation: number) {
-  const valid = () => generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
+  const subjectGeneration = conversationSubjectGeneration;
+  const valid = () => subjectGeneration === conversationSubjectGeneration && !resettingConversation && generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
   if (!valid()) return;
   const id = crypto.randomUUID(); currentId = id; conversationRequestRevision = revision + 1;
   const own = new AbortController(); controller = own; audioBusy = true; refreshControls();
@@ -377,12 +399,20 @@ async function processConversationTranscript(text: string, generation: number) {
     $<HTMLTextAreaElement>('text').value = typeof data.text === 'string' ? data.text : '';
     const parsed = TargetSchema.array().max(3).safeParse(data.targets);
     const targets = parsed.success ? parsed.data : [];
+    const correctionHint = typeof data.correctionHint === 'string' ? data.correctionHint.trim().slice(0, 400) : '';
+    const correctionCandidate = TargetSchema.safeParse(data.correctionCandidate);
+    const candidateNotice = targets.length === 0 && correctionCandidate.success
+      ? `候補：${correctionCandidate.data.personName}。名前を言い直してください。` : '';
+    const correctionNotice = [candidateNotice, correctionHint].filter(Boolean).join(' ');
+    $('correction-hint').textContent = correctionNotice;
+    $('correction-hint').classList.toggle('hidden', !correctionNotice);
     if (targets.length !== 1) {
-      if (targets.length > 1 || data.hasPersonMention !== false) {
+      if (targets.length > 1 || data.hasPersonMention !== false || correctionNotice) {
+        conversationLastKey = ''; conversationLastAt = 0;
         newViewToken(); clearResult();
-        await sendView('人物を確認', targets.length > 1 ? '複数の人物が出ています。' : '人物名や所属などを教えてください。', '同じ人として結び付けません');
+        await sendView('人物を確認', correctionNotice || (targets.length > 1 ? '複数の人物が出ています。' : '人物名や所属などを教えてください。'), '断定せず、言い直しを待っています');
       }
-      status(targets.length > 1 ? '複数の人物が出ています。調べたい人物を一人ずつ話してください。' : '聞き取り中です。人物名が出たら公開情報を調べます。');
+      status(correctionNotice || (targets.length > 1 ? '複数の人物が出ています。調べたい人物を一人ずつ話してください。' : '聞き取り中です。人物名が出たら公開情報を調べます。'));
       return;
     }
     const target = verifiedAliasForTarget(targets[0]!)?.target ?? targets[0]!;
@@ -394,45 +424,100 @@ async function processConversationTranscript(text: string, generation: number) {
     $<HTMLTextAreaElement>('text').value = `人物の候補：氏名「${target.personName}」${target.companyName ? `、会社名「${target.companyName}」` : '、所属は未指定'}。本人の公開プロフィールで確認してください。直近の発話：${data.text}`;
     audioBusy = false; if (controller === own) controller = null;
     await research(undefined, id, conversationId);
-    if (result?.status === 'awaiting_confirmation' && valid()) {
-      const stream = conversation; conversation = null; conversationRunning = false; recording = false; audioBusy = false; audioGeneration++; pendingTranscript = null; stream?.cancel();
-      setVoicePhase('paused');
-      await (audioSource === 'g2' ? g2.stopAudio() : phone.stop());
-      status('相手の確認のため聞き取りを一時停止しました。候補を選び、会話モードを再開してください。');
+    if (!valid()) return;
+    if (result?.status === 'awaiting_confirmation') {
+      conversationLastKey = ''; conversationLastAt = 0;
+      status('聞き取りを続けています。名前や所属を言い直すか、候補を選んでください。「聞き直す」で対象をリセットできます。');
     }
-    if (result?.reasonCode === 'BUDGET_EXHAUSTED') throw new Error('費用上限に達したため、会話モードを終了しました。');
-  } finally { if (controller === own) controller = null; if (generation === audioGeneration) audioBusy = false; refreshControls(); }
+    if (result && mustStopConversation({ code: result.reasonCode, message: result.message })) throw Object.assign(new Error(result.message), { code: result.reasonCode });
+    if (result?.status === 'failed') await waitForNextUtterance(result.message);
+  } finally { if (controller === own) controller = null; if (subjectGeneration === conversationSubjectGeneration && generation === audioGeneration) audioBusy = false; refreshControls(); }
 }
 async function drainTranscripts(generation: number) {
-  if (identifyingTranscript) return;
+  if (identifyingTranscript || resettingConversation) return;
+  const drainId = ++transcriptDrainId;
   identifyingTranscript = true;
   try {
-    while (pendingTranscript && conversationRunning && generation === audioGeneration) {
+    while (drainId === transcriptDrainId && pendingTranscript && conversationRunning && !resettingConversation && generation === audioGeneration) {
       const next = pendingTranscript; pendingTranscript = null;
       await processConversationTranscript(next.text, generation);
     }
   } catch (error) {
-    if (generation === audioGeneration && conversationRunning) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話の調査を続けられませんでした。'); }
-  } finally { identifyingTranscript = false; if (pendingTranscript && conversationRunning) void drainTranscripts(audioGeneration); }
+    if (drainId === transcriptDrainId && generation === audioGeneration && conversationRunning) {
+      const message = error instanceof Error ? error.message : '人物の調査を完了できませんでした。';
+      if (mustStopConversation(error)) { await stopRecording(false); reportVoiceError(message); }
+      else await waitForNextUtterance(message);
+    }
+  } finally { if (drainId === transcriptDrainId) { identifyingTranscript = false; if (pendingTranscript && conversationRunning && !resettingConversation) void drainTranscripts(audioGeneration); } }
+}
+async function keepConversationAlive() {
+  if (!conversationRunning || !conversationId || !token || document.hidden || pageLeaving || !$<HTMLInputElement>('consent').checked || keepaliveController) return;
+  const group = conversationId; const generation = audioGeneration; const expectedToken = token;
+  const own = new AbortController(); keepaliveController = own;
+  const timeout = setTimeout(() => own.abort(), 8_000);
+  const valid = () => generation === audioGeneration && conversationRunning && conversationId === group && token === expectedToken && !document.hidden && !pageLeaving;
+  try {
+    const data = await (await api('/api/conversation/keepalive', { ...json({ conversationId: group }), signal: own.signal })).json();
+    if (!valid()) return;
+    if (!Number.isFinite(data.expiresAt) || data.expiresAt <= Date.now()) throw new Error('会話の利用期限を確認できませんでした。もう一度開始してください。');
+    expiresAt = data.expiresAt;
+    if (Number.isInteger(data.revision) && data.revision >= 0) revision = Math.max(revision, data.revision);
+  } catch (error) {
+    if (valid()) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話の接続を確認できませんでした。もう一度開始してください。'); }
+  } finally { clearTimeout(timeout); if (keepaliveController === own) keepaliveController = null; }
+}
+async function retryConversation() {
+  if (!conversationRunning || !conversationId || resettingConversation || !token || document.hidden || pageLeaving) return;
+  const group = conversationId; const generation = audioGeneration; const subjectGeneration = ++conversationSubjectGeneration;
+  resettingConversation = true; transcriptDrainId++; identifyingTranscript = false;
+  for (const itemId of partialTranscripts.keys()) ignoredTranscriptItems.add(itemId);
+  if (pendingTranscript) ignoredTranscriptItems.add(pendingTranscript.itemId);
+  while (ignoredTranscriptItems.size > 64) ignoredTranscriptItems.delete(ignoredTranscriptItems.values().next().value!);
+  pendingTranscript = null; partialTranscripts.clear(); completedTranscript = ''; voicePreview = '';
+  controller?.abort(); controller = null; running = false; audioBusy = true;
+  conversationLastKey = ''; conversationLastAt = 0; currentId = crypto.randomUUID(); revision++;
+  newViewToken(); clearResult(); $('correction-hint').textContent = ''; $('correction-hint').classList.add('hidden'); lastInput = null; $<HTMLTextAreaElement>('text').value = '';
+  $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
+  status('対象をリセットしています。聞き取りは続いています。');
+  void sendView('聞き直します', '対象をリセット中です', '音声は再送しません'); refreshControls();
+  const own = new AbortController(); controller = own;
+  const valid = () => generation === audioGeneration && subjectGeneration === conversationSubjectGeneration && conversationRunning && conversationId === group && !own.signal.aborted;
+  try {
+    const data = await (await api('/api/conversation/reset', { ...json({ conversationId: group }), signal: own.signal })).json();
+    if (!valid()) return;
+    if (Number.isInteger(data.revision) && data.revision >= 0) revision = Math.max(revision, data.revision);
+    conversationRequestRevision = revision + 1;
+    status('聞き取りを続けています。調べたい人物の名前や所属を、もう一度話してください。');
+    await sendView('もう一度話してください', '名前や所属を言い直してください', '音声は再送しません');
+  } catch (error) {
+    if (valid()) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '対象をリセットできませんでした。会話モードを再開してください。'); }
+  } finally {
+    if (subjectGeneration === conversationSubjectGeneration) { resettingConversation = false; audioBusy = false; }
+    if (controller === own) controller = null;
+    refreshControls();
+  }
 }
 async function startConversation() {
   if (!runtimeStatus.streamingEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || recording || audioBusy || conversationRunning || microphoneConnecting) return;
   if ($<HTMLSelectElement>('microphone').value === 'g2' && !connected) { if (await prepareGlassesMicrophone()) void startConversation(); return; }
   const generation = ++audioGeneration; conversationRunning = true; recording = true;
   conversationId = ''; conversationRequestRevision = 0; conversationLastKey = ''; conversationLastAt = 0;
-  completedTranscript = ''; partialTranscripts.clear(); pendingTranscript = null;
+  completedTranscript = ''; partialTranscripts.clear(); pendingTranscript = null; ignoredTranscriptItems.clear(); resettingConversation = false; conversationSubjectGeneration++;
+  $('correction-hint').textContent = ''; $('correction-hint').classList.add('hidden');
   audioSource = $<HTMLSelectElement>('microphone').value === 'g2' ? 'g2' : 'phone'; currentId = crypto.randomUUID(); newViewToken(); clearResult();
   setVoicePhase('connecting');
   conversation = new StreamingAudio({
     onDelta: (itemId, delta) => {
       if (generation !== audioGeneration || !conversationRunning) return;
+      if (resettingConversation) { if (ignoredTranscriptItems.size < 64) ignoredTranscriptItems.add(itemId); return; }
+      if (ignoredTranscriptItems.has(itemId)) return;
       if (!partialTranscripts.has(itemId) && partialTranscripts.size >= 8) partialTranscripts.delete(partialTranscripts.keys().next().value!);
       partialTranscripts.set(itemId, ((partialTranscripts.get(itemId) ?? '') + delta).slice(-2000));
       voicePreview = partialTranscripts.get(itemId)!; queueVoiceDisplay();
       $<HTMLTextAreaElement>('text').value = `${completedTranscript}\n${[...partialTranscripts.values()].join(' ')}`.trim().slice(-2000);
     },
     onFinal: (itemId, text) => {
-      if (generation !== audioGeneration || !conversationRunning || !text.trim()) return;
+      if (generation !== audioGeneration || !conversationRunning || !text.trim() || resettingConversation || ignoredTranscriptItems.has(itemId)) return;
       partialTranscripts.delete(itemId); completedTranscript = `${completedTranscript}\n${text}`.trim().slice(-1200);
       voicePreview = text; queueVoiceDisplay();
       $<HTMLTextAreaElement>('text').value = completedTranscript;
@@ -453,7 +538,7 @@ async function startConversation() {
     const ticketResponse = await api('/api/conversation/stream', json({ conversationId }));
     const ticket = await ticketResponse.json(); if (generation !== audioGeneration) return;
     if (!await conversation!.start(ticket.ticket) || generation !== audioGeneration) return;
-    setVoicePhase('listening');
+    setVoicePhase('listening'); refreshControls();
     status('ストリーミング認識中です。話している途中から文字が表示され、人物名を見つけたら公開情報を調べます。');
     await sendView('会話モード', '音声をストリーミング認識中', '終了はスマートフォンから');
   } catch (error) { if (generation === audioGeneration) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話モードを開始できませんでした。'); } }
@@ -522,6 +607,7 @@ async function prepareGlassesMicrophone() {
 $('connect').onclick = () => { void connectGlasses(); };
 $('consent').onchange = () => { if (!$<HTMLInputElement>('consent').checked) void stopRecording(false); refreshControls(); };
 $('conversation').onclick = () => { void startConversation(); };
+$('retry-listening').onclick = () => { void retryConversation(); };
 $('record').onclick = () => { if (conversationRunning) void cancel(); else if (recording) void stopRecording(true); else void startRecording(); };
 $('mode').onchange = () => { currentId = crypto.randomUUID(); newViewToken(); clearResult(); void sendView('これで誰でも雑談マスター', '調査を開始してください。', 'マイクは停止中'); const demo = $<HTMLSelectElement>('mode').value === 'demo'; $('scenario-field').classList.toggle('hidden', !demo); $('mode-badge').textContent = demo ? '体験デモ · 架空の人物・固定データ' : '実API · 公開情報を調査'; $('hud-mode').textContent = demo ? 'DEMO / FICTIONAL DATA' : 'LIVE / PUBLIC SOURCES'; $('result-note').textContent = demo ? '体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。' : '個人の非公開情報は調査しません。情報が曖昧な場合は確認を求めます。'; refreshControls(); };
 $('resume').onclick = async () => {
@@ -545,6 +631,7 @@ document.addEventListener('visibilitychange', () => {
   else if (!token && qrLoginTicket && runtimeStatus && !authBusy && !pageLeaving) { void redeemQrLogin(); }
 });
 window.addEventListener('pagehide', () => { pageLeaving = true; qrLoginTicket = ''; abortConversation(); clearTimeout(voiceDisplayTimer); voiceDisplayTimer = undefined; voicePreview = ''; authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
+setInterval(() => { void keepConversationAlive(); }, 60_000);
 setInterval(() => { if (result?.cards.some(card => Date.parse(card.expiresAt) <= Date.now())) renderCard(); if (token && expiresAt > 0 && expiresAt <= Date.now()) void expireSession(); }, 15_000);
 try {
   runtimeStatus = await (await fetch('/api/status', { cache: 'no-store' })).json();

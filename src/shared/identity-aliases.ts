@@ -1,33 +1,53 @@
 import type { Target } from './contracts.ts';
+import { PUBLIC_FIGURE_CATALOG } from './public-figure-catalog.ts';
 
-/** Curated identity links, never model-generated aliases or proof of a new fact.
- * Adding a record requires checking public primary sources and explicit scope.
- * The Japanese corporate name below is also historical; do not infer current
- * legal-entity employment from this identity mapping.
+/** Only canonical names, published names and source-backed readings enter this
+ * identity layer. ASR correction hints are deliberately not imported as aliases.
+ * Company clues describe a verified relationship, not proof of current employment.
  */
-export const VERIFIED_IDENTITY_ALIASES = [{
-  id: 'madoka-chiyoda-chomado',
-  scope: 'person-company',
+export interface VerifiedIdentityAlias {
+  readonly id: string;
+  readonly scope: 'person-company' | 'public-person';
+  readonly target: Target;
+  readonly personNames: readonly string[];
+  readonly companyNames: readonly string[];
+  readonly xHandle?: string;
+  readonly checkedOn: string;
+  readonly sourceUrls: readonly string[];
+}
+
+const companyAliases: readonly VerifiedIdentityAlias[] = [{
+  id: 'madoka-chiyoda-chomado', scope: 'person-company',
   target: { personName: '千代田まどか', companyName: 'Microsoft' },
-  personNames: ['千代田まどか', 'Madoka Chiyoda', 'ちょまど', 'Chomado'],
+  personNames: ['千代田まどか', 'ちよだまどか', 'Madoka Chiyoda', 'ちょまど', 'Chomado'],
   companyNames: ['Microsoft', 'マイクロソフト', '日本マイクロソフト'],
-  xHandle: 'chomado',
-  checkedOn: '2026-09-22',
+  xHandle: 'chomado', checkedOn: '2026-09-22',
   sourceUrls: ['https://chomado.com/', 'https://chomado.com/chomado/', 'https://developer.microsoft.com/ja-jp/advocates/madoka-chiyoda'],
-}, {
-  id: 'hiroyuki-nishimura', scope: 'public-person',
-  target: { personName: '西村博之', companyName: '' },
-  personNames: ['西村博之', 'ひろゆき', 'Hiroyuki Nishimura'], companyNames: [],
-  xHandle: 'hirox246', checkedOn: '2026-09-22',
-  sourceUrls: ['https://guild.to/', 'https://guild.to/news/弊社のメンバー達がノンタイトルで激突すること/', 'https://shueisha.online/list/persons/65a92f368ce1158c700000ca'],
-}, {
-  id: 'takafumi-horie', scope: 'public-person',
-  target: { personName: '堀江貴文', companyName: '' },
-  personNames: ['堀江貴文', 'ホリエモン', 'Takafumi Horie'], companyNames: [],
-  xHandle: 'takapon_jp', checkedOn: '2026-09-22',
-  sourceUrls: ['https://snsgroup.jp/', 'https://zeroichi.media/', 'https://columbia.jp/artist-info/horiemon/prof.html', 'https://www.youtube.com/watch?v=uFkcC8UYQy4'],
-}] as const;
-export type VerifiedIdentityAlias = typeof VERIFIED_IDENTITY_ALIASES[number];
+}];
+
+const existingPublicSources: Readonly<Record<string, readonly string[]>> = {
+  'hiroyuki-nishimura': ['https://guild.to/', 'https://guild.to/news/弊社のメンバー達がノンタイトルで激突すること/', 'https://shueisha.online/list/persons/65a92f368ce1158c700000ca'],
+  'takafumi-horie': ['https://snsgroup.jp/', 'https://zeroichi.media/', 'https://columbia.jp/artist-info/horiemon/prof.html', 'https://www.youtube.com/watch?v=uFkcC8UYQy4'],
+};
+const unique = (values: readonly string[]) => [...new Set(values)];
+const catalogAliases: VerifiedIdentityAlias[] = PUBLIC_FIGURE_CATALOG.flatMap(record => {
+  // Preserve an existing company-scoped identity instead of silently broadening it.
+  if (companyAliases.some(alias => alias.target.personName === record.canonicalName)) return [];
+  const personNames = unique([record.canonicalName, record.kana, ...record.publicNames]);
+  const sourceUrls = unique([...(existingPublicSources[record.id] ?? []), record.officialProfileUrl, ...(record.readingSourceUrl ? [record.readingSourceUrl] : []), ...(record.xHandleSourceUrl ? [record.xHandleSourceUrl] : [])]);
+  const common = { scope: 'public-person' as const, personNames, ...(record.xHandle ? { xHandle: record.xHandle } : {}), checkedOn: record.checkedOn };
+  return [{ ...common, id: record.id, target: { personName: record.canonicalName, companyName: '' }, companyNames: [], sourceUrls },
+    ...(record.companyClues ?? []).map((company, index) => ({
+      ...common, id: `${record.id}-company-${index + 1}`,
+      target: { personName: record.canonicalName, companyName: company.name },
+      companyNames: unique([company.name, ...company.aliases]),
+      // Fetch this relationship's primary text first within the existing allowance.
+      sourceUrls: unique([company.sourceUrl, ...sourceUrls]),
+    })),
+  ];
+});
+
+export const VERIFIED_IDENTITY_ALIASES: readonly VerifiedIdentityAlias[] = [...companyAliases, ...catalogAliases];
 
 export const normalizeIdentity = (value: string) => value.normalize('NFKC').replace(/[ァ-ヶ]/gu, character => String.fromCharCode(character.charCodeAt(0) - 0x60)).replace(/\s+/g, '').toLocaleLowerCase('ja');
 const normalize = normalizeIdentity;
@@ -43,15 +63,15 @@ function contains(text: string, name: string): boolean {
 
 export function verifiedAliasForTarget(target: Target): VerifiedIdentityAlias | undefined {
   const matches = VERIFIED_IDENTITY_ALIASES.filter(record => listed(personName(target.personName), record.personNames) &&
-    (record.scope === 'public-person' ? !target.companyName.trim() : listed(target.companyName, record.companyNames)));
+    (record.target.companyName ? listed(target.companyName, record.companyNames) : !target.companyName.trim()));
   return matches.length === 1 ? matches[0] : undefined;
 }
 
-/** Company-linked aliases need both clues; public-person aliases never invent a company. */
+/** Any company-bearing alias needs both supplied clues; empty-company aliases never invent one. */
 export function verifiedAliasForInputTarget(text: string, target: Target): VerifiedIdentityAlias | undefined {
   const record = verifiedAliasForTarget(target);
   return record && record.personNames.some(name => contains(text, name)) &&
-    (record.scope === 'public-person' || record.companyNames.some(name => contains(text, name))) ? record : undefined;
+    (!record.target.companyName || record.companyNames.some(name => contains(text, name))) ? record : undefined;
 }
 
 /** A current person name is mandatory. Context may only supply a company clue.
@@ -72,8 +92,8 @@ export function isVerifiedPublicSource(url: string, target: Target): boolean {
   if (record?.scope !== 'public-person') return false;
   try {
     const candidate = new URL(url);
-    if (candidate.protocol !== 'https:' || candidate.username || candidate.password) return false;
-    if (['x.com', 'twitter.com'].includes(candidate.hostname)) return candidate.pathname.split('/')[1]?.toLowerCase() === record.xHandle;
+    if (candidate.protocol !== 'https:' || candidate.username || candidate.password || candidate.port) return false;
+    if (['x.com', 'twitter.com'].includes(candidate.hostname)) return !!record.xHandle && candidate.pathname.split('/')[1]?.toLowerCase() === record.xHandle;
     return record.sourceUrls.some(value => {
       const verified = new URL(value);
       return candidate.hostname === verified.hostname && (verified.pathname === '/' || candidate.pathname === verified.pathname && (!verified.search || candidate.search === verified.search));
@@ -85,6 +105,7 @@ export function isVerifiedPublicSource(url: string, target: Target): boolean {
 export function evidenceMatchesTarget(text: string, target: Target, sourceUrl?: string): boolean {
   const record = verifiedAliasForTarget(target);
   if (record?.scope === 'public-person') return record.personNames.some(name => contains(text, name)) &&
+    (!record.target.companyName || record.companyNames.some(name => contains(text, name))) &&
     (isVerifiedPublicSource(sourceUrl ?? '', target) || contains(text, record.target.personName));
   if (record) return record.personNames.some(name => contains(text, name)) && record.companyNames.some(name => contains(text, name));
   if (!target.companyName.trim()) return contains(text, target.personName);

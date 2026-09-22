@@ -113,7 +113,7 @@ describe('conversation-wide audio and research budget', () => {
       expect((await identify(randomUUID())).status).toBe(409);
       expect((await f.research(auth.body.token, f.body(1, { mode: 'live', conversationId: group.conversationId, requestId }))).response.status).toBe(200);
       const ledger = JSON.parse(await readFile(join(f.directory, 'budget.json'), 'utf8'));
-      expect(Object.keys(ledger.runs)).toEqual([group.conversationId]); expect(ledger.runs[group.conversationId].spent).toBe(2_000);
+      expect(Object.keys(ledger.runs)).toEqual([group.conversationId]); expect(ledger.runs[group.conversationId].spent).toBe(1_000);
       f.advance(900_001); expect(grant.valid()).toBe(false);
     } finally { spy.mockRestore(); }
   });
@@ -151,12 +151,12 @@ describe('conversation-wide audio and research budget', () => {
     expect((await transcribe(f, auth.body.token, group.conversationId, randomUUID(), 2)).status).toBe(200);
   });
 
-  it('allows windows without research but stops at the server-side one-hundred-window limit', async () => {
+  it('continues past one hundred audio windows without reopening the conversation', async () => {
     const provider: ResearchProvider = { ...createFixtureProvider('normal'), mode: 'live', transcribe: vi.fn(async () => ({ value: DEMO_TEXT, actualUsd: 0 })) };
     const f = await fixture({ live: true, liveProvider: provider }); const auth = await f.login(); const group = await (await start(f, auth.body.token)).json();
     for (let i = 0; i < 100; i++) expect((await transcribe(f, auth.body.token, group.conversationId)).status).toBe(200);
-    expect((await transcribe(f, auth.body.token, group.conversationId)).status).toBe(429);
-    expect(provider.transcribe).toHaveBeenCalledTimes(100);
+    expect((await transcribe(f, auth.body.token, group.conversationId)).status).toBe(200);
+    expect(provider.transcribe).toHaveBeenCalledTimes(101);
   });
 
   it.each([{ targets: [], hasPersonMention: false }, { targets: [{ personName: '架空花子', companyName: '架空研究所' }], hasPersonMention: true }])('forwards optional validated target metadata and conversation context without an extra call: %j', async ({ targets, hasPersonMention }) => {
@@ -656,5 +656,72 @@ describe('authenticated HTTP boundary', () => {
       expect(ledger.event.reserved).toBe(10_000);
       finish();
     } finally { vi.useRealTimers(); }
+  });
+});
+
+
+describe('continuous conversation correction and recovery', () => {
+  async function setup() {
+    let takeTicket!: (ticket: string) => streamingRelay.StreamGrant;
+    const reset = vi.fn(() => true); const closeConversation = vi.fn();
+    const spy = vi.spyOn(streamingRelay, 'createStreamingRelay').mockImplementation(options => {
+      takeTicket = options.takeTicket; return { upgrade: () => false, closeConversation, close: vi.fn(), resetConversation: reset, updateKeywordsConversation: vi.fn(() => true) };
+    });
+    cleanups.push(async () => { spy.mockRestore(); });
+    const normal = createFixtureProvider('normal');
+    const plan = vi.fn(async () => ({ value: { target: { personName: '広行', companyName: '株式会社メイドインジャパン' }, needsConfirmation: false, candidates: [], query: '', reason: 'literal', hasPersonMention: true }, actualUsd: 0 }));
+    const provider: ResearchProvider = { ...normal, mode: 'live', plan };
+    const f = await fixture({ live: true, liveProvider: provider, config: { maximumCosts: { llm: 0.001, search: 0.001, page: 0 }, streamingApiKey: 'fake', streamingAudioMaxPerMinute: 0.01 } });
+    f.config.status.streamingEnabled = true;
+    const auth = await f.login();
+    const post = (path: string, data: unknown, token = auth.body.token) => f.request(path, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    const group = await (await post('/api/conversation', {})).json();
+    const issued = await (await post('/api/conversation/stream', { conversationId: group.conversationId })).json();
+    const grant = takeTicket(issued.ticket);
+    const identify = (text: string, revision = 1, requestId = randomUUID()) => post('/api/conversation/identify', { conversationId: group.conversationId, requestId, subjectRevision: revision, text });
+    return { f, auth, post, group, grant, identify, plan, reset, closeConversation };
+  }
+  it('corrects a literal ASR homophone using the known company and binds the corrected target to that final', async () => {
+    const { f, auth, group, grant, identify } = await setup();
+    const text = '株式会社メイドインジャパンの広行さん'; grant.onFinal(text);
+    const requestId = randomUUID(); const response = await identify(text, 1, requestId); const data = await response.json();
+    expect(response.status).toBe(200); expect(data.targets[0].personName).toBe('西村博之');
+    expect(data.correctionHint).toBeTruthy();
+    const result = await f.research(auth.body.token, f.body(1, { mode: 'live', conversationId: group.conversationId, requestId, text: '別の名前をクライアントが指定' }));
+    expect(result.events.at(-1).result.target.personName).toBe('西村博之');
+    expect((await identify(text, 2)).status).toBe(409);
+  });
+  it('keeps the same audio grant active beyond fifteen minutes but expires after inactivity', async () => {
+    const { f, auth, post, group, grant } = await setup();
+    f.advance(14 * 60_000);
+    const refresh = await post('/api/conversation/keepalive', { conversationId: group.conversationId });
+    expect(refresh.status).toBe(200); expect((await refresh.json()).expiresAt).toBeGreaterThan(auth.body.expiresAt);
+    f.advance(2 * 60_000); expect(grant.valid()).toBe(true);
+    const other = await f.login(); expect((await post('/api/conversation/keepalive', { conversationId: group.conversationId }, other.body.token)).status).toBe(409);
+    f.advance(14 * 60_000); expect(grant.valid()).toBe(false);
+    expect((await post('/api/conversation/keepalive', { conversationId: group.conversationId })).status).toBe(401);
+  });
+  it('invalidates a consumed final at the data retention boundary while keeping authentication active', async () => {
+    const { f, auth, post, group, grant, identify } = await setup();
+    const text = '株式会社メイドインジャパンの広行さん'; grant.onFinal(text);
+    const requestId = randomUUID(); expect((await identify(text, 1, requestId)).status).toBe(200);
+    f.advance(14 * 60_000); expect((await post('/api/conversation/keepalive', { conversationId: group.conversationId })).status).toBe(200);
+    f.advance(2 * 60_000);
+    expect((await f.research(auth.body.token, f.body(1, { mode: 'live', conversationId: group.conversationId, requestId }))).response.status).toBe(409);
+    expect(grant.valid()).toBe(true);
+    expect((await identify(text, 1)).status).toBe(409);
+  });
+  it('reset rejects old finals and pending research without closing the microphone grant', async () => {
+    const { f, auth, post, group, grant, identify, reset, closeConversation } = await setup();
+    const oldText = '株式会社メイドインジャパンの広行さん'; grant.onFinal(oldText);
+    const oldId = randomUUID(); expect((await identify(oldText, 1, oldId)).status).toBe(200);
+    grant.onFinal('古い未処理の広行さん');
+    const response = await post('/api/conversation/reset', { conversationId: group.conversationId }); const data = await response.json();
+    expect(response.status).toBe(200); expect(data.revision).toBeGreaterThan(1); expect(reset).toHaveBeenCalledWith(group.conversationId);
+    expect(grant.valid()).toBe(true); expect(closeConversation).not.toHaveBeenCalled();
+    expect((await identify('古い未処理の広行さん', data.revision + 1)).status).toBe(409);
+    expect((await f.research(auth.body.token, f.body(data.revision + 1, { mode: 'live', conversationId: group.conversationId, requestId: oldId }))).response.status).toBe(409);
+    grant.onFinal('広行さん'); const fresh = await identify('広行さん', data.revision + 1);
+    expect(fresh.status).toBe(200); expect((await fresh.json()).targets[0].personName).toBe('西村博之');
   });
 });

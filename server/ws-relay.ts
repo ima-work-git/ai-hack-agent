@@ -3,6 +3,7 @@ import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
 import { OpenAIStreamingASR } from './openai-streaming-asr.ts';
 import { BudgetError, type BudgetLedger } from './budget.ts';
+import { PUBLIC_FIGURE_CATALOG } from '../src/shared/public-figure-catalog.ts';
 
 export interface StreamGrant {
   sessionId: string;
@@ -10,6 +11,7 @@ export interface StreamGrant {
   expiresAt: number;
   valid: () => boolean;
   onFinal: (text: string) => void;
+  keywords?: readonly string[];
 }
 interface RelayOptions {
   apiKey: string;
@@ -37,12 +39,22 @@ const relayErrors = {
   ASR_ERROR: '音声認識サービスの処理でエラーが発生しました。',
 } as const;
 type RelayErrorCode = keyof typeof relayErrors;
+const catalogKeywords = PUBLIC_FIGURE_CATALOG.slice(0, 15).map(entry => entry.publicNames[0] ?? entry.canonicalName);
+const recognitionKeywords = (values: readonly string[]) => [...new Set([...values, ...catalogKeywords])].filter(word => typeof word === 'string' && word.trim() && word.length <= 80 && !/[<>\r\n]/u.test(word)).slice(0, 20);
 const safeStartErrors = new Set(['音声接続を終了しました。', '音声認識の設定が不足しています。', '対応していない音声モデルです。', '音声認識の用語設定を確認してください。', '音声認識は接続されていません。']);
 
+export interface StreamingRelay {
+  upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean;
+  resetConversation?: (id: string) => boolean;
+  updateKeywordsConversation?: (id: string, keywords: readonly string[]) => boolean;
+  closeConversation(id: string): void;
+  close(): void;
+}
+
 /** Same-origin, one-use authentication. Only server-side credentials reach upstream. */
-export function createStreamingRelay(options: RelayOptions) {
+export function createStreamingRelay(options: RelayOptions): StreamingRelay {
   const server = new WebSocketServer({ noServer: true, maxPayload: 64_000, perMessageDeflate: false });
-  const connections = new Map<WebSocket, { grant?: StreamGrant; close: () => void }>();
+  const connections = new Map<WebSocket, { grant?: StreamGrant; close: () => void; reset: () => boolean; updateKeywords: (keywords: readonly string[]) => boolean }>();
   server.on('connection', socket => {
     let ended = false; let authenticated = false; let ready = false;
     let upstream: OpenAIStreamingASR | undefined;
@@ -50,6 +62,8 @@ export function createStreamingRelay(options: RelayOptions) {
     let bytes = 0; let reservedMinutes = 0; let queuedBytes = 0;
     let allowance = 64_000; let lastFrameAt = options.now(); let connectedAt = options.now();
     let pending = Promise.resolve();
+    let inputGeneration = 0; let resetRequested = false;
+    let keywords: readonly string[] = catalogKeywords;
     const send = (value: unknown) => {
       if (ended || socket.readyState !== WebSocket.OPEN) return;
       if (socket.bufferedAmount > 64_000) { console.warn('[streaming-asr]', 'DOWNSTREAM_BACKPRESSURE'); finish(); return; }
@@ -92,7 +106,17 @@ export function createStreamingRelay(options: RelayOptions) {
         while (reservedMinutes < required) { await options.budget!.reserve(ownGrant.conversationId, options.maximumPerMinute); reservedMinutes++; }
       }).catch(failException);
     }, 1_000);
-    connections.set(socket, { close: finish });
+    const reset = () => {
+      if (ended || !grant?.valid()) return false;
+      inputGeneration++; resetRequested = true;
+      if (ready && upstream) { resetRequested = false; return upstream.resetInput(); }
+      return true;
+    };
+    const updateKeywords = (values: readonly string[]) => {
+      if (ended || !grant?.valid()) return false;
+      keywords = recognitionKeywords(values); return upstream ? upstream.updateKeywords(keywords) : true;
+    };
+    connections.set(socket, { close: finish, reset, updateKeywords });
     socket.on('error', () => fail('CONNECTION')); socket.on('close', () => finish());
     socket.on('message', (raw, binary) => {
       if (ended) return;
@@ -104,7 +128,8 @@ export function createStreamingRelay(options: RelayOptions) {
           if (auth.type !== 'auth' || typeof auth.ticket !== 'string' || !/^[a-f0-9]{64}$/.test(auth.ticket)) throw new Error('auth');
           grant = options.takeTicket(auth.ticket); authenticated = true; clearTimeout(authTimer);
           if ([...connections.values()].some(connection => connection.grant?.conversationId === grant!.conversationId)) { fail('DUPLICATE_CONNECTION'); return; }
-          connections.set(socket, { grant, close: finish });
+          keywords = recognitionKeywords(grant.keywords ?? []);
+          connections.set(socket, { grant, close: finish, reset, updateKeywords });
           const ownGrant = grant;
           pending = (async () => {
             if (!options.budget || !Number.isFinite(options.maximumPerMinute) || options.maximumPerMinute <= 0) throw new BudgetError('BUDGET_NOT_CONFIGURED');
@@ -112,11 +137,13 @@ export function createStreamingRelay(options: RelayOptions) {
             if (ended) return;
             if (!ownGrant.valid()) { fail('AUTH_EXPIRED'); return; }
             connectedAt = options.now();
-            upstream = new OpenAIStreamingASR({ apiKey: options.apiKey, model: options.model,
+            upstream = new OpenAIStreamingASR({ apiKey: options.apiKey, model: options.model, keywords,
               onReady: () => {
                 if (ended) return;
                 if (!ownGrant.valid()) { fail('AUTH_EXPIRED'); return; }
-                ready = true; send({ type: 'ready' });
+                ready = true;
+                if (resetRequested) { resetRequested = false; upstream!.resetInput(); }
+                send({ type: 'ready' });
               },
               onDelta: (itemId, text) => { if (!ownGrant.valid()) { fail('AUTH_EXPIRED'); return; } send({ type: 'delta', itemId, text }); },
               onFinal: (itemId, text) => {
@@ -142,13 +169,13 @@ export function createStreamingRelay(options: RelayOptions) {
       const at = options.now(); allowance = Math.min(64_000, allowance + Math.max(0, at - lastFrameAt) * 32); lastFrameAt = at;
       if (data.length > allowance) { fail('RATE_LIMIT'); return; }
       allowance -= data.length; queuedBytes += data.length;
-      const copy = Buffer.from(data); const ownGrant = grant;
+      const copy = Buffer.from(data); const ownGrant = grant; const audioGeneration = inputGeneration;
       pending = pending.then(async () => {
-        if (ended) return;
+        if (ended || audioGeneration !== inputGeneration) return;
         if (!ownGrant.valid()) { fail('AUTH_EXPIRED'); return; }
         const required = Math.max(Math.ceil((bytes + copy.length) / (32_000 * 60)), Math.ceil((options.now() - connectedAt + 5_000) / 60_000));
         while (reservedMinutes < required) { await options.budget!.reserve(ownGrant.conversationId, options.maximumPerMinute); reservedMinutes++; }
-        if (ended) return;
+        if (ended || audioGeneration !== inputGeneration) return;
         if (!ownGrant.valid()) { fail('AUTH_EXPIRED'); return; }
         upstream!.append(copy); bytes += copy.length;
       }).catch(failException).finally(() => { queuedBytes -= copy.length; copy.fill(0); });
@@ -159,6 +186,12 @@ export function createStreamingRelay(options: RelayOptions) {
       if (req.url?.split('?')[0] !== '/api/asr') return false;
       if (!options.apiKey || !options.allowOrigin(req) || connections.size >= 20) { socket.destroy(); return true; }
       server.handleUpgrade(req, socket, head, ws => server.emit('connection', ws, req)); return true;
+    },
+    resetConversation(id: string): boolean {
+      let reset = false; for (const connection of connections.values()) if (connection.grant?.conversationId === id) reset = connection.reset() || reset; return reset;
+    },
+    updateKeywordsConversation(id: string, keywords: readonly string[]): boolean {
+      let updated = false; for (const connection of connections.values()) if (connection.grant?.conversationId === id) updated = connection.updateKeywords(keywords) || updated; return updated;
     },
     closeConversation(id: string) { for (const connection of connections.values()) if (connection.grant?.conversationId === id) connection.close(); },
     close() { for (const connection of connections.values()) connection.close(); server.close(); },

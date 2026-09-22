@@ -10,7 +10,7 @@ const MAX_EVENT = 64 * 1024;
 export interface OpenAIStreamingASROptions {
   apiKey: string;
   model?: string;
-  keywords?: string[];
+  keywords?: readonly string[];
   signal?: AbortSignal;
   onReady?: () => void;
   onDelta?: (itemId: string, delta: string) => void;
@@ -63,6 +63,11 @@ export class OpenAIStreamingASR {
   private commitTimer?: ReturnType<typeof setInterval>;
   private closeTimer?: ReturnType<typeof setTimeout>;
   private pendingSamples = 0;
+  private clearing = false;
+  private clearTimer?: ReturnType<typeof setTimeout>;
+  private ignoredItems = new Map<string, 'reset' | 'retired'>();
+  private inputGeneration = 0;
+  private commitGenerations: number[] = [];
   private resampler = new PCM16To24Resampler();
   private items = new Map<string, { length: number; final: boolean; sequence?: number; previousId?: string | null }>();
   private latestCommittedId: string | null = null;
@@ -80,7 +85,7 @@ export class OpenAIStreamingASR {
     const model = this.options.model ?? 'gpt-live-transcribe';
     if (model !== 'gpt-live-transcribe') return Promise.reject(new Error('対応していない音声モデルです。'));
     const keywords = this.options.keywords ?? [];
-    if (keywords.length > 20 || keywords.some(word => !word || word.length > 80 || /[<>\r\n]/u.test(word))) return Promise.reject(new Error('音声認識の用語設定を確認してください。'));
+    if (!this.validKeywords(keywords)) return Promise.reject(new Error('音声認識の用語設定を確認してください。'));
     this.startPromise = new Promise<void>((resolve, reject) => { this.resolveStart = resolve; this.rejectStart = reject; });
     this.options.signal?.addEventListener('abort', this.onAbort, { once: true });
     this.timeout = setTimeout(() => this.fail('音声認識への接続が時間内に完了しませんでした。'), 8000);
@@ -91,12 +96,7 @@ export class OpenAIStreamingASR {
       });
       this.socket.on('open', () => {
         if (this.stopped) return;
-        this.send({ type: 'session.update', session: { type: 'transcription', audio: { input: {
-          format: { type: 'audio/pcm', rate: 24000 },
-          transcription: { model, languages: ['ja'], delay: 'low', ...(keywords.length ? { keywords } : {}),
-            prompt: '日本語の会話です。聞こえた発話だけを文字起こしし、用語ヒントを発話に挿入しないでください。' },
-          turn_detection: null,
-        } } } });
+        this.sendSessionUpdate();
       });
       this.socket.on('message', (data, isBinary) => this.receive(data, isBinary));
       this.socket.on('error', () => this.fail('音声認識サービスへ接続できませんでした。'));
@@ -114,6 +114,9 @@ export class OpenAIStreamingASR {
       this.fail('音声データの形式またはサイズが不正です。');
       throw new Error('音声データの形式またはサイズが不正です。');
     }
+    // Audio recorded while clear is awaiting acknowledgement is deliberately
+    // discarded, never buffered for later replay into the new subject.
+    if (this.clearing) return;
     const pcm24k = this.resampler.convert(pcm16k);
     if (pcm24k.length) {
       const sent = this.send({ type: 'input_audio_buffer.append', audio: pcm24k.toString('base64') });
@@ -123,16 +126,70 @@ export class OpenAIStreamingASR {
     }
   }
 
+  /** Forget pending input without reopening either socket or microphone. */
+  resetInput(): boolean {
+    if (!this.ready || this.stopped) return false;
+    if (this.clearing) return true;
+    this.inputGeneration++; this.clearing = true;
+    this.pendingSamples = 0; this.resampler.clear();
+    for (const id of this.items.keys()) this.ignoreItem(id);
+    this.clearTimer = setTimeout(() => this.fail('音声入力のリセットが時間内に完了しませんでした。'), 8000);
+    return this.send({ type: 'input_audio_buffer.clear' });
+  }
+
+  /** Hints influence recognition only; they never become forced output. */
+  updateKeywords(keywords: readonly string[]): boolean {
+    if (this.stopped || !this.validKeywords(keywords)) return false;
+    const next = [...new Set(keywords.map(word => word.trim()))];
+    if (JSON.stringify(next) === JSON.stringify(this.options.keywords ?? [])) return true;
+    this.options = { ...this.options, keywords: next };
+    return !this.ready || this.sendSessionUpdate();
+  }
+
+  private validKeywords(keywords: readonly string[]): boolean {
+    return Array.isArray(keywords) && keywords.length <= 20 && keywords.every(word => typeof word === 'string' && word.trim().length > 0 && word.length <= 80 && !/[<>\r\n]/u.test(word));
+  }
+
+  private sendSessionUpdate(): boolean {
+    const keywords = this.options.keywords ?? [];
+    return this.send({ type: 'session.update', session: { type: 'transcription', audio: { input: {
+      format: { type: 'audio/pcm', rate: 24000 },
+      transcription: { model: this.options.model ?? 'gpt-live-transcribe', languages: ['ja'], delay: 'low', keywords,
+        prompt: '日本語の会話です。聞こえた発話だけを文字起こしし、用語ヒントを発話に挿入しないでください。' },
+      turn_detection: null,
+    } } } });
+  }
+
+  private ignoreItem(id: string, reason: 'reset' | 'retired' = 'reset'): void {
+    if (this.ignoredItems.get(id) !== 'retired') this.ignoredItems.set(id, reason);
+    // A bounded recent tombstone window suppresses delayed partials. Finals
+    // outside this window still need a known commit sequence to be delivered.
+    while (this.ignoredItems.size > 512) this.ignoredItems.delete(this.ignoredItems.keys().next().value!);
+  }
+
+  private pruneItems(): void {
+    for (const [id, item] of this.items) {
+      if (this.items.size < 256) break;
+      // The latest commit is the next acknowledgement's predecessor. Keep it
+      // even when final, and never retire an unresolved provisional item.
+      if (id === this.latestCommittedId || !(item.final || item.sequence !== undefined &&
+        (item.sequence < this.lastFinalSequence || this.ignoredItems.has(id)))) continue;
+      this.items.delete(id); this.ignoreItem(id, 'retired');
+    }
+  }
+
   /** Immediate cancellation: no final commit or later transcript callback. */
   stop(): void {
     if (this.stopped) return;
     this.stopped = true; this.ready = false;
     if (this.timeout) clearTimeout(this.timeout);
     if (this.commitTimer) clearInterval(this.commitTimer);
+    if (this.clearTimer) clearTimeout(this.clearTimer);
     this.options.signal?.removeEventListener('abort', this.onAbort);
     this.rejectStart?.(new Error('音声接続を終了しました。'));
     this.resolveStart = undefined; this.rejectStart = undefined;
     this.pendingSamples = 0; this.resampler.clear(); this.items.clear();
+    this.ignoredItems.clear(); this.commitGenerations = []; this.clearing = false;
     this.latestCommittedId = null; this.lastFinalSequence = -1;
     const socket = this.socket;
     if (socket) {
@@ -170,10 +227,17 @@ export class OpenAIStreamingASR {
         this.ready = true;
         if (this.timeout) clearTimeout(this.timeout);
         this.commitTimer = setInterval(() => {
-          if (this.pendingSamples >= 2400 && this.send({ type: 'input_audio_buffer.commit' })) this.pendingSamples = 0;
+          if (!this.clearing && this.pendingSamples >= 2400) {
+            if (this.commitGenerations.length >= 512) { this.fail('音声認識の応答待ちが上限に達しました。'); return; }
+            if (this.send({ type: 'input_audio_buffer.commit' })) { this.pendingSamples = 0; this.commitGenerations.push(this.inputGeneration); }
+          }
         }, 5000);
         this.resolveStart?.(); this.resolveStart = undefined; this.rejectStart = undefined;
         this.notify(() => this.options.onReady?.());
+        return;
+      }
+      if (value.type === 'input_audio_buffer.cleared') {
+        if (this.clearing) { this.clearing = false; if (this.clearTimer) clearTimeout(this.clearTimer); this.clearTimer = undefined; }
         return;
       }
       if (value.type === 'input_audio_buffer.committed') {
@@ -181,9 +245,14 @@ export class OpenAIStreamingASR {
           !(value.previous_item_id === null || typeof value.previous_item_id === 'string' && /^[a-zA-Z0-9_-]{1,120}$/u.test(value.previous_item_id))) throw new Error();
         const previousId = value.previous_item_id;
         const known = this.items.get(value.item_id);
+        if (!known && this.ignoredItems.get(value.item_id) === 'retired') return;
+        if (this.clearing) this.ignoreItem(value.item_id);
         if (known?.sequence !== undefined) { if (known.previousId !== previousId) throw new Error(); return; }
+        const commitGeneration = this.commitGenerations.shift();
+        if (commitGeneration !== undefined && commitGeneration < this.inputGeneration) this.ignoreItem(value.item_id);
         // Never invent an order if a predecessor acknowledgement is missing.
         if (previousId !== this.latestCommittedId) return;
+        this.pruneItems();
         if (!known && this.items.size >= 512) throw new Error();
         const sequence = previousId === null ? 0 : this.items.get(previousId)!.sequence! + 1;
         this.items.set(value.item_id, { length: known?.length ?? 0, final: false, sequence, previousId });
@@ -195,6 +264,8 @@ export class OpenAIStreamingASR {
       if (!this.ready || typeof value.item_id !== 'string' || !/^[a-zA-Z0-9_-]{1,120}$/u.test(value.item_id)) throw new Error();
       const text = isFinal ? value.transcript : value.delta;
       if (typeof text !== 'string' || text.length > 8000) throw new Error();
+      if (this.clearing) this.ignoreItem(value.item_id);
+      if (this.ignoredItems.has(value.item_id)) return;
       const prior = this.items.get(value.item_id);
       // Live partials precede commit and stay provisional. Only known-old
       // items are suppressed; an unordered final must never change a subject.
