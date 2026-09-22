@@ -62,6 +62,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   const sttMax = Number(env.MAX_STT_CALL_USD || NaN);
   const liveEnabled = env.AGENT_LIVE_ENABLED === 'true' && missing.length === 0;
   const streamingApiKey = env.OPENAI_API_KEY || '';
+  const personCorrection = { apiKey: env.PERSON_CORRECTION_ENABLED === 'false' ? '' : streamingApiKey, model: env.PERSON_CORRECTION_MODEL || 'gpt-5.6-luna' };
   const streamingModel = env.OPENAI_STREAMING_ASR_MODEL || 'gpt-live-transcribe';
   const streamingAudioMaxPerMinute = Number(env.STREAMING_ASR_MAX_USD_PER_MINUTE || NaN);
   const status: RuntimeStatus = {
@@ -71,6 +72,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     xEnabled: liveEnabled && !!providers.xEnabled,
     accessCodeRequired: accessCode.length > 0, version: '0.1.0',
   };
-  return { host, port, origin, accessCode, providers, budget, maximumCosts, sttMax, status, streamingApiKey, streamingModel, streamingAudioMaxPerMinute };
+  return { host, port, origin, accessCode, providers, budget, maximumCosts, sttMax, status, streamingApiKey, streamingModel, streamingAudioMaxPerMinute, personCorrection };
 }
 export type AppConfig = ReturnType<typeof readConfig>;

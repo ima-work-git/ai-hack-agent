@@ -1,4 +1,4 @@
-import { createDecipheriv } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -80,6 +80,79 @@ describe('session retention and cancellation (REQ-005, REQ-006, REQ-008)', () =>
     const restored = new SessionStore(f.directory, f.clock);
     expect(restored.authenticate(token)).toBeNull();
     expect(existsSync(f.file(session.id))).toBe(false);
+  });
+
+  it.each(['get', 'authenticate', 'sweep', 'restart'] as const)('keeps active authentication beyond 15 minutes but clears fixed-window data via %s', method => {
+    const f = fixture(); const { session, token } = f.store.login(); const requestId = randomUUID();
+    const firstDataDeadline = session.dataExpiresAt!;
+    session.revision = 7; session.requestIds.push(requestId);
+    session.lastInput = { text: 'synthetic-retained-input', requestId, subjectRevision: 7, mode: 'demo', scenario: 'normal' };
+    session.result = { requestId, subjectRevision: 7, mode: 'demo', status: 'no_evidence', target: null, candidates: [], cards: [], sources: [], trace: [], reasonCode: 'NO_EVIDENCE', message: 'synthetic-retained-result', usage: { llm: 0, searches: 0, pages: 0, elapsedMs: 0, reservedUsd: 0, actualUsd: 0, costKnown: true } };
+    f.store.save(session); const controller = f.store.start(session);
+    f.advance(14 * 60_000); expect(f.store.touch(session.id)?.expiresAt).toBe(f.clock() + 15 * 60_000);
+    expect(session.dataExpiresAt).toBe(firstDataDeadline); expect(session.lastInput).toBeDefined();
+    f.advance(60_000);
+    let store = f.store;
+    if (method === 'get') store.get(session.id);
+    if (method === 'authenticate') store.authenticate(token);
+    if (method === 'sweep') store.sweep();
+    if (method === 'restart') store = new SessionStore(f.directory, f.clock);
+    const cleared = store.authenticate(token)!;
+    expect(cleared.lastInput).toBeUndefined(); expect(cleared.result).toBeUndefined();
+    expect(cleared.revision).toBe(7); expect(cleared.requestIds).toEqual([requestId]);
+    expect(cleared.dataExpiresAt).toBe(f.clock() + 15 * 60_000);
+    if (method !== 'restart') expect(controller.signal.aborted).toBe(false);
+    expect(new SessionStore(f.directory, f.clock).authenticate(token)?.lastInput).toBeUndefined();
+    const nextDataDeadline = cleared.dataExpiresAt;
+    f.advance(60_000);
+    cleared.lastInput = { text: 'synthetic-next-window', requestId: randomUUID(), subjectRevision: 8, mode: 'demo', scenario: 'normal' };
+    store.save(cleared);
+    expect(cleared.dataExpiresAt).toBe(nextDataDeadline);
+    expect(new SessionStore(f.directory, f.clock).authenticate(token)?.lastInput?.text).toBe('synthetic-next-window');
+  });
+
+  it('refreshes idle expiry without extending the twelve-hour hard deadline, including re-login and restart', () => {
+    const f = fixture(); const first = f.store.login(); const hard = first.session.hardExpiresAt!;
+    expect(hard - f.clock()).toBe(12 * 60 * 60_000);
+    f.advance(10 * 60_000); f.store.touch(first.session.id);
+    const idle = first.session.expiresAt; const next = f.store.login(first.session.id);
+    expect(next.session.hardExpiresAt).toBe(hard); expect(next.session.expiresAt).toBe(idle);
+    const store = new SessionStore(f.directory, f.clock);
+    while (f.clock() < hard - 1) {
+      f.advance(Math.min(14 * 60_000, hard - 1 - f.clock()));
+      expect(store.touch(next.session.id)?.hardExpiresAt).toBe(hard);
+    }
+    expect(store.get(next.session.id)?.expiresAt).toBe(hard);
+    f.advance(1); expect(store.touch(next.session.id)).toBeUndefined();
+    expect(store.authenticate(next.token)).toBeNull(); expect(existsSync(f.file(next.session.id))).toBe(false);
+  });
+
+  it('persists a supplied shorter grant cap and refuses expired or invalid touch limits without resurrection', () => {
+    const f = fixture(); const { session, token } = f.store.login();
+    const original = session.expiresAt;
+    for (const maximum of [NaN, Infinity, f.clock(), f.clock() - 1]) expect(f.store.touch(session.id, maximum)).toBeUndefined();
+    expect(session.expiresAt).toBe(original);
+    const cap = f.clock() + 20 * 60_000;
+    f.advance(10 * 60_000); expect(f.store.touch(session.id, cap)?.expiresAt).toBe(cap);
+    const restored = new SessionStore(f.directory, f.clock);
+    f.advance(5 * 60_000); expect(restored.touch(session.id)?.expiresAt).toBe(cap);
+    expect(restored.get(session.id)?.hardExpiresAt).toBe(cap);
+    f.advance(5 * 60_000); expect(restored.touch(session.id, cap + 12 * 60 * 60_000)).toBeUndefined();
+    expect(restored.authenticate(token)).toBeNull();
+    const idle = restored.login(); f.advance(15 * 60_000);
+    expect(restored.touch(idle.session.id)).toBeUndefined(); expect(restored.authenticate(idle.token)).toBeNull();
+  });
+
+  it('loads legacy encrypted sessions without inventing a longer hard grant', () => {
+    const f = fixture(); const { session, token } = f.store.login(); const deadline = session.expiresAt;
+    const old = { ...session }; delete old.hardExpiresAt; delete old.dataExpiresAt;
+    const key = readFileSync(join(f.directory, '.session-key')); const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', key, iv);
+    const encrypted = Buffer.concat([cipher.update(JSON.stringify(old)), cipher.final()]);
+    writeFileSync(f.file(session.id), Buffer.concat([iv, cipher.getAuthTag(), encrypted]));
+    const store = new SessionStore(f.directory, f.clock); f.advance(60_000);
+    expect(store.touch(session.id)?.expiresAt).toBe(deadline);
+    expect(store.authenticate(token)).toMatchObject({ hardExpiresAt: deadline, dataExpiresAt: deadline });
   });
 
   it('logout immediately revokes access, aborts work, and prevents a stale save from restoring the file', () => {

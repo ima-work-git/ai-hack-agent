@@ -100,6 +100,101 @@ describe('server streaming transcription — mocked sockets only', () => {
     expect(f.onFinal.mock.calls.at(-1)).toEqual(['item_3', '次の対象']);
     expect(f.onError).not.toHaveBeenCalled();
   });
+  it('keeps forwarding more than 600 committed turns with bounded retired history and no replay of recent old items', async () => {
+    vi.useFakeTimers(); const f = fixture(); await f.ready();
+    for (let i = 0; i < 800; i++) {
+      const id = `turn_${i}`;
+      f.asr.append(Buffer.alloc(6400)); await vi.advanceTimersByTimeAsync(5000);
+      f.socket.message({ type: 'conversation.item.input_audio_transcription.delta', item_id: id, delta: '途中' });
+      f.socket.committed(id, i ? `turn_${i - 1}` : null);
+      f.socket.message({ type: 'conversation.item.input_audio_transcription.completed', item_id: id, transcript: `発話${i}` });
+    }
+    expect(f.socket.sent.filter(event => event.type === 'input_audio_buffer.commit')).toHaveLength(800);
+    expect(f.onFinal).toHaveBeenCalledTimes(800); expect(f.onDelta).toHaveBeenCalledTimes(800);
+    expect(f.onFinal.mock.calls.at(-1)).toEqual(['turn_799', '発話799']);
+    // This item has been evicted, but is still in the bounded tombstone window.
+    f.socket.committed('turn_300', 'turn_299');
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.delta', item_id: 'turn_300', delta: '古い人物' });
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'turn_300', transcript: '古い人物' });
+    // Even an ancient final outside the tombstone window has no known order.
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'turn_0', transcript: 'さらに古い人物' });
+    expect(f.onDelta).toHaveBeenCalledTimes(800); expect(f.onFinal).toHaveBeenCalledTimes(800);
+    expect(f.asr.resetInput()).toBe(true); f.socket.message({ type: 'input_audio_buffer.cleared' });
+    f.asr.append(Buffer.alloc(6400)); await vi.advanceTimersByTimeAsync(5000);
+    f.socket.committed('after-reset', 'turn_799');
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'after-reset', transcript: '新しい人物' });
+    expect(f.onFinal).toHaveBeenLastCalledWith('after-reset', '新しい人物');
+    expect(f.onError).not.toHaveBeenCalled(); expect(f.onClose).not.toHaveBeenCalled(); expect(f.connect).toHaveBeenCalledOnce();
+  });
+  it('clears pending audio without reconnecting and suppresses old and clear-in-flight items while preserving commit order', async () => {
+    vi.useFakeTimers(); const f = fixture(); await f.ready();
+    f.asr.append(Buffer.alloc(6400));
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.delta', item_id: 'old', delta: '古い対象' });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.asr.resetInput()).toBe(true); expect(f.asr.resetInput()).toBe(true);
+    expect(f.socket.sent.filter(event => event.type === 'input_audio_buffer.clear')).toHaveLength(1);
+    const priorAppends = f.socket.sent.filter(event => event.type === 'input_audio_buffer.append').length;
+    f.asr.append(pcm([30000, 30000]));
+    expect(f.socket.sent.filter(event => event.type === 'input_audio_buffer.append')).toHaveLength(priorAppends);
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.delta', item_id: 'during-clear', delta: 'リセット中の対象' });
+    f.socket.message({ type: 'input_audio_buffer.cleared' });
+    // This old commit was already sent before reset, but its acknowledgement
+    // can arrive later. It still advances sequence without becoming a subject.
+    f.socket.committed('old');
+    f.socket.committed('during-clear', 'old');
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'old', transcript: '古い確定' });
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'during-clear', transcript: 'クリア前の確定' });
+    f.asr.append(pcm([0, 0]));
+    const appended = f.socket.sent.at(-1)!;
+    expect(Buffer.from(appended.audio as string, 'base64')).toEqual(new PCM16To24Resampler().convert(pcm([0, 0])));
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.delta', item_id: 'new', delta: '新しい対象' });
+    f.socket.committed('new', 'during-clear');
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'new', transcript: '新しい確定' });
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.delta', item_id: 'old', delta: '遅着' });
+    expect(f.onDelta.mock.calls).toEqual([['old', '古い対象'], ['new', '新しい対象']]);
+    expect(f.onFinal.mock.calls).toEqual([['new', '新しい確定']]);
+    expect(f.onError).not.toHaveBeenCalled(); expect(f.onClose).not.toHaveBeenCalled(); expect(f.connect).toHaveBeenCalledOnce();
+  });
+
+  it('suppresses an unseen late commit from before reset and never commits discarded clear-window PCM', async () => {
+    vi.useFakeTimers(); const f = fixture(); await f.ready();
+    f.asr.append(Buffer.alloc(6400)); await vi.advanceTimersByTimeAsync(5000);
+    f.asr.resetInput(); f.asr.append(Buffer.alloc(6400));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.socket.sent.filter(event => event.type === 'input_audio_buffer.commit')).toHaveLength(1);
+    f.socket.message({ type: 'input_audio_buffer.cleared' });
+    f.socket.committed('unseen-old');
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.delta', item_id: 'unseen-old', delta: '古い対象' });
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'unseen-old', transcript: '古い対象' });
+    expect(f.onDelta).not.toHaveBeenCalled(); expect(f.onFinal).not.toHaveBeenCalled();
+    f.asr.append(Buffer.alloc(6400)); await vi.advanceTimersByTimeAsync(5000);
+    f.socket.committed('new', 'unseen-old');
+    f.socket.message({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'new', transcript: '新しい対象' });
+    expect(f.onFinal).toHaveBeenCalledExactlyOnceWith('new', '新しい対象');
+  });
+
+  it('times out a missing clear acknowledgement instead of silently holding the microphone stream forever', async () => {
+    vi.useFakeTimers(); const f = fixture(); await f.ready(); f.asr.resetInput();
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(f.onError).toHaveBeenCalledExactlyOnceWith('音声入力のリセットが時間内に完了しませんでした。');
+    expect(f.onClose).toHaveBeenCalledOnce(); expect(f.asr.resetInput()).toBe(false);
+  });
+
+  it('updates bounded recognition hints without restarting, forcing output, or forwarding invalid hint strings', async () => {
+    const f = fixture(); await f.ready();
+    expect(f.asr.updateKeywords(['ひろゆき', 'ホリエモン'])).toBe(true);
+    const update = f.socket.sent.at(-1) as { session: { audio: { input: { transcription: { keywords: string[]; prompt: string } } } } };
+    expect(update.session.audio.input.transcription.keywords).toEqual(['ひろゆき', 'ホリエモン']);
+    expect(update.session.audio.input.transcription.prompt).toContain('用語ヒントを発話に挿入しない');
+    f.socket.message({ type: 'session.updated', session: { type: 'transcription' } });
+    expect(f.onReady).toHaveBeenCalledOnce(); expect(f.connect).toHaveBeenCalledOnce();
+    const count = f.socket.sent.length;
+    expect(f.asr.updateKeywords(['<injected>'])).toBe(false);
+    expect(f.asr.updateKeywords(Array.from({ length: 21 }, (_, i) => `name${i}`))).toBe(false);
+    expect(f.socket.sent).toHaveLength(count);
+    expect(f.onError).not.toHaveBeenCalled();
+  });
+
   it.each(['odd', 'oversized', 'backpressure'])('fails closed for %s audio without sending more audio', async kind => {
     const f = fixture(); await f.ready();
     if (kind === 'backpressure') f.socket.bufferedAmount = 256 * 1024;

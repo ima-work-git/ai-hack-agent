@@ -14,7 +14,12 @@ import { createLiveProvider, prepareAudio } from './providers.ts';
 import type { ResearchProvider } from './provider-contract.ts';
 import { ProviderError } from './provider-contract.ts';
 import { createStreamingRelay } from './ws-relay.ts';
+import { createLunaCorrection } from './luna-correction.ts';
+import { resolvePersonTarget } from './person-resolver.ts';
 import { isTargetGroundedInTranscript } from '../src/shared/identity-aliases.ts';
+
+interface ConversationWindow { revision: number; transcribed: boolean; researchStarted: boolean; target?: Target }
+interface Conversation { id: string; expiresAt: number; dataExpiresAt: number; dataGeneration: number; companyClue: string; transcriptContext: string; finalTexts: string[]; requests: Map<string, ConversationWindow> }
 
 interface HttpDependencies {
   store?: SessionStore;
@@ -24,6 +29,7 @@ interface HttpDependencies {
   liveProvider?: ResearchProvider;
   runAgent?: typeof runAgent;
   now?: () => number;
+  correctPerson?: ReturnType<typeof createLunaCorrection>;
 }
 class HttpError extends Error {
   readonly status: number;
@@ -70,12 +76,24 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   const budget = dependencies.budget ?? (config.status.liveEnabled ? new BudgetLedger(config.budget) : undefined);
   const liveProvider = dependencies.liveProvider ?? createLiveProvider(config.providers);
   const research = dependencies.runAgent ?? runAgent;
+  const correctPerson = dependencies.correctPerson ?? (config.personCorrection.apiKey ? createLunaCorrection(config.personCorrection) : undefined);
   const configuredOrigin = new URL(config.origin);
   const origins = new Set([config.origin, `http://localhost:${config.port}`, `http://127.0.0.1:${config.port}`]);
   const hosts = new Set([...origins].map(origin => new URL(origin).host));
   const attempts = new Map<string, { count: number; until: number }>();
   const active = new Map<string, { requestId: string; revision: number; controller: AbortController }>();
-  const conversations = new Map<string, { id: string; expiresAt: number; transcriptContext: string; finalTexts: string[]; requests: Map<string, { revision: number; transcribed: boolean; researchStarted: boolean }> }>();
+  const conversations = new Map<string, Conversation>();
+  const pruneConversationData = (group: Conversation) => {
+    if (group.dataExpiresAt > now()) return;
+    group.dataGeneration++;
+    group.transcriptContext = ''; group.companyClue = ''; group.finalTexts.length = 0;
+    group.requests.clear();
+    group.dataExpiresAt = now() + 15 * 60_000;
+  };
+  const addWindow = (group: Conversation, requestId: string, window: ConversationWindow) => {
+    while (group.requests.size >= 100) group.requests.delete(group.requests.keys().next().value!);
+    group.requests.set(requestId, window);
+  };
   const streamTickets = new Map<string, { sessionId: string; conversationId: string; expiresAt: number }>();
   const dropConversation = (sessionId: string) => {
     const group = conversations.get(sessionId);
@@ -89,6 +107,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       if (conversation && (conversation.expiresAt <= now() || !store.get(sessionId))) dropConversation(sessionId);
       throw new HttpError(409, '会話モードが終了または失効しました。もう一度開始してください。');
     }
+    pruneConversationData(conversation);
     return conversation;
   };
   const qrTickets = new Map<string, { issuerSessionId: string; expiresAt: number }>();
@@ -98,6 +117,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   const sweep = setInterval(() => {
     store.sweep();
     sweepQrTickets();
+    for (const group of conversations.values()) pruneConversationData(group);
     for (const [sessionId, conversation] of conversations) if (conversation.expiresAt <= now() || !store.get(sessionId)) {
       const current = active.get(sessionId);
       if (current && conversation.requests.has(current.requestId)) { store.cancel(sessionId); active.delete(sessionId); }
@@ -132,7 +152,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       const group = conversationFor(grant.sessionId, grant.conversationId);
       return { ...grant, expiresAt: group.expiresAt,
         valid: () => conversations.get(grant.sessionId) === group && group.expiresAt > now() && !!store.get(grant.sessionId),
-        onFinal: text => { group.finalTexts.push(text); if (group.finalTexts.length > 8) group.finalTexts.shift(); group.transcriptContext = `${group.transcriptContext}\n${text}`.trim().slice(-2000); },
+        onFinal: text => { pruneConversationData(group); group.finalTexts.push(text); if (group.finalTexts.length > 8) group.finalTexts.shift(); group.transcriptContext = `${group.transcriptContext}\n${text}`.trim().slice(-2000); },
       };
     },
   });
@@ -185,11 +205,14 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       if (req.method === 'POST' && path === '/api/session/restore') {
         sameOrigin(req); rateLimit(req, 'restore');
         z.object({}).strict().parse(await jsonBody(req));
-        if (!deviceLogins.authenticate(deviceCookie(req))) {
+        const remembered = deviceLogins.authenticate(deviceCookie(req));
+        if (!remembered) {
           res.setHeader('Set-Cookie', rememberedCookie(''));
           throw new HttpError(401, '利用コードで開始してください。');
         }
         const { session, token } = beginSession(req);
+        session.hardExpiresAt = Math.min(session.hardExpiresAt ?? session.expiresAt, remembered.expiresAt);
+        session.expiresAt = Math.min(session.expiresAt, session.hardExpiresAt); store.save(session);
         res.setHeader('Set-Cookie', cookie(session.id, session.expiresAt));
         sendJson(res, 200, { token, expiresAt: session.expiresAt, revision: session.revision, hasPrevious: !!validResult(session.result, session.revision), interrupted: session.interrupted });
         return true;
@@ -206,6 +229,8 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         if (!recurring && (!grant || grant.expiresAt <= now() || !store.get(grant.issuerSessionId))) throw new HttpError(401, 'QRコードが失効しました。新しいQRコードで開始してください。');
         const remembered = deviceLogins.issue(deviceCookie(req), recurring?.expiresAt);
         const { session, token } = store.login();
+        session.hardExpiresAt = Math.min(session.hardExpiresAt ?? session.expiresAt, remembered.expiresAt);
+        session.expiresAt = Math.min(session.expiresAt, session.hardExpiresAt); store.save(session);
         res.setHeader('Set-Cookie', [cookie(session.id, session.expiresAt), rememberedCookie(remembered.token, remembered.expiresAt)]);
         sendJson(res, 200, { token, expiresAt: session.expiresAt, revision: session.revision, hasPrevious: false, interrupted: false });
         return true;
@@ -240,6 +265,28 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         const body = z.object({ ticket: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(await jsonBody(req));
         reusableQr.revoke(body.ticket); sendJson(res, 200, { revoked: true }); return true;
       }
+      if (req.method === 'POST' && path === '/api/conversation/keepalive') {
+        sameOrigin(req);
+        const body = z.object({ conversationId: z.string().uuid() }).strict().parse(await jsonBody(req));
+        const group = conversationFor(session.id, body.conversationId);
+        const refreshed = store.touch(session.id);
+        if (!refreshed) throw new HttpError(401, '利用期限が切れました。もう一度開始してください。');
+        group.expiresAt = refreshed.expiresAt;
+        res.setHeader('Set-Cookie', cookie(session.id, refreshed.expiresAt));
+        sendJson(res, 200, { expiresAt: refreshed.expiresAt, revision: refreshed.revision }); return true;
+      }
+      if (req.method === 'POST' && path === '/api/conversation/reset') {
+        sameOrigin(req);
+        const body = z.object({ conversationId: z.string().uuid() }).strict().parse(await jsonBody(req));
+        const group = conversationFor(session.id, body.conversationId);
+        session.revision = Math.max(session.revision, ...[...group.requests.values()].map(window => window.revision)) + 1;
+        store.cancel(session.id); active.delete(session.id);
+        group.requests.clear(); group.finalTexts.length = 0;
+        group.transcriptContext = group.companyClue;
+        delete session.result; delete session.lastInput; store.save(session);
+        relay.resetConversation?.(group.id);
+        sendJson(res, 200, { revision: session.revision, resetAt: now() }); return true;
+      }
       if (req.method === 'POST' && path === '/api/conversation/stream') {
         sameOrigin(req);
         const body = z.object({ conversationId: z.string().uuid() }).strict().parse(await jsonBody(req));
@@ -257,25 +304,44 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         if (!config.status.streamingEnabled || !budget) throw new HttpError(403, 'ストリーミング音声の設定が未完了です。');
         const group = conversationFor(session.id, body.conversationId);
         if (session.running || body.subjectRevision <= session.revision || group.requests.has(body.requestId) || session.requestIds.includes(body.requestId)) throw new HttpError(409, 'この音声の処理を開始できません。');
-        if (group.requests.size >= 100) throw new HttpError(429, 'この会話の処理回数が上限です。');
         const finalIndex = group.finalTexts.indexOf(body.text);
         if (finalIndex < 0) throw new HttpError(409, '確定した音声文字起こしと一致しません。');
         group.finalTexts.splice(finalIndex, 1);
-        const window = { revision: body.subjectRevision, transcribed: false, researchStarted: false }; group.requests.set(body.requestId, window);
+        const window: ConversationWindow = { revision: body.subjectRevision, transcribed: false, researchStarted: false }; addWindow(group, body.requestId, window);
+        const dataGeneration = group.dataGeneration;
+        const previousContext = group.transcriptContext.endsWith(body.text) ? group.transcriptContext.slice(0, -body.text.length).trim() : group.transcriptContext;
         const controller = store.start(session); active.set(session.id, { requestId: body.requestId, revision: body.subjectRevision, controller });
         const disconnected = () => { if (!res.writableEnded) controller.abort(); }; res.on('close', disconnected);
-        const timer = setTimeout(() => controller.abort(), 8_000);
+        const timer = setTimeout(() => controller.abort(), 16_000);
         try {
           const reservation = await budget.reserve(group.id, config.maximumCosts.llm);
           if (controller.signal.aborted) { await budget.settle(reservation, 0); throw new HttpError(408, '音声の解析を停止しました。'); }
-          const planned = await liveProvider.plan({ text: `引用された会話の中の人物候補を抽出してください。直近発話に氏名がない場合はtarget=nullにしてください。前の会話は所属の補助だけです。\n${JSON.stringify({ previousTranscript: group.transcriptContext.slice(-1200), currentTranscript: body.text.slice(-650) })}`.slice(0, 2000), requestId: body.requestId, subjectRevision: body.subjectRevision, mode: 'live', scenario: 'normal', conversationId: group.id }, controller.signal);
+          const planned = await liveProvider.plan({ text: `引用された会話の中の人物候補を抽出してください。直近発話に氏名がない場合はtarget=nullにしてください。前の会話は所属の補助だけです。\n${JSON.stringify({ previousTranscript: previousContext.slice(-1200), currentTranscript: body.text.slice(-650) })}`.slice(0, 2000), requestId: body.requestId, subjectRevision: body.subjectRevision, mode: 'live', scenario: 'normal', conversationId: group.id }, controller.signal);
           await budget.settle(reservation, planned.actualUsd ?? null);
           const plan = PlanDecisionSchema.parse(planned.value);
-          if (controller.signal.aborted || conversations.get(session.id) !== group || !store.finish(session.id, controller)) throw new HttpError(409, '停止または失効した解析です。');
           const proposed = plan.needsConfirmation ? plan.candidates : plan.target ? [plan.target] : [];
-          const targets = proposed.filter(target => isTargetGroundedInTranscript(body.text, group.transcriptContext, target)).slice(0, 3).map(({ personName, companyName }) => ({ personName, companyName }));
+          let targets = proposed.filter(target => isTargetGroundedInTranscript(body.text, previousContext, target)).slice(0, 3).map(({ personName, companyName }) => ({ personName, companyName }));
+          let correctionHint: string | undefined; let correctionCandidate: Target | undefined;
+          if (targets.length <= 1) {
+            const corrected = await resolvePersonTarget({ currentTranscript: body.text, previousTranscript: previousContext, target: targets[0] ?? null,
+              correct: correctPerson ? async (input, signal) => {
+                const held = await budget.reserve(group.id, config.maximumCosts.llm);
+                if (signal.aborted) { await budget.settle(held, 0); signal.throwIfAborted(); }
+                const response = await correctPerson(input, signal);
+                await budget.settle(held, response.actualUsd ?? null); return response;
+              } : undefined,
+            }, controller.signal);
+            targets = corrected.target ? [corrected.target] : [];
+            correctionHint = corrected.hint; correctionCandidate = corrected.candidate;
+          }
+          if (controller.signal.aborted || conversations.get(session.id) !== group || group.dataGeneration !== dataGeneration || group.dataExpiresAt <= now() || group.requests.get(body.requestId) !== window || !store.finish(session.id, controller)) throw new HttpError(409, '停止または失効した解析です。');
+          if (targets.length === 1) {
+            window.target = targets[0];
+            if (targets[0]!.companyName) group.companyClue = targets[0]!.companyName;
+            relay.updateKeywordsConversation?.(group.id, [targets[0]!.personName, targets[0]!.companyName].filter(Boolean));
+          }
           window.transcribed = true; session.running = false; store.save(session); active.delete(session.id);
-          sendJson(res, 200, { text: body.text, targets, hasPersonMention: targets.length > 0 || plan.hasPersonMention !== false });
+          sendJson(res, 200, { text: body.text, targets, hasPersonMention: targets.length > 0 || !!correctionCandidate || plan.hasPersonMention !== false, correctionHint, correctionCandidate });
         } finally { clearTimeout(timer); res.off('close', disconnected); if (active.get(session.id)?.controller === controller) { store.cancel(session.id); active.delete(session.id); } }
         return true;
       }
@@ -284,7 +350,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         if (!store.authenticate(authorization!.slice(7))) throw new HttpError(401, '再ログインしてください。');
         if (session.running) throw new HttpError(409, '処理が進行中です。停止してから開始してください。');
         if ((!config.status.sttEnabled && !config.status.streamingEnabled) || !config.status.liveEnabled || !budget) throw new HttpError(403, '会話モードの音声・実API設定が未完了です。');
-        const conversation = { id: randomUUID(), expiresAt: session.expiresAt, transcriptContext: '', finalTexts: [] as string[], requests: new Map<string, { revision: number; transcribed: boolean; researchStarted: boolean }>() };
+        const conversation: Conversation = { id: randomUUID(), expiresAt: session.expiresAt, dataExpiresAt: now() + 15 * 60_000, dataGeneration: 0, companyClue: '', transcriptContext: '', finalTexts: [], requests: new Map() };
         dropConversation(session.id); conversations.set(session.id, conversation);
         sendJson(res, 200, { conversationId: conversation.id, expiresAt: conversation.expiresAt }); return true;
       }
@@ -327,10 +393,11 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         if (input.mode === 'live' && !config.status.liveEnabled) throw new HttpError(403, '実APIの設定と費用上限が未完了です。');
         if (session.running) throw new HttpError(409, '調査が進行中です。停止してから開始してください。');
         if (session.lastInput?.requestId === input.requestId || session.requestIds.includes(input.requestId)) throw new HttpError(409, 'この要求IDは処理済みです。');
-        if (session.requestIds.length >= 100) throw new HttpError(429, 'このセッションの調査回数上限です。終了して新しいセッションを開始してください。');
+        if (!input.conversationId && session.requestIds.length >= 100) throw new HttpError(429, 'このセッションの調査回数上限です。終了して新しいセッションを開始してください。');
         if (input.subjectRevision <= session.revision) throw new HttpError(409, '対象の版が古くなっています。状態を再取得してください。');
         const conversation = input.conversationId ? conversationFor(session.id, input.conversationId) : undefined;
         const window = conversation?.requests.get(input.requestId);
+        const dataGeneration = conversation?.dataGeneration;
         const confirmsConversation = !!input.selectedCandidateId && session.lastInput?.conversationId === conversation?.id;
         if (conversation && (input.mode !== 'live' || !confirmsConversation && (!window?.transcribed || window.researchStarted || window.revision !== input.subjectRevision))) throw new HttpError(409, 'この会話の音声処理と調査要求が一致しません。');
         if (!conversation && conversations.get(session.id)?.requests.has(input.requestId)) throw new HttpError(409, '会話の識別子が必要です。');
@@ -342,11 +409,11 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
           if (!selected || session.lastInput?.text !== input.text || session.lastInput.mode !== input.mode || session.lastInput.scenario !== input.scenario) throw new HttpError(409, '選択した候補が元の入力と一致しません。');
           confirmedTarget = { personName: selected.personName, companyName: selected.companyName };
         }
-        session.revision = input.subjectRevision; session.lastInput = input; session.requestIds.push(input.requestId); delete session.result;
+        session.revision = input.subjectRevision; session.lastInput = input; session.requestIds.push(input.requestId); if (session.requestIds.length > 100) session.requestIds.shift(); delete session.result;
         if (window) window.researchStarted = true;
         const controller = store.start(session);
         active.set(session.id, { requestId: input.requestId, revision: input.subjectRevision, controller });
-        const stillCurrent = () => active.get(session.id)?.controller === controller && !controller.signal.aborted && !!store.get(session.id) && (!conversation || conversations.get(session.id) === conversation && conversation.expiresAt > now());
+        const stillCurrent = () => active.get(session.id)?.controller === controller && !controller.signal.aborted && !!store.get(session.id) && (!conversation || conversations.get(session.id) === conversation && conversation.expiresAt > now() && conversation.dataExpiresAt > now() && conversation.dataGeneration === dataGeneration);
         const disconnected = () => { if (!res.writableEnded && stillCurrent()) { session.interrupted = true; store.cancel(session.id); active.delete(session.id); } };
         res.on('close', disconnected);
         res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'X-Accel-Buffering': 'no' });
@@ -354,6 +421,12 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         const sendLine = (value: unknown) => { if (!res.destroyed && !res.writableEnded) res.write(JSON.stringify(value) + '\n'); };
         try {
           let provider = dependencies.provider?.(input) ?? (input.mode === 'demo' ? createFixtureProvider(input.scenario) : liveProvider);
+          if (window?.target && !confirmedTarget && input.mode === 'live') {
+            // This target came from a once-consumed ASR final, not a client field.
+            // Public source identity and exact evidence checks still run below.
+            const target = window.target;
+            provider = { ...provider, plan: async () => ({ value: { target, needsConfirmation: false, candidates: [], query: `${target.personName} ${target.companyName} 公式 プロフィール`, reason: '会話と会社の手掛かりから補正した調査候補です。公開情報で照合します。' }, actualUsd: 0 }) };
+          }
           if (confirmedTarget && input.mode === 'live') {
             const original = provider;
             const selected = confirmedTarget;
@@ -394,9 +467,8 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         const conversation = typeof conversationId === 'string' ? conversationFor(session.id, conversationId) : undefined;
         if (!conversation && conversations.get(session.id)?.requests.has(requestId)) throw new HttpError(409, '会話の識別子が必要です。');
         if (conversation?.requests.has(requestId) || session.requestIds.includes(requestId)) throw new HttpError(409, 'この音声要求は処理済みです。');
-        if (conversation && conversation.requests.size >= 100) throw new HttpError(429, 'この会話の音声処理回数が上限に達しました。');
         const window = { revision, transcribed: false, researchStarted: false };
-        conversation?.requests.set(requestId, window);
+        if (conversation) addWindow(conversation, requestId, window);
         const controller = store.start(session);
         active.set(session.id, { requestId, revision, controller });
         const disconnected = () => { if (!res.writableEnded && active.get(session.id)?.controller === controller) { session.interrupted = true; store.cancel(session.id); active.delete(session.id); } };

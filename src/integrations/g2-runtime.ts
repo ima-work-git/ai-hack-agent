@@ -18,7 +18,7 @@ export interface GlassesView {
   footer: string
 }
 
-export type G2Action = 'primary' | 'previous' | 'next' | 'exit'
+export type G2Action = 'primary' | 'retry' | 'previous' | 'next' | 'exit'
 export type G2State = 'idle' | 'connecting' | 'connected' | 'recording' | 'background'
   | 'disconnected' | 'unavailable' | 'error' | 'disposed'
 export interface G2Status { state: G2State; reason?: string }
@@ -322,7 +322,7 @@ export class G2Runtime {
     }
     if (eventType === OsEventTypeList.SCROLL_TOP_EVENT) this.action('previous')
     else if (eventType === OsEventTypeList.SCROLL_BOTTOM_EVENT) this.action('next')
-    else if (event.textEvent && (eventType === OsEventTypeList.CLICK_EVENT || eventType === undefined)) this.action('primary')
+    else if (eventType === OsEventTypeList.CLICK_EVENT || event.textEvent && eventType === undefined) this.action('retry')
   }
 
   private suspend(state: 'background' | 'disconnected', reason: string): void {

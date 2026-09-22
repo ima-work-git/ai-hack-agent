@@ -131,6 +131,8 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
       if (path === '/api/session/restore') return new Response('{}', { status: 401 });
       if (path === '/api/session/forget') return jsonResponse({ ended: true });
       if (path === '/api/conversation') return jsonResponse({ conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab', expiresAt: Date.now() + 900_000 });
+      if (path === '/api/conversation/reset') return jsonResponse({ revision: 6, resetAt: Date.now() });
+      if (path === '/api/conversation/keepalive') return jsonResponse({ expiresAt: Date.now() + 900_000, revision: 3 });
       if (path === '/api/conversation/stream') return jsonResponse({ ticket: 'fixture-stream-ticket' });
       if (path === '/api/conversation/identify') return jsonResponse({ text: '架空検証社の架空の検証参加者です。', targets: [{ personName: '架空の検証参加者', companyName: '架空検証社' }], hasPersonMention: true });
       if (path === '/api/transcribe') return jsonResponse({ text: '架空検証社の架空の検証参加者です。' });
@@ -307,7 +309,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('G2 聞取中');
   });
 
-  it('pauses capture for ambiguous candidates and selects within the original conversation budget', async () => {
+  it('keeps capture for ambiguous candidates and selects within the original conversation budget', async () => {
     routes.set('/api/research', async init => {
       const input = JSON.parse(String(init.body)) as ResearchInput;
       if (input.selectedCandidateId) return resultResponse(input);
@@ -318,15 +320,138 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
     const stream = devices.streaming!;
     stream.options.onFinal('ambiguous', '架空検証社の架空の検証参加者です。'); await flush();
-    expect(devices.phone!.recording).toBe(false);
-    expect(stream.cancel).toHaveBeenCalledOnce();
+    expect(devices.phone!.recording).toBe(true);
+    expect(stream.cancel).not.toHaveBeenCalled();
     expect(element('candidates').children).toHaveLength(1);
-    stream.options.onFinal('late', '別の会社の人物です。'); await flush();
+    expect(element('card-board').textContent).not.toContain(FACT);
     expect(requests('/api/conversation/identify')).toHaveLength(1);
     (element('candidates').firstElementChild as HTMLButtonElement).click(); await flush();
     expect(requests('/api/research')).toHaveLength(2);
     expect(JSON.parse(String(requests('/api/research')[1]!.body))).toMatchObject({ selectedCandidateId: 'candidate-a', conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab' });
     expect(element('card-board').textContent).toContain(FACT);
+  });
+
+  it('shows an uncertain correction candidate on phone and glasses, then researches a named correction with its success hint', async () => {
+    routes.set('/api/conversation/identify', async init => {
+      const { text } = JSON.parse(String(init.body));
+      return jsonResponse(text === '広行について' ? { text, targets: [], hasPersonMention: true, correctionHint: '聞き取った名前の候補です。まだ本人とは確認できていません。', correctionCandidate: { personName: 'ひろゆき', companyName: '' } }
+        : { text, targets: [{ personName: 'ひろゆき', companyName: '' }], hasPersonMention: true, correctionHint: '言い直した名前を候補として公開情報を確認します。' });
+    });
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    stream.options.onFinal('uncertain', '広行について'); await flush();
+    expect(element('correction-hint').textContent).toContain('候補：ひろゆき');
+    expect(element('correction-hint').textContent).toContain('まだ本人とは確認できていません');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain('候補：ひろゆき');
+    expect(element('card-board').textContent).not.toContain(FACT); expect(requests('/api/research')).toHaveLength(0);
+    expect(stream.cancel).not.toHaveBeenCalled();
+    stream.options.onFinal('corrected', 'ひろゆきです'); await flush();
+    expect(requests('/api/research')).toHaveLength(1);
+    expect(JSON.parse(String(requests('/api/research')[0]!.body)).text).toContain('西村博之');
+    expect(element('correction-hint').textContent).toContain('言い直した名前');
+    expect(element('card-board').textContent).toContain(FACT);
+    expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.startAudio).toHaveBeenCalledOnce();
+  });
+
+  it.each(['/api/conversation/identify', '/api/research'])('keeps ASR active after a temporary %s failure and retries only after new speech', async path => {
+    routes.set(path, async () => new Response(JSON.stringify({ message: '人物調査のサービスが一時的に利用できません。' }), { status: 503, headers: { 'Content-Type': 'application/json' } }));
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!; stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(element('status').textContent).toContain('聞き取りは続いています');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain('言い直してください');
+    expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+    const sent = requests(path).length; await vi.advanceTimersByTimeAsync(5000); expect(requests(path)).toHaveLength(sent);
+    routes.delete(path); stream.options.onFinal('retry', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(requests(path)).toHaveLength(sent + 1); expect(element('card-board').textContent).toContain(FACT);
+    expect(devices.g2!.startAudio).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [429, '費用上限に達しました。', 'BUDGET_EXHAUSTED'],
+    [401, 'ログイン期限が切れました。', 'AUTH_EXPIRED'],
+    [409, '会話モードが終了または失効しました。', 'CONVERSATION_EXPIRED'],
+  ] as const)('still stops capture for a conversation boundary %s', async (httpStatus, message, code) => {
+    routes.set('/api/conversation/identify', async () => new Response(JSON.stringify({ message, code }), { status: httpStatus, headers: { 'Content-Type': 'application/json' } }));
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    const stream = devices.streaming!; stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(stream.cancel).toHaveBeenCalledOnce(); expect(devices.phone!.recording).toBe(false);
+    stream.options.onFinal('late', '次の人物です'); await flush();
+    expect(requests('/api/conversation/identify')).toHaveLength(1);
+  });
+
+  it('accepts a spoken correction after an ambiguous result without stopping or reopening the microphone', async () => {
+    routes.set('/api/research', async init => {
+      const input = JSON.parse(String(init.body)) as ResearchInput;
+      const result = researchResult(input.requestId, input.subjectRevision);
+      if (requests('/api/research').length === 1) { result.status = 'awaiting_confirmation'; result.cards = []; }
+      return new Response(`${JSON.stringify({ type: 'result', result })}\n`);
+    });
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(element('card-board').textContent).not.toContain(FACT);
+    stream.options.onFinal('correction', '違います。架空検証社の架空の検証参加者です。'); await flush();
+    expect(requests('/api/conversation/identify')).toHaveLength(2); expect(requests('/api/research')).toHaveLength(2);
+    expect(element('card-board').textContent).toContain(FACT);
+    expect(devices.phone!.recording).toBe(true); expect(devices.phone!.start).toHaveBeenCalledOnce(); expect(stream.cancel).not.toHaveBeenCalled();
+  });
+
+  it.each(['phone-button', 'glasses-tap'] as const)('clears the subject for new speech via %s and ignores old partial/final and delayed identification', async action => {
+    const old = deferred<Response>();
+    routes.set('/api/conversation/identify', () => old.promise);
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    expect(element<HTMLButtonElement>('retry-listening').disabled).toBe(false);
+    stream.options.onFinal('old-final', '架空検証社の架空の検証参加者です。'); await flush();
+    const oldRequest = requests('/api/conversation/identify')[0]!;
+    stream.options.onDelta('old-partial', '古い発話の途中');
+    if (action === 'phone-button') click('retry-listening'); else devices.g2!.options.onAction?.('retry');
+    await flush();
+    expect(requests('/api/conversation/reset')).toHaveLength(1);
+    expect(JSON.parse(String(requests('/api/conversation/reset')[0]!.body))).toEqual({ conversationId: '8a874d7b-6dda-41a2-8a27-d70e440b10ab' });
+    expect(oldRequest.signal!.aborted).toBe(true); expect(element('card-board').textContent).not.toContain(FACT);
+    expect(stream.cancel).not.toHaveBeenCalled(); expect(devices.phone!.recording).toBe(true);
+    expect(devices.phone!.start).toHaveBeenCalledOnce(); expect(devices.phone!.stop).not.toHaveBeenCalled();
+    stream.options.onFinal('old-partial', '古い発話です'); await flush();
+    routes.delete('/api/conversation/identify');
+    stream.options.onFinal('fresh-final', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(requests('/api/conversation/identify')).toHaveLength(2); expect(requests('/api/research')).toHaveLength(1);
+    expect(JSON.parse(String(requests('/api/research')[0]!.body)).subjectRevision).toBeGreaterThan(6);
+    old.resolve(jsonResponse({ text: '古い別人の応答です', targets: [{ personName: '古い別人', companyName: '' }], hasPersonMention: true })); await flush();
+    expect(requests('/api/research')).toHaveLength(1); expect(element('card-board').textContent).toContain(FACT);
+    expect(element<HTMLTextAreaElement>('text').value).not.toContain('古い別人');
+    expect(requests('/api/transcribe')).toHaveLength(0);
+  });
+
+  it('resets an active research without displaying its late result and permits the same subject after reset', async () => {
+    const old = deferred<Response>(); routes.set('/api/research', () => old.promise);
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    const stream = devices.streaming!; stream.options.onFinal('first', '架空検証社の架空の検証参加者です。'); await flush();
+    const oldInput = JSON.parse(String(requests('/api/research')[0]!.body)) as ResearchInput;
+    click('retry-listening'); await flush();
+    expect(requests('/api/research')[0]!.signal!.aborted).toBe(true);
+    routes.delete('/api/research'); stream.options.onFinal('fresh', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(requests('/api/research')).toHaveLength(2);
+    const currentBoard = element('card-board').textContent;
+    const stale = researchResult(oldInput.requestId, oldInput.subjectRevision); stale.cards[0]!.fact = '古い無効な人物カード';
+    old.resolve(new Response(`${JSON.stringify({ type: 'result', result: stale })}\n`)); await flush();
+    expect(element('card-board').textContent).toBe(currentBoard);
+    expect(element('card-board').textContent).not.toContain('古い無効'); expect(stream.cancel).not.toHaveBeenCalled();
+  });
+
+  it('keeps an active visible conversation alive, updates expiry, and stops heartbeat after consent is removed', async () => {
+    routes.set('/api/conversation/keepalive', async () => jsonResponse({ expiresAt: Date.now() + 900_000, revision: 12 }));
+    await boot(); chooseLiveAndConsent(); click('conversation'); await flush();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(requests('/api/conversation/keepalive')).toHaveLength(1);
+    devices.streaming!.options.onFinal('new', '架空検証社の架空の検証参加者です。'); await flush();
+    expect(JSON.parse(String(requests('/api/research')[0]!.body)).subjectRevision).toBe(13);
+    await vi.advanceTimersByTimeAsync(841_000);
+    expect(devices.phone!.recording).toBe(true); expect(element('workspace').classList.contains('hidden')).toBe(false);
+    const sent = requests('/api/conversation/keepalive').length;
+    element<HTMLInputElement>('consent').checked = false; element('consent').dispatchEvent(new Event('change')); await flush();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(requests('/api/conversation/keepalive')).toHaveLength(sent); expect(devices.phone!.recording).toBe(false);
   });
 
   it('cancels streaming and active identification, ignoring delayed final text and identification responses', async () => {

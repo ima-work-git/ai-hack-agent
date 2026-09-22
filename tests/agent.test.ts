@@ -490,6 +490,19 @@ describe('person-only public-profile research', () => {
     expect(result.cards).toHaveLength(outcome === 'few_cards' ? 2 : outcome === 'verified' ? 1 : 0);
   });
 
+  it('fetches the verified company source when X alone cannot link a known public person and company', async () => {
+    const target = { personName: '西村博之', companyName: '株式会社made in Japan' };
+    const provider = publicProvider({}, target.personName);
+    provider.plan = vi.fn(async () => ({ value: { target, needsConfirmation: false, candidates: [], query: '公式', reason: 'test' } }));
+    provider.search = vi.fn(async () => ({ value: [{ url: 'https://x.com/hirox246', title: '公開プロフィール' }] }));
+    provider.fetchPage = vi.fn(async hit => ({ value: { sourceId: hit.url, url: hit.url, title: hit.title, text: '西村博之についてのテスト資料。', kind: hit.url.startsWith('https://x.com') ? 'x' as const : 'web' as const, retrievedAt: '2026-09-22T00:00:00Z' } }));
+    provider.assess = vi.fn(async () => ({ value: { identityVerified: false, needsConfirmation: true, candidates: [], cards: [], followUpQuery: null, reason: '会社との関係の根拠不足' } }));
+    const result = await runAgent(input({ text: '株式会社メイドインジャパンのひろゆきさん' }), provider);
+    expect(provider.search).toHaveBeenCalledTimes(2);
+    expect(provider.fetchPage).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://modein.co.jp/corp/' }), expect.any(AbortSignal));
+    expect(result.cards).toHaveLength(0); expect(result.status).toBe('awaiting_confirmation');
+  });
+
   it('does not treat registered URLs as evidence when the preferred public pages cannot be fetched', async () => {
     const provider = publicProvider({ identityVerified: false, publicPersonVerified: false, needsConfirmation: true, cards: [] }, '堀江貴文');
     let searches = 0;

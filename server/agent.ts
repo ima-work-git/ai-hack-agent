@@ -152,7 +152,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     let hits;
     try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.search(queryForTarget(query, initialSearch), signal))); }
     catch (error) { if (fatal(error)) throw error; hadFailure = true; emit('recovery', '検索を取得できませんでした。別の検索か検証済みの情報へ縮退します。'); return; }
-    const knownPublicPerson = !initialSearch && target && !target.companyName ? verifiedAliasForTarget(target) : undefined;
+    const knownPublicPerson = !initialSearch && target ? verifiedAliasForTarget(target) : undefined;
     if (knownPublicPerson?.scope === 'public-person') {
       // These are known public identity locations, not cached factual evidence.
       // Fetch their real text within the same page allowance, then apply all
@@ -235,7 +235,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     }
     if (plan.needsConfirmation || !target) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '対象を絞るため、氏名・会社名または候補を確認してください。');
     const verifiedAlias = verifiedAliasForInputTarget(input.text, target);
-    if (verifiedAlias) {
+    if (verifiedAlias?.xHandle) {
       if (handles.length && handles[0] !== verifiedAlias.xHandle) return finish('awaiting_confirmation', 'ACCOUNT_IDENTITY_CONFLICT', '入力されたアカウントと確認済みの人物情報が一致しません。対象を確認してください。');
       if (!handles.length) handles.push(verifiedAlias.xHandle);
     }
@@ -256,9 +256,9 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     const accepted = applyAssessment(assessment);
     // X may lack primary identity evidence or useful facts. A candidate
     // ambiguity still stops immediately; use only the existing Web allowance.
-    const needsPublicWeb = !target.companyName && assessment.candidates.length === 0 &&
-      ((!accepted && (!assessment.identityVerified || !assessment.publicPersonVerified || !assessment.publicIdentitySourceIds?.length)) ||
-        (accepted && publicIdentityVerified && cards.length < 4)) &&
+    const needsPublicWeb = (!target.companyName || !!verifiedAliasForTarget(target)) && assessment.candidates.length === 0 &&
+      ((!accepted && (!assessment.identityVerified || !target.companyName && (!assessment.publicPersonVerified || !assessment.publicIdentitySourceIds?.length))) ||
+        (accepted && (assessment.identityVerified || publicIdentityVerified) && cards.length < 4)) &&
       sources.every(source => source.kind === 'x') && counts.search < limits.search && counts.llm < limits.llm && counts.page < limits.page;
     if (!accepted && !needsPublicWeb) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '所属や候補に曖昧さがあります。確認後に調査を再開してください。');
     if ((needsPublicWeb || assessment.followUpQuery) && counts.search < limits.search && counts.llm < limits.llm && cards.length < 4) {

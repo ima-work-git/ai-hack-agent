@@ -4,7 +4,7 @@ import { BudgetError, type BudgetLedger } from '../server/budget.ts';
 import type { OpenAIStreamingASROptions } from '../server/openai-streaming-asr.ts';
 import { createStreamingRelay } from '../server/ws-relay.ts';
 
-const mocks = vi.hoisted(() => ({ startError: undefined as unknown, servers: [] as EventEmitter[], upstreams: [] as { options: OpenAIStreamingASROptions; append: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> }[] }));
+const mocks = vi.hoisted(() => ({ startError: undefined as unknown, servers: [] as EventEmitter[], upstreams: [] as { options: OpenAIStreamingASROptions; append: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>; resetInput: ReturnType<typeof vi.fn>; updateKeywords: ReturnType<typeof vi.fn> }[] }));
 vi.mock('ws', async () => {
   const { EventEmitter } = await import('node:events');
   return { WebSocket: { OPEN: 1 }, WebSocketServer: class extends EventEmitter {
@@ -15,7 +15,7 @@ vi.mock('ws', async () => {
 });
 vi.mock('../server/openai-streaming-asr.ts', () => ({ OpenAIStreamingASR: class {
   options: OpenAIStreamingASROptions;
-  append = vi.fn(); stop = vi.fn();
+  append = vi.fn(); stop = vi.fn(); resetInput = vi.fn(() => true); updateKeywords = vi.fn(() => true);
   constructor(options: OpenAIStreamingASROptions) { this.options = options; mocks.upstreams.push(this); }
   async start() { if (mocks.startError) throw mocks.startError; this.options.onReady?.(); }
 } }));
@@ -53,6 +53,24 @@ describe('authenticated streaming relay', () => {
     f.relay.closeConversation('group'); expect(socket.terminate).toHaveBeenCalledOnce(); expect(mocks.upstreams[0]!.stop).toHaveBeenCalledOnce();
     f.relay.close();
   });
+  it('resets only the matching conversation, discards queued old PCM, and keeps the same sockets and budget', async () => {
+    const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
+    const upstream = mocks.upstreams[0]!;
+    expect(upstream.options.keywords).toContain('ひろゆき'); expect(upstream.options.keywords).toContain('ホリエモン');
+    expect(upstream.options.keywords!.length).toBeLessThanOrEqual(20);
+    socket.emit('message', Buffer.alloc(16_000), true);
+    expect(f.relay.resetConversation?.('other-group')).toBe(false);
+    expect(f.relay.resetConversation?.('group')).toBe(true); await flush();
+    expect(upstream.resetInput).toHaveBeenCalledOnce(); expect(upstream.append).not.toHaveBeenCalled();
+    socket.emit('message', Buffer.alloc(16_000), true); await flush();
+    expect(upstream.append).toHaveBeenCalledOnce(); expect(upstream.stop).not.toHaveBeenCalled();
+    expect(socket.terminate).not.toHaveBeenCalled(); expect(f.reserve).toHaveBeenCalledOnce();
+    expect(f.relay.updateKeywordsConversation?.('group', ['架空企業', '架空太郎'])).toBe(true);
+    expect(upstream.updateKeywords).toHaveBeenCalledWith(expect.arrayContaining(['架空企業', '架空太郎', 'ひろゆき']));
+    expect(upstream.updateKeywords.mock.calls[0]![0].length).toBeLessThanOrEqual(20);
+    f.relay.close();
+  });
+
   it('reserves connection time before the next minute and closes immediately when additional budget is denied', async () => {
     const f = setup(); const socket = f.connect(); f.auth(socket); await flush();
     f.reserve.mockRejectedValueOnce(new BudgetError('BUDGET_EXHAUSTED'));

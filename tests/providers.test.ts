@@ -155,6 +155,30 @@ describe('bounded OrcaRouter adapter', () => {
     await expect(createLiveProvider(config, { fetch: api }).plan({ ...input, text }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
   });
 
+  it('canonicalizes a verified company relationship without dropping its company', async () => {
+    const api = mockFetch(completion({ ...plan, target: { personName: 'ひろゆき', companyName: '株式会社メイドインジャパン' }, query: '公式 @hirox246' }));
+    const result = await createLiveProvider(config, { fetch: api }).plan({ ...input, text: '株式会社メイドインジャパンのひろゆきさんです。' }, signal());
+    expect(result.value.target).toEqual({ personName: '西村博之', companyName: '株式会社made in Japan' });
+  });
+
+  it('canonicalizes a catalog reading without granting an unverified X account', async () => {
+    const result = { ...plan, target: { personName: 'そんまさよし', companyName: '' }, query: 'そんまさよし 公式' };
+    const api = mockFetch(completion(result), completion({ ...result, query: '公式 @unverified' }));
+    const provider = createLiveProvider(config, { fetch: api });
+    expect((await provider.plan({ ...input, text: 'そんまさよしさんについて' }, signal())).value.target)
+      .toEqual({ personName: '孫正義', companyName: '' });
+    await expect(provider.plan({ ...input, text: 'そんまさよしさんについて' }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
+  });
+
+  it.each([
+    ['メイドインジャパンの広行さん', { personName: '西村博之', companyName: '株式会社made in Japan' }],
+    ['別会社のひろゆきさん', { personName: '西村博之', companyName: '株式会社made in Japan' }],
+    ['メイドインジャパンのひろゆきさん', { personName: '西村博之', companyName: 'Microsoft' }],
+  ])('does not make a permanent alias from ASR spelling or substitute a different company: %s', async (text, target) => {
+    const api = mockFetch(completion({ ...plan, target, query: '公式 @hirox246' }));
+    await expect(createLiveProvider(config, { fetch: api }).plan({ ...input, text: text as string }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
+  });
+
   it('does not grant an arbitrary account even for a verified alias pair', async () => {
     const api = mockFetch(completion({ ...plan, target: { personName: 'ちょまど', companyName: 'マイクロソフト' }, query: '@invented' }));
     await expect(createLiveProvider(config, { fetch: api }).plan({ ...input, text: 'マイクロソフトのちょまどさん' }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
