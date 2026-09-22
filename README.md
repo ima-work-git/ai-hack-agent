@@ -1,12 +1,15 @@
-# AI HACK — AI-DLC 開発準備キット
+# AI HACK — Even G2 会話中の調査アシスタント（名称未定）
 
-テーマが決まってから、すぐにチームで仕様を固めて開発を始めるためのひな形です。
-対象テーマは「業務を自律化するAIエージェント」。約2人でCodexを使います。個別の業務、技術スタック、チーム名は未定です。
+懇親会や打ち合わせで出た人名・会社名をEven G2で捉え、AIが公開サイトや利用可能なSNSを調べ、出典付きの短い話題カードを表示するサービスです。サービス名は未定。約2人でCodex・AWS AI-DLCを使います。
 
-**現在の状態：Publicリポジトリ・初期Issue・main保護・資料チェックCIを作成済み。公式AI-DLC 2.9.0をCodex向けに導入するスクリプトを同梱。プロダクトは未実装、2人目の招待はユーザー名待ち。**
-このキットの独自テンプレートと、公式AI-DLCが生成する状態・監査情報は別物です。
+2026-09-22にテーマ・Even G2・既存G2試作の接続方式再利用を決定し、ユーザーが提示済み要件を確認しました。レビューとマージはCodexへ委任されています。[決定記録](docs/DECISIONS.md)。**プロダクトは未実装・実機未検証です。**
 
-初回利用時は各自の `aidlc` コマンドの利用準備、Codexのhooks承認、ツール内の診断を行ってください。業務テーマのワークフローはまだ開始していません。
+**現在の状態：Publicリポジトリ・初期Issue・main保護・資料チェックCIを作成済み。採用テーマを仕様・開発分担・デモ台本へ反映。公式AI-DLC 2.9.0をCodex向けに導入するスクリプトを同梱。プロダクトは未実装、2人目の招待はユーザー名待ち。**
+このリポジトリの仕様草案と、公式AI-DLCが生成する状態・監査情報は別物です。
+
+初回利用時は各自の `aidlc` コマンドの利用準備、Codexのhooks承認、ツール内の診断を行ってください。進行担当のローカル環境ではMVPのワークフローを開始し、初期化を完了しました。要件確認は決定記録に基づき、公式の段階完了とは区別します。
+
+2026-09-22：本リポジトリのローカル環境へ公式設定・版登録を適用し、診断はエラー0件。要件確認と開発の委任を受け、進行担当がMVP方式を選んで進めます。[開発入力ブリーフ](docs/PROJECT_BRIEF.md)に決定事項・未確認事項をまとめています。
 
 リポジトリ：[ima-work-git/ai-hack-agent](https://github.com/ima-work-git/ai-hack-agent)
 
@@ -15,7 +18,7 @@
 1. [準備チェックリスト](docs/PREPARATION.md)で担当者と未決定事項を埋める。
 2. [GitHub・チーム運用](docs/TEAM_AND_GITHUB.md)に沿ってこのリポジトリへ参加し、招待受諾・clone・練習PRを確認する。
 3. [AI-DLC導入](docs/AI_DLC_SETUP.md)を読み、`sh scripts/setup-aidlc.sh` で各自の端末へ公式2.9.0を導入する。
-4. チームで30分集まり、[課題・要件](docs/specs/01_INTENT_AND_REQUIREMENTS.md)のMVPと受入条件を決める。
+4. [Even G2連携](docs/EVEN_G2_INTEGRATION.md)で既存方式と未検証箇所を確認し、[課題・要件](docs/specs/01_INTENT_AND_REQUIREMENTS.md)のMVPと受入条件に沿って実装する。
 5. [エージェント設計](docs/specs/02_AGENT_DESIGN.md)で自律実行・人の承認・失敗時の動きを決め、1本の業務を最後まで通す。
 
 **開発時の人間の承認と、完成したエージェントの利用者承認は別です。**
@@ -25,8 +28,11 @@ AI-DLCでは人が重要な開発判断を行います。プロダクト側で�
 
 | 目的 | 資料 |
 | --- | --- |
+| AI-DLCで作業を開始・再開する | [開発入力ブリーフ](docs/PROJECT_BRIEF.md) |
 | 準備の抜けを防ぐ | [準備・初期タスク](docs/PREPARATION.md) |
 | 招待、分担、PR、main保護 | [チーム・GitHub](docs/TEAM_AND_GITHUB.md) |
+| Even G2の既存方式を引き継ぐ | [G2連携と接続確認](docs/EVEN_G2_INTEGRATION.md) |
+| 再利用コードの確認結果と修正候補を見る | [G2再利用確認記録](docs/validation/EVEN_G2_REUSE_AUDIT.md) |
 | AWS公式ワークフローを導入する | [AI-DLCセットアップ](docs/AI_DLC_SETUP.md) |
 | OrcaRouter・クラウドの利用準備 | [サービス準備](docs/SERVICES.md) |
 | 作るものを決める | [課題・要件](docs/specs/01_INTENT_AND_REQUIREMENTS.md) |
