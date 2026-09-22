@@ -15,7 +15,7 @@ const assessment = { identityVerified: true, needsConfirmation: false, candidate
 function json(value: unknown, status = 200, headers: Record<string, string> = {}) {
   return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json', ...headers } });
 }
-function completion(value: unknown) { return json({ choices: [{ message: { content: JSON.stringify(value) } }] }); }
+function completion(value: unknown, usage?: unknown) { return json({ choices: [{ message: { content: JSON.stringify(value) } }], usage }); }
 function mockFetch(...responses: Response[]) {
   return vi.fn<typeof fetch>().mockImplementation(async () => {
     const response = responses.shift();
@@ -46,11 +46,43 @@ describe('bounded OrcaRouter adapter', () => {
     expect(result).toEqual({ value: plan });
     const [url, options] = api.mock.calls[0]!;
     expect(url).toBe('https://api.orcarouter.ai/v1/chat/completions');
-    expect(options).toMatchObject({ method: 'POST', redirect: 'error', headers: { Authorization: 'Bearer server-orca-secret' } });
+    expect(options).toMatchObject({ method: 'POST', redirect: 'error', headers: {
+      Authorization: 'Bearer server-orca-secret', 'X-OrcaRouter-Include-Cost': 'true',
+    } });
     const payload = JSON.parse(String(options!.body));
     expect(payload).toMatchObject({ model: 'operator-selected-model', response_format: { type: 'json_object' }, stream: false });
     expect(payload.messages[1].content).toBe(JSON.stringify({ text: input.text }));
     expect(payload.messages[0].content).not.toContain(config.orcaApiKey);
+  });
+
+  it('returns inline USD as preliminary only, including zero, without releasing the reservation', async () => {
+    const api = mockFetch(completion(plan, { cost_usd: 0.00846, prompt_tokens: 1100, completion_tokens: 420 }),
+      completion(assessment, { cost_usd: 0 }));
+    const provider = createLiveProvider(config, { fetch: api });
+    const planResult = await provider.plan(input, signal());
+    const assessmentResult = await provider.assess(target, [], signal());
+    expect(planResult).toEqual({ value: plan, reportedUsd: 0.00846 });
+    expect(assessmentResult).toEqual({ value: assessment, reportedUsd: 0 });
+    expect(planResult).not.toHaveProperty('actualUsd');
+    expect(assessmentResult).not.toHaveProperty('actualUsd');
+    expect(api).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    undefined, null, {}, { prompt_tokens: 1100, completion_tokens: 420 },
+    { cost_usd: null }, { cost_usd: '0.00846' }, { cost_usd: -0.01 }, { cost_usd: true },
+    [{ cost_usd: 0.01 }],
+  ])('leaves the monetary cost unknown for absent or invalid usage metadata %#', async (usage) => {
+    const api = mockFetch(completion(plan, usage));
+    expect(await createLiveProvider(config, { fetch: api }).plan(input, signal())).toEqual({ value: plan });
+    expect(api).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a non-finite reported cost without discarding the valid plan', async () => {
+    const response = new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(plan) } }] })
+      .replace(/}$/, ',"usage":{"cost_usd":1e999}}'));
+    const api = mockFetch(response);
+    expect(await createLiveProvider(config, { fetch: api }).plan(input, signal())).toEqual({ value: plan });
   });
 
   it.each([
@@ -105,6 +137,47 @@ describe('bounded OrcaRouter adapter', () => {
     expect(data.sources[0].text).toHaveLength(10_000);
     expect(payload.messages[0].content).toContain('untrusted');
     expect(payload.messages[0].content).not.toContain('Ignore previous instructions.');
+    expect(payload.messages[0].content).toContain('EXACT CONTIGUOUS substring');
+    expect(payload.messages[0].content).toContain('at most 1000 characters');
+    expect(payload.messages[0].content).toContain('Do not equate aliases or translations');
+  });
+
+  it('prioritizes exact-name/company eligible evidence while retaining other sources unchanged for ambiguity checks', async () => {
+    const api = mockFetch(completion(assessment));
+    const source = (sourceId: string, text: string): EvidenceSource => ({ sourceId,
+      url: `https://company.example.org/${sourceId}`, title: sourceId, text,
+      retrievedAt: '2026-09-22T00:00:00.000Z', kind: 'web' });
+    const sources = [
+      source('japanese-company', '山田花子は株式会社灯に所属しています。'),
+      source('eligible', '山田 花子 - ＡＫＡＲＩ　ＬＡＢＳ の公開イベントに登壇。'),
+      source('translated-name', 'Hanako Yamada works at Akari Labs.'),
+      source('different-company', '山田花子はLamp Companyに所属しています。'),
+    ];
+    const before = structuredClone(sources);
+    await createLiveProvider(config, { fetch: api }).assess({ personName: '山田花子', companyName: 'Akari Labs' }, sources, signal());
+    const payload = JSON.parse(String(api.mock.calls[0]![1]!.body));
+    const data = JSON.parse(payload.messages[1].content);
+    expect(data.sources).toEqual([sources[1], sources[0], sources[2], sources[3]].map((entry, index) => ({
+      sourceId: entry!.sourceId, kind: entry!.kind, url: entry!.url, title: entry!.title, text: entry!.text,
+      cardEligible: index === 0,
+      excerpts: index === 0 ? [{ excerptId: expect.any(String), text: entry!.text,
+        facts: [{ factId: expect.any(String), text: entry!.text }] }] : [],
+    })));
+    expect(sources).toEqual(before);
+    expect(payload.messages[0].content).toContain('only supplied sources with cardEligible=true');
+    expect(payload.messages[0].content).toContain('Assess ALL supplied sources');
+    expect(payload.messages[0].content).toContain('not verified identity');
+    expect(payload.messages[0].content).toContain('All suggestedQuestion and reason values must be Japanese');
+  });
+
+  it('does not mark a source eligible for identity text outside the bounded model excerpt', async () => {
+    const api = mockFetch(completion(assessment));
+    const source: EvidenceSource = { sourceId: 'long-source', url: 'https://company.example.org/long', title: '山田花子 株式会社灯',
+      text: `${'a'.repeat(10_000)} 山田花子 株式会社灯`, retrievedAt: '2026-09-22T00:00:00.000Z', kind: 'web' };
+    await createLiveProvider(config, { fetch: api }).assess(target, [source], signal());
+    const payload = JSON.parse(String(api.mock.calls[0]![1]!.body));
+    const data = JSON.parse(payload.messages[1].content);
+    expect(data.sources[0]).toMatchObject({ sourceId: 'long-source', text: 'a'.repeat(10_000), cardEligible: false });
   });
 
   it.each([
@@ -144,6 +217,7 @@ describe('public search and evidence', () => {
     const result = await createLiveProvider(config, { fetch: api }).search('山田花子 株式会社灯', signal());
     expect(result).toEqual({ value: [{ url: 'https://company.example.org/team', title: 'Team', snippet: 'unverified snippet' }] });
     expect(api.mock.calls[0]![0]).toBe('https://api.tavily.com/search');
+    expect(new Headers(api.mock.calls[0]![1]!.headers).has('X-OrcaRouter-Include-Cost')).toBe(false);
     expect(JSON.parse(String(api.mock.calls[0]![1]!.body))).toMatchObject({ search_depth: 'basic', max_results: 5,
       auto_parameters: false, include_answer: false, include_raw_content: false, include_images: false });
   });
@@ -161,6 +235,91 @@ describe('public search and evidence', () => {
   it('removes scripts, style, markup and decodes entities from evidence', () => {
     expect(extractPageText(Buffer.from('<head>hidden</head><script>prompt injection</script><style>hidden</style><p>山田 &amp; 灯 &#x4f1a;</p>'), 'text/html'))
       .toBe('山田 & 灯 会');
+  });
+
+  it('preserves the real Japanese document title before English body text, not search metadata', async () => {
+    const html = '<!doctype html><html><head><title>山田 花子 - 株式会社灯</title>' +
+      '<meta property="og:title" content="UNTRUSTED METADATA"></head>' +
+      '<body><h1>Hanako Yamada</h1><p>Speaker at a public company event.</p></body></html>';
+    const fetchPage = vi.fn().mockResolvedValue({ ...pageResponse(), body: Buffer.from(html) });
+    const result = await createLiveProvider(config, { fetchPage })
+      .fetchPage({ url: 'https://company.example.org/team', title: 'INVENTED SEARCH TITLE', snippet: 'INVENTED SNIPPET' }, signal());
+    expect(result.value.text).toBe('山田 花子 - 株式会社灯 Hanako Yamada Speaker at a public company event.');
+    expect(result.value.text).not.toMatch(/INVENTED|UNTRUSTED/);
+  });
+
+  it('decodes title entities once and ignores title-looking comments, script strings and attributes', () => {
+    const html = '<html><head><!-- <title>COMMENT FAKE</title> -->' +
+      '<script>const fake = "<title>SCRIPT FAKE</title>";</script>' +
+      '<style>/* <title>STYLE FAKE</title> */</style>' +
+      '<meta content="<title>ATTRIBUTE FAKE</title>">' +
+      '<title>山田&nbsp;花子 &amp; 灯 &#x4f1a; &#31038; &amp;lt;</title>' +
+      '</head><body>Public body content.</body></html>';
+    expect(extractPageText(Buffer.from(html), 'text/html'))
+      .toBe('山田 花子 & 灯 会 社 &lt; Public body content.');
+  });
+
+  it('does not expose script text when a JavaScript string contains a closing head tag', () => {
+    const html = '<html><head><script>const marker="</head>";' +
+      'const hidden="山田花子 | 株式会社灯 | HIDDEN_SCRIPT_ONLY";</script>' +
+      '<title>Public title</title></head><body>Public body.</body></html>';
+    expect(extractPageText(Buffer.from(html), 'text/html')).toBe('Public title Public body.');
+  });
+
+  it.each(['"', "'"])('keeps a closing head tag inside a %s-quoted metadata attribute hidden', quote => {
+    const html = '<html><head><title>山田花子 | 株式会社灯</title>' +
+      `<meta name="description" content=${quote}</head>HIDDEN_ATTRIBUTE_ONLY。${quote}>` +
+      '</head><body>Public body.</body></html>';
+    expect(extractPageText(Buffer.from(html), 'text/html')).toBe('山田花子 | 株式会社灯 Public body.');
+  });
+
+  it('does not expose quoted body attributes containing angle brackets or hidden closing tags', () => {
+    const html = '<head><title>Public title</title></head><body>' +
+      '<p title="value > HIDDEN_ATTRIBUTE_ONLY <script>fake</script>">Visible sentence.</p>' +
+      "<div data-note='</template> SECOND_HIDDEN_ATTRIBUTE'>Another sentence.</div></body>";
+    expect(extractPageText(Buffer.from(html), 'text/html')).toBe('Public title Visible sentence. Another sentence.');
+  });
+
+  it('keeps nested template text hidden even when attributes contain apparent closing tags', () => {
+    const html = '<body><template><div data-value="</template>">HIDDEN_TEMPLATE_ONLY</div>' +
+      '<template>HIDDEN_NESTED_TEMPLATE</template>HIDDEN_TEMPLATE_TAIL</template><p>Visible sentence.</p></body>';
+    expect(extractPageText(Buffer.from(html), 'text/html')).toBe('Visible sentence.');
+  });
+
+  it.each([
+    '<head><meta content="</head>HIDDEN_UNCLOSED_ATTRIBUTE></head><body>Visible?</body>',
+    '<body>Prefix.<div title="HIDDEN_UNCLOSED_ATTRIBUTE > Tail.</body>',
+    '<body>Prefix.<template><svg>HIDDEN_MISMATCH</template></svg>Tail.</body>',
+  ])('discards body text when markup is ambiguous or incomplete %#', html => {
+    expect(extractPageText(Buffer.from(html), 'text/html')).toBe('');
+  });
+
+  it.each([
+    ['<!doctype html><html><title>山田花子 | 株式会社灯</title><body>Hanako Yamada profile.</body></html>', 'text/html'],
+    ['<meta charset="utf-8"><title>山田花子 | 株式会社灯</title><p>Hanako Yamada profile.</p>', 'text/html'],
+    ['<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>山田花子 | 株式会社灯</title></head><body>Hanako Yamada profile.</body></html>', 'application/xhtml+xml'],
+  ])('preserves the real title with omitted head tags or an XML declaration %#', (html, mime) => {
+    expect(extractPageText(Buffer.from(html), mime)).toBe('山田花子 | 株式会社灯 Hanako Yamada profile.');
+  });
+
+  it.each([
+    '<head><title>DUPLICATE A</title><title>DUPLICATE B</title></head>',
+    '<head><title>NESTED <title>FAKE</title></head>',
+    '<head><title>UNCLOSED</head>',
+    '<head><meta content="<title>ATTRIBUTE ONLY</title>"></head>',
+    '<head><template><title>TEMPLATE FAKE</title></template></head>',
+    '<head><script>const fake = "<title>UNCLOSED SCRIPT</title>";',
+  ])('does not adopt an ambiguous or non-document title %#', prefix => {
+    const text = extractPageText(Buffer.from(`${prefix}<body>Public body content.</body>`), 'text/html');
+    expect(text).not.toMatch(/DUPLICATE|NESTED|FAKE|UNCLOSED|ATTRIBUTE|TEMPLATE/);
+  });
+
+  it('caps the document title at 1000 characters and total evidence at 40000', () => {
+    const html = `<head><title>${'題'.repeat(1200)}</title></head><body>${'文'.repeat(45000)}</body>`;
+    const text = extractPageText(Buffer.from(html), 'text/html');
+    expect(text).toHaveLength(40_000);
+    expect(text.startsWith(`${'題'.repeat(1000)} 文`)).toBe(true);
+    expect(text).not.toContain('題'.repeat(1001));
   });
 
   it.each(['You must log in to view this profile and continue.', 'Verify you are human before continuing to this page.', 'short'])('rejects inaccessible or insufficient source text', async (text) => {
@@ -196,6 +355,7 @@ describe('optional X public lookup and timeline', () => {
     const provider = createLiveProvider(xConfig, { fetch: api, fetchPage: web });
     const result = await provider.search('山田花子 株式会社灯 @public_person', signal());
     expect(api).toHaveBeenCalledTimes(2);
+    for (const call of api.mock.calls) expect(new Headers(call[1]!.headers).has('X-OrcaRouter-Include-Cost')).toBe(false);
     expect(String(api.mock.calls[0]![0])).toContain('/users/by/username/public_person?');
     expect(String(api.mock.calls[1]![0])).toContain('/users/123/tweets?max_results=5');
     expect(result.value).toHaveLength(1);

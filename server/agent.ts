@@ -46,6 +46,8 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
   let counts = { llm: 0, search: 0, page: 0 };
   let observedCost = 0;
   let reservedCost = 0;
+  let reportedCost = 0;
+  let reportedCostCalls = 0;
   let knownCost = true;
   const limits = { llm: 3, search: 2, page: 4 };
   const emit = (step: string, message: string) => {
@@ -89,6 +91,11 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       counts[kind] += 1;
       return operation(controller.signal);
     }).then(async result => {
+      // Response-time reports are display metadata, never settlement authority.
+      if (result.reportedUsd !== undefined && Number.isFinite(result.reportedUsd) && result.reportedUsd >= 0) {
+        reportedCost += result.reportedUsd;
+        reportedCostCalls += 1;
+      }
       const actual = result.actualUsd;
       if (actual !== undefined && (!Number.isFinite(actual) || actual < 0)) throw new ProviderError('INVALID_COST', '費用応答が不正です。');
       if (reservation) {
@@ -119,7 +126,8 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     return ResearchResultSchema.parse({
       requestId: input.requestId, subjectRevision: input.subjectRevision, mode: input.mode, status, target, candidates, cards, sources, trace,
       reasonCode, message: `${input.mode === 'demo' ? '模擬データ（架空の人物・会社）。' : ''}${message}`,
-      usage: { llm: counts.llm, searches: counts.search, pages: counts.page, elapsedMs: Math.max(0, now() - started), reservedUsd, actualUsd, costKnown: knownCost },
+      usage: { llm: counts.llm, searches: counts.search, pages: counts.page, elapsedMs: Math.max(0, now() - started), reservedUsd, actualUsd, costKnown: knownCost,
+        ...(reportedCostCalls ? { reportedUsd: reportedCost, reportedCostCalls } : {}) },
     });
   };
   const fatal = (error: unknown) => error instanceof StopError && error.code !== 'OPERATION_TIMEOUT' || error instanceof BudgetError;
@@ -206,6 +214,17 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     if (plan.needsConfirmation || !target) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '対象を絞るため、氏名・会社名または候補を確認してください。');
     if (input.selectedCandidateId) emit('human_confirmation', '利用者が選んだ候補で調査を再開します。');
     await gather(plan.query, true);
+    if (!sources.length && counts.search < limits.search) {
+      // An empty timeline/search is missing evidence, not evidence of an
+      // ambiguous identity. Use the remaining web search before asking a model.
+      emit('recovery', '初回の調査で本文を取得できなかったため、別の公開情報を探します。');
+      emit('replan', '氏名と会社名によるWeb検索へ切り替え、残りの取得枠で根拠を確認します。');
+      await gather(plan.query, false);
+    }
+    if (!sources.length) {
+      return finish(hadFailure ? 'failed' : 'no_evidence', hadFailure ? 'SOURCES_UNAVAILABLE' : 'NO_VERIFIABLE_EVIDENCE',
+        hadFailure ? '情報源を取得できず、根拠を確認できませんでした。入力または接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
+    }
     let assessment = await assess();
     if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '所属や候補に曖昧さがあります。確認後に調査を再開してください。');
     if (assessment.followUpQuery && counts.search < 2 && counts.llm < 3 && cards.length < 3) {
@@ -215,7 +234,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '追加資料で対象に曖昧さが見つかりました。候補を確認してください。');
     }
     if (cards.length) return finish(hadFailure ? 'partial' : 'ready', hadFailure ? 'PARTIAL_SOURCES_UNAVAILABLE' : 'EVIDENCE_VERIFIED', hadFailure ? '取得できなかった資料があります。確認できた根拠だけを表示します。' : '本文と対象を照合した話題カードを表示します。');
-    return finish(hadFailure ? 'failed' : 'no_evidence', hadFailure ? 'SOURCES_UNAVAILABLE' : 'NO_VERIFIABLE_EVIDENCE', hadFailure ? '情報源を取得できず、根拠を確認できませんでした。入力または接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
+    return finish(hadFailure ? 'failed' : 'no_evidence', hadFailure ? 'SOURCES_UNAVAILABLE' : 'NO_VERIFIABLE_EVIDENCE', hadFailure ? '一部の資料を取得できず、取得済みの資料からも対象と事実を照合できませんでした。入力や接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
   } catch (error) {
     const reason = error instanceof StopError || error instanceof BudgetError || error instanceof ProviderError ? error.code : 'INVALID_OR_UNAVAILABLE_RESPONSE';
     if (reason === 'CANCELLED') return finish('cancelled', reason, '調査を停止しました。遅れて届いた結果は表示しません。');

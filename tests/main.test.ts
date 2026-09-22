@@ -219,6 +219,36 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(devices.g2!.startAudio).not.toHaveBeenCalled();
   });
 
+  it.each([0, 0.00846])('keeps the reserved cost primary when a live result reports preliminary USD %s', async reportedUsd => {
+    routes.set('/api/research', async init => {
+      const input = JSON.parse(String(init.body)) as ResearchInput;
+      const result = researchResult(input.requestId, input.subjectRevision);
+      result.usage = { ...result.usage, reservedUsd: 0.063, reportedUsd, reportedCostCalls: 1 };
+      return new Response(`${JSON.stringify({ type: 'result', result })}\n`);
+    });
+    await boot(); chooseLiveAndConsent();
+    element<HTMLTextAreaElement>('text').value = '架空検証社の架空の検証参加者';
+    click('research'); await flush();
+    expect(element('fact').textContent).toBe(FACT);
+    expect(element('metric-cost').textContent).toBe('$0.063');
+    expect(element('cost-label').textContent).toBe(`実費未確定・上限額を留保 / 一部API報告額（暫定）$${reportedUsd.toFixed(6)}`);
+    expect(element('cost-label').textContent).not.toContain('計測された費用');
+  });
+
+  it('keeps a demo visibly simulated even if cost metadata is present', async () => {
+    const result = researchResult();
+    result.mode = 'demo';
+    result.usage = { ...result.usage, reservedUsd: 0.063, actualUsd: 0.00846, costKnown: true,
+      reportedUsd: 0.00846, reportedCostCalls: 1 };
+    routes.set('/api/session/resume', async () => jsonResponse({ result }));
+    await boot(); click('resume'); await flush();
+    expect(element('fact').textContent).toBe(FACT);
+    expect(element('metric-cost').textContent).toBe('模擬');
+    expect(element('cost-label').textContent).toBe('実費は未計測');
+    expect(element('result-note').textContent).toContain('架空の人物・固定資料によるデモ');
+    expect(element('cost-label').textContent).not.toContain('API報告額');
+  });
+
   it.each(['new-recording', 'mode-change', 'end-session'] as const)('discards a late resume response after %s, on both phone and glasses', async action => {
     const response = deferred<Response>();
     routes.set('/api/session/resume', () => response.promise);

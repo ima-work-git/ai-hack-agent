@@ -103,6 +103,9 @@ function showResult(value: ResearchResult) {
   $('metric-calls').textContent = `${value.usage.llm} / ${value.usage.searches} / ${value.usage.pages}`;
   $('metric-cost').textContent = value.mode === 'demo' ? '模擬' : value.usage.costKnown ? `$${value.usage.actualUsd?.toFixed(4)}` : `$${value.usage.reservedUsd.toFixed(3)}`;
   $('cost-label').textContent = value.mode === 'demo' ? '実費は未計測' : value.usage.costKnown ? '計測された費用' : '実費未確定・上限額を留保';
+  if (value.mode === 'live' && value.usage.reportedUsd !== undefined) {
+    $('cost-label').textContent += ` / 一部API報告額（暫定）$${value.usage.reportedUsd.toFixed(6)}`;
+  }
   $('candidates').replaceChildren();
   if (value.status === 'awaiting_confirmation') {
     for (const candidate of value.candidates) { const button = document.createElement('button'); button.textContent = `${candidate.personName} / ${candidate.companyName} を選ぶ`; button.onclick = () => { if (lastInput) { $<HTMLTextAreaElement>('text').value = lastInput.text; void research(candidate.id); } }; $('candidates').append(button); }

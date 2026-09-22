@@ -150,7 +150,7 @@ describe('bounded evidence research', () => {
     expect(provider.search).not.toHaveBeenCalled();
   });
 
-  it.each([1, 5])('routes a synthetic profile URL with %i X posts through Tavily and retrieves its web evidence', async postCount => {
+  it.each([0, 1, 5])('routes a synthetic profile URL with %i X posts through Tavily and retrieves its web evidence', async postCount => {
     const directory = await mkdtemp(join(tmpdir(), 'agent-x-routing-'));
     try {
       const budget = new BudgetLedger({ directory, currency: 'USD', runLimitUsd: 1, dayLimitUsd: 2, eventLimitUsd: 3 });
@@ -162,13 +162,14 @@ describe('bounded evidence research', () => {
           const data = JSON.parse(JSON.parse(String(init!.body)).messages[1].content);
           let content: unknown;
           if (++completions === 1) content = { target: DEMO_TARGET, needsConfirmation: false, candidates: [], query: '@fixture_user', reason: '入力の氏名・会社を使用' };
-          else if (completions === 2) content = { identityVerified: false, needsConfirmation: false, candidates: [], cards: [], followUpQuery: '公式 登壇 @fixture_user', reason: '公式の根拠が不足' };
-          else content = { identityVerified: true, needsConfirmation: false, candidates: [], cards: [{ fact, suggestedQuestion: '勉強会では何を紹介しましたか。', sourceId: data.sources.find((s: { kind: string }) => s.kind === 'web').sourceId, excerpt: fact }], followUpQuery: null, reason: '公式本文で確認' };
+          else if (completions === 2 && postCount > 0) content = { identityVerified: false, needsConfirmation: false, candidates: [], cards: [], followUpQuery: '公式 登壇 @fixture_user', reason: '公式の根拠が不足' };
+          else content = { identityVerified: true, needsConfirmation: false, candidates: [], cards: [{ suggestedQuestion: '勉強会では何を紹介しましたか。', factId: data.sources.find((s: { kind: string }) => s.kind === 'web').excerpts.flatMap((excerpt: { facts: { factId: string; text: string }[] }) => excerpt.facts).find((candidate: { text: string }) => candidate.text === fact).factId }], followUpQuery: null, reason: '公式本文で確認' };
           value = { choices: [{ message: { content: JSON.stringify(content) } }] };
         } else if (String(url).includes('/users/by/username/fixture_user')) {
           value = { data: { id: '123', username: 'fixture_user', name: DEMO_TARGET.personName, description: DEMO_TARGET.companyName, protected: false } };
         } else if (String(url).includes('/users/123/tweets')) {
-          value = { data: Array.from({ length: postCount }, (_, index) => ({ id: String(456 + index), author_id: '123', text: '公開勉強会について話しました。' })) };
+          value = postCount === 0 ? { meta: { result_count: 0, next_token: 'fixture-unused-next-page' } }
+            : { data: Array.from({ length: postCount }, (_, index) => ({ id: String(456 + index), author_id: '123', text: '公開勉強会について話しました。' })) };
         } else if (url === 'https://api.tavily.com/search') {
           expect(JSON.parse(String(init!.body)).query).not.toContain('@');
           value = { results: [{ url: 'https://company.example.org/event', title: '公式イベント' }] };
@@ -183,7 +184,7 @@ describe('bounded evidence research', () => {
         { budget, maximumCosts: { llm: 0.01, search: 0.05, page: 0 } });
       expect(result.status).toBe('ready');
       expect(result.cards).toHaveLength(1);
-      expect(result.usage).toMatchObject({ llm: 3, searches: 2, pages: Math.min(postCount, 2) + 1, costKnown: false });
+      expect(result.usage).toMatchObject({ llm: postCount ? 3 : 2, searches: 2, pages: Math.min(postCount, 2) + 1, costKnown: false });
       expect(result.sources.filter(source => source.kind === 'x')).toHaveLength(Math.min(postCount, 2));
       expect(result.sources.filter(source => source.kind === 'web')).toHaveLength(1);
       expect(fetchPage).toHaveBeenCalledTimes(1);
@@ -192,6 +193,86 @@ describe('bounded evidence research', () => {
       expect(api.mock.calls.filter(([url]) => String(url).includes('/users/by/username/'))).toHaveLength(1);
       expect(api.mock.calls.filter(([url]) => String(url).includes('/tweets?'))).toHaveLength(1);
       expect(api.mock.calls.filter(([url]) => url === 'https://api.tavily.com/search')).toHaveLength(1);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it('recovers a generic empty first search before assessing, without making a third search', async () => {
+    const provider = createFixtureProvider('normal');
+    const originalSearch = provider.search.bind(provider);
+    provider.search = vi.fn(originalSearch).mockResolvedValueOnce({ value: [], actualUsd: 0 });
+    provider.assess = vi.fn(provider.assess);
+    const result = await runAgent(input(), provider);
+    expect(result.status).toBe('ready');
+    expect(result.cards).toHaveLength(1);
+    expect(result.usage).toMatchObject({ llm: 2, searches: 2, pages: 1 });
+    expect(provider.assess).toHaveBeenCalledOnce();
+    expect(vi.mocked(provider.assess).mock.calls[0]![1]).toHaveLength(1);
+    expect(provider.search).toHaveBeenCalledTimes(2);
+    for (const [query] of vi.mocked(provider.search).mock.calls) {
+      expect(query).toContain(DEMO_TARGET.personName);
+      expect(query).toContain(DEMO_TARGET.companyName);
+    }
+    expect(result.trace.some(event => event.step === 'recovery')).toBe(true);
+    expect(result.trace.some(event => event.step === 'replan')).toBe(true);
+  });
+
+  it.each([
+    ['empty', 'empty', 'no_evidence'],
+    ['failure', 'empty', 'failed'],
+    ['empty', 'failure', 'failed'],
+    ['failure', 'failure', 'failed'],
+  ] as const)('ends %s then %s as %s without asking a model to invent ambiguity', async (first, second, status) => {
+    const provider = createFixtureProvider('normal');
+    const responses = [first, second];
+    provider.search = vi.fn(async () => {
+      if (responses.shift() === 'failure') throw new Error('synthetic search failure');
+      return { value: [], actualUsd: 0 };
+    });
+    provider.assess = vi.fn(provider.assess);
+    provider.fetchPage = vi.fn(provider.fetchPage);
+    const result = await runAgent(input(), provider);
+    expect(result.status).toBe(status);
+    expect(result.reasonCode).toBe(status === 'failed' ? 'SOURCES_UNAVAILABLE' : 'NO_VERIFIABLE_EVIDENCE');
+    expect(result.cards).toEqual([]);
+    expect(result.sources).toEqual([]);
+    expect(result.candidates).toEqual([]);
+    expect(result.usage).toMatchObject({ llm: 1, searches: 2, pages: 0 });
+    expect(provider.assess).not.toHaveBeenCalled();
+    expect(provider.fetchPage).not.toHaveBeenCalled();
+  });
+
+  it('honors cancellation before dispatching the empty-source recovery search', async () => {
+    const provider = createFixtureProvider('normal');
+    provider.search = vi.fn(async () => ({ value: [], actualUsd: 0 }));
+    provider.assess = vi.fn(provider.assess);
+    const controller = new AbortController();
+    const result = await runAgent(input(), provider, {
+      signal: controller.signal,
+      onEvent: event => { if (event.step === 'replan') controller.abort(); },
+    });
+    expect(result.status).toBe('cancelled');
+    expect(provider.search).toHaveBeenCalledOnce();
+    expect(provider.assess).not.toHaveBeenCalled();
+    expect(result.cards).toEqual([]);
+  });
+
+  it('does not dispatch recovery when unknown initial charges exhaust the run budget', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agent-empty-budget-'));
+    try {
+      const budget = new BudgetLedger({ directory, currency: 'USD', runLimitUsd: 0.025, dayLimitUsd: 1, eventLimitUsd: 2 });
+      const fixture = createFixtureProvider('normal');
+      const provider: ResearchProvider = {
+        ...fixture, mode: 'live',
+        plan: async (...args) => ({ value: (await fixture.plan(...args)).value }),
+        search: vi.fn(async () => ({ value: [] })),
+        assess: vi.fn(fixture.assess),
+      };
+      const result = await runAgent(input({ mode: 'live' }), provider, { budget, maximumCosts: { llm: 0.01, search: 0.01, page: 0 } });
+      expect(result.reasonCode).toBe('BUDGET_EXHAUSTED');
+      expect(result.usage).toMatchObject({ llm: 1, searches: 1, pages: 0, reservedUsd: 0.02, actualUsd: null, costKnown: false });
+      expect(provider.search).toHaveBeenCalledOnce();
+      expect(provider.assess).not.toHaveBeenCalled();
+      expect(JSON.parse(await readFile(join(directory, 'budget.json'), 'utf8')).event.reserved).toBe(20_000);
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
   it('cancels even if a provider ignores the signal, and never accepts its late result', async () => {
@@ -227,18 +308,19 @@ describe('bounded evidence research', () => {
   it.each([1, 10])('reserves follow-up capacity with %i initial hits and counts failed attempts without repeating them', async initialHits => {
     const provider = createFixtureProvider('normal');
     let searches = 0;
-    provider.search = async () => ({ value: Array.from({ length: ++searches === 1 ? initialHits : 10 }, (_, i) => ({ url: `https://example.invalid/page-${i}`, title: 'fixture' })), actualUsd: 0 });
     const fetch = vi.fn<ResearchProvider['fetchPage']>(async () => { throw new Error('unavailable'); });
-    provider.fetchPage = fetch;
-    const assess = provider.assess.bind(provider);
-    const attemptsAtAssessment: number[] = [];
-    provider.assess = async (...args) => {
-      attemptsAtAssessment.push(fetch.mock.calls.length);
-      return assess(...args);
+    const attemptsAtSearch: number[] = [];
+    provider.search = async () => {
+      attemptsAtSearch.push(fetch.mock.calls.length);
+      return { value: Array.from({ length: ++searches === 1 ? initialHits : 10 }, (_, i) => ({ url: `https://example.invalid/page-${i}`, title: 'fixture' })), actualUsd: 0 };
     };
+    provider.fetchPage = fetch;
+    provider.assess = vi.fn(provider.assess);
     const result = await runAgent(input(), provider);
     expect(fetch).toHaveBeenCalledTimes(4);
-    expect(attemptsAtAssessment).toEqual([Math.min(initialHits, 2), 4]);
+    expect(attemptsAtSearch).toEqual([0, Math.min(initialHits, 2)]);
+    expect(provider.assess).not.toHaveBeenCalled();
+    expect(result.status).toBe('failed');
     expect(fetch.mock.calls.map(([hit]) => hit.url)).toEqual(Array.from({ length: 4 }, (_, i) => `https://example.invalid/page-${i}`));
     expect(result.usage.llm).toBeLessThanOrEqual(3);
     expect(result.usage.searches).toBeLessThanOrEqual(2);
