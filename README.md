@@ -24,7 +24,7 @@ npm run build
 npm start
 ```
 
-`npm start`はビルド済み画面とAPIを同じサーバーで配信します。[実行・設定ガイド](docs/RUNNING.md)に認証、費用上限、音声、G2接続、復旧方法を記載しています。[実装・検証記録](docs/validation/MVP_IMPLEMENTATION.md)に仕様とテストの対応、独立レビュー、未達を記録します。
+`npm start`はビルド済み画面とAPIを同じサーバーで配信します。[実行・設定ガイド](docs/RUNNING.md)に認証、費用上限、音声、G2接続、復旧方法を記載しています。[実装・検証記録](docs/validation/MVP_IMPLEMENTATION.md)に仕様とテストの対応、独立レビュー、未達を記録します。追加の[Xプロフィール入力検証](docs/validation/X_PROFILE_INPUT.md)も参照してください。
 
 ## エージェントがすること
 

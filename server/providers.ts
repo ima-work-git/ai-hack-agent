@@ -4,6 +4,7 @@ import {
   AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, SearchHitSchema,
   type Assessment, type EvidenceSource, type PlanDecision, type ResearchInput, type SearchHit, type Target,
 } from '../src/shared/contracts.ts';
+import { extractExplicitXHandles } from '../src/shared/x-account.ts';
 import { ProviderError, type ProviderConfig, type ProviderResult, type ResearchProvider } from './provider-contract.ts';
 import { safeRequest, SafeFetchError, validatePublicUrl } from './safe-fetch.ts';
 
@@ -255,13 +256,20 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
   return {
     mode: 'live',
     async plan(input: ResearchInput, signal): Promise<ProviderResult<PlanDecision>> {
+      const explicitHandles = extractExplicitXHandles(input.text);
+      if (explicitHandles.length === 1 && /^(?:https:\/\/\S+|@[A-Za-z0-9_]{1,15})$/i.test(input.text.trim())) {
+        // An account identifier by itself cannot establish a person's name or
+        // affiliation. This local clarification makes no billable API request.
+        return { value: { target: null, needsConfirmation: true, candidates: [], query: '', reason: '氏名と会社名も入力してください。アカウントだけでは本人や所属を確定しません。' }, actualUsd: 0 };
+      }
       const result = await complete(PlanDecisionSchema,
-        'Extract only the person and company explicitly supplied in the input. Return {target:{personName,companyName}|null,needsConfirmation:boolean,candidates:[],query:string,reason:string}. If either name is missing or the input names multiple possible people, target=null and needsConfirmation=true. Do not invent candidate identities; no sources are available yet. Make query a short search query of the supplied person/company, at most 300 characters. Do not introduce an @handle unless present in the input. All explanatory text must be Japanese.',
+        'Extract only the person and company explicitly supplied in the input. Return {target:{personName,companyName}|null,needsConfirmation:boolean,candidates:[],query:string,reason:string}. If either name is missing or the input names multiple possible people, target=null and needsConfirmation=true. A profile URL or @handle alone does not supply a person name and company. Do not infer them from account identifiers. Do not invent candidate identities; no sources are available yet. Make query a short search query of the supplied person/company, at most 300 characters. Do not introduce an @handle unless explicitly present or identified by a supplied HTTPS x.com or twitter.com profile URL. Such a URL identifies only the account, not the person or affiliation. All explanatory text must be Japanese.',
         { text: input.text }, signal);
       const normalizedInput = input.text.normalize('NFKC').replace(/\s+/g, '').toLowerCase();
       const mentioned = (value: string) => normalizedInput.includes(value.normalize('NFKC').replace(/\s+/g, '').toLowerCase());
+      const allowedHandles = new Set(explicitHandles);
       if ((result.value.target && (!mentioned(result.value.target.personName) || !mentioned(result.value.target.companyName))) ||
-        result.value.candidates.length > 0 || Array.from(result.value.query.matchAll(/@([A-Za-z0-9_]{1,15})/g)).some((match) => !mentioned(match[0]))) {
+        result.value.candidates.length > 0 || Array.from(result.value.query.matchAll(/@([A-Za-z0-9_]{1,15})/g)).some((match) => !allowedHandles.has(match[1]!.toLowerCase()))) {
         throw new ProviderError('UNGROUNDED_PLAN', '入力にない人物やアカウントを生成したため調査を止めました。');
       }
       return result;

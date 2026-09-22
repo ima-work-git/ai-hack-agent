@@ -21,7 +21,7 @@ Node.js 24、`npm ci` → `npm run dev` → `http://localhost:4173`。
 
 OrcaRouterは [Chat Completions](https://docs.orcarouter.ai/api-reference/chat/create-a-chat-completion) と [構造化出力](https://docs.orcarouter.ai/advanced/structured-outputs) を使用します。モデルが非対応ならエラーで止まり、無制限な修復や勝手なモデル変更をしません。
 
-Tavilyはbasic検索を最大5結果に固定します。検索抜粋をそのまま根拠にせず、実際の本文を取得します。JavaScript必須ページ、ログイン壁、Facebook、Xの直接スクレイピングには対応しません。Xは入力に明示した`@handle`のみ公開APIで調べ、保護アカウントを拒否します。名前からの推測ハンドルや交友関係の推測は行いません。
+Tavilyはbasic検索を最大5結果に固定します。検索抜粋をそのまま根拠にせず、実際の本文を取得します。JavaScript必須ページ、ログイン壁、Facebook、Xの直接スクレイピングには対応しません。Xは入力に明示した`@handle`またはHTTPSの`x.com`/`twitter.com`プロフィールURLを公開APIで調べ、保護アカウントを拒否します。名前からの推測ハンドルや交友関係の推測は行いません。URL・ハンドルだけなら氏名と会社の確認へ戻ります。初回だけXを優先し、追加調査はWebへ進みます。本文の取得枠は初回最大2件・全体最大4件とし、追加調査の枠を残します。日英表記や愛称を自動で同一視する機能は未対応です。
 
 ## 音声
 

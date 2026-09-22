@@ -3,6 +3,7 @@ import {
   AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, ResearchInputSchema, ResearchResultSchema, SearchHitSchema,
 } from '../src/shared/contracts.ts';
 import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, Target, TraceEvent } from '../src/shared/contracts.ts';
+import { extractExplicitXHandles } from '../src/shared/x-account.ts';
 import type { ProviderResult, ResearchProvider } from './provider-contract.ts';
 import { ProviderError } from './provider-contract.ts';
 import { BudgetError, BudgetLedger } from './budget.ts';
@@ -34,9 +35,10 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
   const started = now();
   const deadline = started + 20_000;
   const budgetRunId = options.budgetRunId ?? randomUUID();
-  const handles = [...new Set([...input.text.matchAll(/(?:^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{1,15})(?=$|[^A-Za-z0-9_])/g)].map(match => match[1]!.toLowerCase()))];
+  const handles = extractExplicitXHandles(input.text);
   const trace: TraceEvent[] = [];
   const sources: EvidenceSource[] = [];
+  const attemptedSourceUrls = new Set<string>();
   let cards: Card[] = [];
   let target: Target | null = null;
   let candidates: Candidate[] = [];
@@ -121,21 +123,28 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     });
   };
   const fatal = (error: unknown) => error instanceof StopError && error.code !== 'OPERATION_TIMEOUT' || error instanceof BudgetError;
-  const queryForTarget = (query: string) => {
+  const queryForTarget = (query: string, preferExplicitAccount: boolean) => {
     if (!target) throw new StopError('TARGET_UNRESOLVED');
     // Model-selected topics stay inside the research purpose; source text cannot become an exfiltration query.
     const allowedTopics = ['公式', 'プロフィール', '事業', '登壇', '公開活動', 'インタビュー', '趣味', '経歴', 'official', 'profile', 'business', 'conference'];
     const topics = allowedTopics.filter(topic => query.toLowerCase().includes(topic)).slice(0, 3);
-    return `${target.personName} ${target.companyName} ${topics.length ? topics.join(' ') : '公式 プロフィール'}${handles.length === 1 ? ` @${handles[0]}` : ''}`;
+    const subject = `${target.personName} ${target.companyName}`.replaceAll('@', '');
+    // Only the first search carries the user-specified account. Follow-up terms
+    // cannot force another timeline call instead of the requested web research.
+    return `${subject} ${topics.length ? topics.join(' ') : '公式 プロフィール'}${preferExplicitAccount && handles.length === 1 ? ` @${handles[0]}` : ''}`;
   };
-  const gather = async (query: string) => {
+  const gather = async (query: string, initialSearch: boolean) => {
+    // Keep at least two of the four total attempts available for follow-up web
+    // evidence, even when the initial timeline/search returns many candidates.
+    const pageCeiling = initialSearch ? Math.min(limits.page, counts.page + 2) : limits.page;
     emit('search', '対象の氏名と会社名に絞って公開情報を検索します。');
     let hits;
-    try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.search(queryForTarget(query), signal))); }
+    try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.search(queryForTarget(query, initialSearch), signal))); }
     catch (error) { if (fatal(error)) throw error; hadFailure = true; emit('recovery', '検索を取得できませんでした。別の検索か検証済みの情報へ縮退します。'); return; }
     for (const hit of hits) {
-      if (counts.page >= limits.page) break;
-      if (!sourceUrlIsPublicShape(hit.url) || sources.some(s => s.url === hit.url)) continue;
+      if (counts.page >= pageCeiling) break;
+      if (!sourceUrlIsPublicShape(hit.url) || attemptedSourceUrls.has(hit.url) || sources.some(s => s.url === hit.url)) continue;
+      attemptedSourceUrls.add(hit.url);
       try {
         const source = EvidenceSourceSchema.parse(await call('page', signal => provider.fetchPage(hit, signal)));
         if (!sourceUrlIsPublicShape(source.url) || input.mode === 'live' && source.kind === 'fixture' || sources.some(s => s.sourceId === source.sourceId)) {
@@ -196,12 +205,12 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
     }
     if (plan.needsConfirmation || !target) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '対象を絞るため、氏名・会社名または候補を確認してください。');
     if (input.selectedCandidateId) emit('human_confirmation', '利用者が選んだ候補で調査を再開します。');
-    await gather(plan.query);
+    await gather(plan.query, true);
     let assessment = await assess();
     if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '所属や候補に曖昧さがあります。確認後に調査を再開してください。');
     if (assessment.followUpQuery && counts.search < 2 && counts.llm < 3 && cards.length < 3) {
       emit('replan', '根拠を補うため、追加の公開活動を自律的に調べます。');
-      await gather(assessment.followUpQuery);
+      await gather(assessment.followUpQuery, false);
       assessment = await assess();
       if (!applyAssessment(assessment)) return finish('awaiting_confirmation', 'IDENTITY_CONFIRMATION_REQUIRED', '追加資料で対象に曖昧さが見つかりました。候補を確認してください。');
     }

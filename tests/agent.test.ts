@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runAgent } from '../server/agent.ts';
-import { createFixtureProvider, DEMO_TEXT } from '../server/fixtures.ts';
+import { createFixtureProvider, DEMO_TEXT, DEMO_TARGET } from '../server/fixtures.ts';
+import { createLiveProvider } from '../server/providers.ts';
 import type { ResearchInput, Assessment } from '../src/shared/contracts.ts';
 import type { ResearchProvider } from '../server/provider-contract.ts';
 import { BudgetLedger } from '../server/budget.ts';
@@ -108,6 +109,91 @@ describe('bounded evidence research', () => {
     expect(search.mock.calls[0]![0]).toContain('星野あおい');
     expect(search.mock.calls[0]![0]).toContain('架空・みなもデザイン株式会社');
   });
+
+  it.each(['https://x.com/fixture_user?lang=ja', 'https://twitter.com/FIXTURE_USER/', '@fixture_user',
+    'https://x.com/fixture_user @FIXTURE_USER'])('uses explicit account %s only on the first search', async account => {
+    const provider = createFixtureProvider('normal');
+    const search = vi.fn(provider.search);
+    const assess = provider.assess.bind(provider);
+    provider.search = search;
+    provider.assess = async (...args) => {
+      const response = await assess(...args);
+      if (response.value.followUpQuery) response.value.followUpQuery = '公式 公開活動 @fixture_user @invented';
+      return response;
+    };
+    const result = await runAgent(input({ text: `${DEMO_TEXT} ${account}` }), provider);
+    expect(result.usage.searches).toBe(2);
+    expect(search.mock.calls[0]![0]).toContain(' @fixture_user');
+    expect(search.mock.calls[1]![0]).not.toContain('@');
+    expect(search.mock.calls[1]![0]).toContain(DEMO_TARGET.personName);
+    expect(search.mock.calls[1]![0]).toContain(DEMO_TARGET.companyName);
+    expect(search.mock.calls[1]![0]).toContain('公式 公開活動');
+  });
+
+  it('stops for distinct accounts across URL and handle before a model or search call', async () => {
+    const provider = createFixtureProvider('normal');
+    provider.plan = vi.fn(provider.plan); provider.search = vi.fn(provider.search);
+    const result = await runAgent(input({ text: `${DEMO_TEXT} https://x.com/fixture_user?lang=ja @other_fixture` }), provider);
+    expect(result.reasonCode).toBe('MULTIPLE_HANDLES');
+    expect(result.status).toBe('awaiting_confirmation');
+    expect(provider.plan).not.toHaveBeenCalled();
+    expect(provider.search).not.toHaveBeenCalled();
+  });
+
+  it('stays at confirmation without searching when a URL-only plan lacks person and company', async () => {
+    const provider = createFixtureProvider('normal');
+    provider.plan = async () => ({ value: { target: null, needsConfirmation: true, candidates: [], query: '@fixture_user', reason: '氏名と会社が未提示です。' } });
+    provider.search = vi.fn(provider.search);
+    const result = await runAgent(input({ text: 'https://x.com/fixture_user?lang=ja' }), provider);
+    expect(result.status).toBe('awaiting_confirmation');
+    expect(result.usage.searches).toBe(0);
+    expect(provider.search).not.toHaveBeenCalled();
+  });
+
+  it.each([1, 5])('routes a synthetic profile URL with %i X posts through Tavily and retrieves its web evidence', async postCount => {
+    const directory = await mkdtemp(join(tmpdir(), 'agent-x-routing-'));
+    try {
+      const budget = new BudgetLedger({ directory, currency: 'USD', runLimitUsd: 1, dayLimitUsd: 2, eventLimitUsd: 3 });
+      const fact = `${DEMO_TARGET.companyName}の${DEMO_TARGET.personName}は公開勉強会に登壇しました。`;
+      let completions = 0;
+      const api = vi.fn<typeof fetch>(async (url, init) => {
+        let value: unknown;
+        if (url === 'https://api.orcarouter.ai/v1/chat/completions') {
+          const data = JSON.parse(JSON.parse(String(init!.body)).messages[1].content);
+          let content: unknown;
+          if (++completions === 1) content = { target: DEMO_TARGET, needsConfirmation: false, candidates: [], query: '@fixture_user', reason: '入力の氏名・会社を使用' };
+          else if (completions === 2) content = { identityVerified: false, needsConfirmation: false, candidates: [], cards: [], followUpQuery: '公式 登壇 @fixture_user', reason: '公式の根拠が不足' };
+          else content = { identityVerified: true, needsConfirmation: false, candidates: [], cards: [{ fact, suggestedQuestion: '勉強会では何を紹介しましたか。', sourceId: data.sources.find((s: { kind: string }) => s.kind === 'web').sourceId, excerpt: fact }], followUpQuery: null, reason: '公式本文で確認' };
+          value = { choices: [{ message: { content: JSON.stringify(content) } }] };
+        } else if (String(url).includes('/users/by/username/fixture_user')) {
+          value = { data: { id: '123', username: 'fixture_user', name: DEMO_TARGET.personName, description: DEMO_TARGET.companyName, protected: false } };
+        } else if (String(url).includes('/users/123/tweets')) {
+          value = { data: Array.from({ length: postCount }, (_, index) => ({ id: String(456 + index), author_id: '123', text: '公開勉強会について話しました。' })) };
+        } else if (url === 'https://api.tavily.com/search') {
+          expect(JSON.parse(String(init!.body)).query).not.toContain('@');
+          value = { results: [{ url: 'https://company.example.org/event', title: '公式イベント' }] };
+        } else throw new Error('Unexpected mocked endpoint');
+        return new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
+      });
+      const fetchPage = vi.fn(async (url: string) => ({ url, status: 200, headers: { 'content-type': 'text/plain' }, body: Buffer.from(fact) }));
+      const provider = createLiveProvider({ orcaApiKey: 'fixture-key', orcaModel: 'fixture-model', tavilyApiKey: 'fixture-search', xEnabled: true, xBearerToken: 'fixture-x' }, {
+        fetch: api, fetchPage,
+      });
+      const result = await runAgent(input({ text: `${DEMO_TEXT} https://x.com/fixture_user?lang=ja`, mode: 'live' }), provider,
+        { budget, maximumCosts: { llm: 0.01, search: 0.05, page: 0 } });
+      expect(result.status).toBe('ready');
+      expect(result.cards).toHaveLength(1);
+      expect(result.usage).toMatchObject({ llm: 3, searches: 2, pages: Math.min(postCount, 2) + 1, costKnown: false });
+      expect(result.sources.filter(source => source.kind === 'x')).toHaveLength(Math.min(postCount, 2));
+      expect(result.sources.filter(source => source.kind === 'web')).toHaveLength(1);
+      expect(fetchPage).toHaveBeenCalledTimes(1);
+      expect(fetchPage.mock.calls[0]![0]).toBe('https://company.example.org/event');
+      expect(result.sources.find(source => source.sourceId === result.cards[0]!.sourceId)?.kind).toBe('web');
+      expect(api.mock.calls.filter(([url]) => String(url).includes('/users/by/username/'))).toHaveLength(1);
+      expect(api.mock.calls.filter(([url]) => String(url).includes('/tweets?'))).toHaveLength(1);
+      expect(api.mock.calls.filter(([url]) => url === 'https://api.tavily.com/search')).toHaveLength(1);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it('cancels even if a provider ignores the signal, and never accepts its late result', async () => {
     const provider = createFixtureProvider('normal');
     let resolvePlan!: (value: Awaited<ReturnType<ResearchProvider['plan']>>) => void;
@@ -138,13 +224,22 @@ describe('bounded evidence research', () => {
     expect(result.usage.elapsedMs).toBeLessThanOrEqual(20_001);
     expect(result.cards).toEqual([]);
   });
-  it('counts all fetch attempts and never exceeds page or model caps', async () => {
+  it.each([1, 10])('reserves follow-up capacity with %i initial hits and counts failed attempts without repeating them', async initialHits => {
     const provider = createFixtureProvider('normal');
-    provider.search = async () => ({ value: Array.from({ length: 10 }, (_, i) => ({ url: `https://example.invalid/page-${i}`, title: 'fixture' })), actualUsd: 0 });
-    const fetch = vi.fn(async () => { throw new Error('unavailable'); });
+    let searches = 0;
+    provider.search = async () => ({ value: Array.from({ length: ++searches === 1 ? initialHits : 10 }, (_, i) => ({ url: `https://example.invalid/page-${i}`, title: 'fixture' })), actualUsd: 0 });
+    const fetch = vi.fn<ResearchProvider['fetchPage']>(async () => { throw new Error('unavailable'); });
     provider.fetchPage = fetch;
+    const assess = provider.assess.bind(provider);
+    const attemptsAtAssessment: number[] = [];
+    provider.assess = async (...args) => {
+      attemptsAtAssessment.push(fetch.mock.calls.length);
+      return assess(...args);
+    };
     const result = await runAgent(input(), provider);
     expect(fetch).toHaveBeenCalledTimes(4);
+    expect(attemptsAtAssessment).toEqual([Math.min(initialHits, 2), 4]);
+    expect(fetch.mock.calls.map(([hit]) => hit.url)).toEqual(Array.from({ length: 4 }, (_, i) => `https://example.invalid/page-${i}`));
     expect(result.usage.llm).toBeLessThanOrEqual(3);
     expect(result.usage.searches).toBeLessThanOrEqual(2);
     expect(result.usage.pages).toBe(4);
