@@ -315,8 +315,12 @@ export class G2Runtime {
     }
     if (eventTypes.includes(OsEventTypeList.FOREGROUND_ENTER_EVENT)) {
       this.cancelSingleTap()
+      const wasForeground = this.foreground
       this.foreground = true
-      if (this.connected && !this.fatal) this.notify('connected', 'resume_required')
+      // A delayed/duplicate ENTER is not a microphone stop. Downgrading an
+      // active recording here would make the UI cancel its ASR connection.
+      // Only an actual background -> foreground transition requires resume.
+      if (!wasForeground && this.connected && !this.fatal) this.notify('connected', 'resume_required')
       return
     }
     if (!this.usable()) return

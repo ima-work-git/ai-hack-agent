@@ -1,6 +1,6 @@
 # Even G2 — 既存方式の再利用と最初の接続確認
 
-> 本文は2026-09-22の移植前調査の記録。現在の使い方は [実行ガイド](RUNNING.md) と [仕様08](specs/08_RESPECTFUL_QUESTIONS_AND_EXPLICIT_AUDIO_CONTROLS.md) が優先する。事前同意を前提に毎回のチェックボックスを省くが、音声は明示開始する。G2の確認なし1回タップでは音声を操作せず、聞き直し／再開は上スクロールから確認する。出典の移動承認と音声操作を分離し、3回タップ・長押しの独立通知は前提にしない。今回の実機確認は [検証記録](validation/RESPECTFUL_QUESTIONS_AND_AUDIO_CONTROLS.md) を参照する。
+> 本文は2026-09-22の移植前調査の記録。現在の使い方は [実行ガイド](RUNNING.md)、[仕様08](specs/08_RESPECTFUL_QUESTIONS_AND_EXPLICIT_AUDIO_CONTROLS.md)、[仕様09](specs/09_QR_CONVERSATION_START.md) が優先する。事前同意を前提に毎回のチェックボックスを省き、専用の会話用QR読取を開始操作として準備後に一度だけ音声を開始する。通常ページは開始ボタンを使い、履歴復帰だけでは始めない。G2の確認なし1回タップでは音声を操作せず、聞き直し／再開は上スクロールから確認する。出典の移動承認と音声操作を分離し、3回タップ・長押しの独立通知は前提にしない。操作分離は [仕様08の検証記録](validation/RESPECTFUL_QUESTIONS_AND_AUDIO_CONTROLS.md)、QR開始は [仕様09の検証記録](validation/QR_CONVERSATION_START.md) を参照する。
 
 確認日：2026-09-22。機種はユーザー指定。以前のG2試作のコードを確認し、表示・入力の接続方式を再利用する方針。今回のコード移植、実機動作、音声認識、調査AIの動作確認はまだ行っていない。
 
