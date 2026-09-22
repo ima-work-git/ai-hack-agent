@@ -38,7 +38,9 @@ export const CardSchema = ProposedCardSchema.extend({ cardId: z.string(), expire
 export type Card = z.infer<typeof CardSchema>;
 export const TraceEventSchema = z.object({ eventId: z.number().int().positive(), step: z.string().max(60), message: z.string().max(800), at: z.iso.datetime() }).strict();
 export type TraceEvent = z.infer<typeof TraceEventSchema>;
-export const UsageSchema = z.object({ llm: z.number().int().nonnegative(), searches: z.number().int().nonnegative(), pages: z.number().int().nonnegative(), elapsedMs: z.number().nonnegative(), reservedUsd: z.number().nonnegative(), actualUsd: z.number().nonnegative().nullable(), costKnown: z.boolean() }).strict();
+export const UsageSchema = z.object({ llm: z.number().int().nonnegative(), searches: z.number().int().nonnegative(), pages: z.number().int().nonnegative(), elapsedMs: z.number().nonnegative(), reservedUsd: z.number().nonnegative(), actualUsd: z.number().nonnegative().nullable(), costKnown: z.boolean(),
+  reportedUsd: z.number().finite().nonnegative().optional(), reportedCostCalls: z.number().int().nonnegative().optional(),
+}).strict();
 export type Usage = z.infer<typeof UsageSchema>;
 export const ResearchResultSchema = z.object({
   requestId: z.string(), subjectRevision: z.number().int(), mode: ModeSchema,

@@ -1,6 +1,12 @@
 import type { Assessment, EvidenceSource, PlanDecision, ResearchInput, SearchHit, Target } from '../src/shared/contracts.ts';
 
-export interface ProviderResult<T> { value: T; actualUsd?: number; }
+export interface ProviderResult<T> {
+  value: T;
+  /** Final verified cost only; callers may reconcile a reservation with this amount. */
+  actualUsd?: number;
+  /** Preliminary provider-reported USD for display only; never releases a reservation. */
+  reportedUsd?: number;
+}
 export interface ResearchProvider {
   readonly mode: 'demo' | 'live';
   plan(input: ResearchInput, signal: AbortSignal): Promise<ProviderResult<PlanDecision>>;

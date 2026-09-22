@@ -49,7 +49,7 @@ WebViewからの通信には`app.json`の接続先許可とサーバー側CORS�
 | 既存接続・表示コードの確認 | 済み |
 | 今回への移植、SDK版固定 | adapter実装、SDK 0.0.12固定 |
 | 実機の文字表示・操作・PCM受信 | 未検証 |
-| STT・OrcaRouter・Web検索接続 | adapter実装・模擬試験済み、実API未検証 |
+| STT・OrcaRouter・Web検索接続 | OrcaRouter・Web検索は実API疎通済み。STT・G2実機は未検証 |
 | ロック/切断/再接続・遅延結果棄却 | SDK模擬試験済み、実機未検証 |
 | 秘密のないパッケージ生成 | 静的UIを生成済み、バックエンドを含まない |
 

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import {
-  AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, SearchHitSchema,
+  AssessmentSchema, EvidenceSourceSchema, PlanDecisionSchema, ProposedCardSchema, SearchHitSchema,
   type Assessment, type EvidenceSource, type PlanDecision, type ResearchInput, type SearchHit, type Target,
 } from '../src/shared/contracts.ts';
 import { extractExplicitXHandles } from '../src/shared/x-account.ts';
@@ -29,7 +29,12 @@ export interface ProviderDependencies {
 
 const CompletionSchema = z.object({ choices: z.array(z.object({
   message: z.object({ content: z.string().max(30_000) }),
-})).min(1).max(10) });
+})).min(1).max(10), usage: z.unknown().optional() });
+const OrcaCostSchema = z.object({ cost_usd: z.number().finite().nonnegative() });
+// The model selects a supplied sentence; it never rewrites facts or evidence.
+const SelectionAssessmentSchema = AssessmentSchema.extend({ cards: z.array(
+  ProposedCardSchema.omit({ sourceId: true, excerpt: true, fact: true }).extend({ factId: z.string().min(1).max(80) }).strict(),
+).max(3) }).strict();
 const TavilySchema = z.object({ results: z.array(z.object({
   url: z.string().max(2048), title: z.string().max(4000), content: z.string().max(40_000).optional(),
 })).max(20) });
@@ -106,6 +111,15 @@ async function responseText(response: Response, signal: AbortSignal): Promise<st
 
 function sourceId(url: string): string { return `src-${createHash('sha256').update(url).digest('hex').slice(0, 20)}`; }
 
+function sliceText(text: string, start: number, end: number): string {
+  const high = (index: number) => text.charCodeAt(index) >= 0xd800 && text.charCodeAt(index) <= 0xdbff;
+  const low = (index: number) => text.charCodeAt(index) >= 0xdc00 && text.charCodeAt(index) <= 0xdfff;
+  let from = start; let to = Math.min(end, text.length);
+  if (from > 0 && low(from) && high(from - 1)) from += 1;
+  if (to > from && high(to - 1) && low(to)) to -= 1;
+  return text.slice(from, to);
+}
+
 function decodeEntities(text: string): string {
   const named: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
   return text.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (whole, entity: string) => {
@@ -115,18 +129,112 @@ function decodeEntities(text: string): string {
   });
 }
 
+function documentTitle(html: string): string {
+  // Accept one title in the explicit or HTML-implied head. Quote-aware tags prevent a
+  // title-looking attribute, script string, or comment from becoming evidence.
+  const tags = /<\?xml\b[^]*?\?>|<!--[\s\S]*?(?:-->|$)|<![^>]*>|<\/?[a-z][a-z0-9:-]*\b(?:[^<>"']|"[^"]*"|'[^']*')*>/gi;
+  const titles: string[] = [];
+  let inHead = false;
+  let cursor = 0;
+  for (let match; (match = tags.exec(html));) {
+    // Text/malformed markup outside title ends the conservative head parser.
+    if (html.slice(cursor, match.index).trim()) break;
+    cursor = tags.lastIndex;
+    if (match[0].startsWith('<!') || /^<\?xml\b/i.test(match[0])) continue;
+    const tag = /^<(\/?)([a-z][a-z0-9:-]*)/i.exec(match[0])!;
+    const name = tag[2]!.toLowerCase();
+    const closing = Boolean(tag[1]);
+    if (!inHead) {
+      if (!closing && name === 'html') continue;
+      if (!closing && name === 'head') { inHead = true; continue; }
+      if (!closing && ['title', 'base', 'basefont', 'bgsound', 'link', 'meta', 'script', 'style', 'noscript', 'noframes'].includes(name)) inHead = true;
+      else break;
+    }
+    if (closing && name === 'head') break;
+    if (!closing && ['script', 'style', 'noscript', 'noframes'].includes(name)) {
+      const end = new RegExp(`</${name}\\s*>`, 'gi'); end.lastIndex = cursor;
+      if (!end.exec(html)) break;
+      cursor = tags.lastIndex = end.lastIndex;
+      continue;
+    }
+    if (!closing && name === 'title') {
+      const end = /<\/title\s*>/gi; end.lastIndex = cursor;
+      const found = end.exec(html);
+      if (!found) return '';
+      const raw = html.slice(cursor, found.index);
+      if (raw.includes('<')) return ''; // malformed/nested title markup is ambiguous
+      titles.push(sliceText(decodeEntities(raw).replace(/\s+/g, ' ').trim(), 0, 1000));
+      cursor = tags.lastIndex = end.lastIndex;
+      continue;
+    }
+    if (!closing && ['base', 'basefont', 'bgsound', 'link', 'meta'].includes(name)) continue;
+    // Body, template/foreign content, or malformed head structure is not a title.
+    break;
+  }
+  return titles.length === 1 ? titles[0]! : '';
+}
+
+function documentBodyText(html: string): string {
+  // Walk whole, quote-aware tags. A `>` or `</head>` inside an attribute
+  // must never turn non-visible metadata into a quoted factual sentence.
+  const tagPattern = /<\/?([a-z][a-z0-9:-]*)\b(?:[^<>"']|"[^"]*"|'[^']*')*>/iy;
+  const declarationPattern = /<![^<>"']*(?:(?:"[^"]*"|'[^']*')[^<>"']*)*>|<\?xml\b(?:[^<>"']|"[^"]*"|'[^']*')*\?>/iy;
+  const hidden: string[] = [];
+  const parts: string[] = [];
+  let cursor = 0;
+  while (cursor < html.length) {
+    const start = html.indexOf('<', cursor);
+    if (start < 0) { if (!hidden.length) parts.push(html.slice(cursor)); break; }
+    if (!hidden.length) parts.push(html.slice(cursor, start));
+    if (html.startsWith('<!--', start)) {
+      const end = html.indexOf('-->', start + 4);
+      if (end < 0) return ''; // Ambiguous or incomplete markup fails closed.
+      cursor = end + 3; continue;
+    }
+    if (html.startsWith('<!', start) || html.startsWith('<?', start)) {
+      declarationPattern.lastIndex = start;
+      const declaration = declarationPattern.exec(html);
+      if (!declaration) return '';
+      cursor = declarationPattern.lastIndex; continue;
+    }
+    tagPattern.lastIndex = start;
+    const tag = tagPattern.exec(html);
+    if (!tag) {
+      // A comparison such as "1 < 2" is visible text; malformed markup is not.
+      if (/^[a-z/]/i.test(html.slice(start + 1, start + 2))) return '';
+      if (!hidden.length) parts.push('<');
+      cursor = start + 1; continue;
+    }
+    cursor = tagPattern.lastIndex;
+    const name = tag[1]!.toLowerCase();
+    const closing = tag[0].startsWith('</');
+    if (!closing && ['script', 'style', 'noscript', 'noframes', 'title'].includes(name)) {
+      // These elements contain raw text: apparent head/body tags inside their
+      // contents do not change the surrounding visibility state.
+      const end = new RegExp(`</${name}\\s*>`, 'gi'); end.lastIndex = cursor;
+      if (!end.exec(html)) return '';
+      cursor = end.lastIndex; continue;
+    }
+    if (['head', 'template', 'svg'].includes(name)) {
+      if (closing) {
+        if (hidden.at(-1) !== name) return '';
+        hidden.pop();
+      } else if (name !== 'svg' || !/\/\s*>$/.test(tag[0])) hidden.push(name);
+    }
+  }
+  return hidden.length ? '' : parts.join(' ');
+}
+
 export function extractPageText(body: Buffer, contentType: string): string {
   const charset = /charset\s*=\s*["']?([^\s;"']+)/i.exec(contentType)?.[1] ?? 'utf-8';
   let text: string;
   try { text = new TextDecoder(charset).decode(body); }
   catch { throw new ProviderError('UNSUPPORTED_CONTENT', 'ページの文字コードを読み取れませんでした。'); }
   if (/html/i.test(contentType)) {
-    text = text.replace(/<!--[^]*?-->/g, ' ')
-      .replace(/<(script|style|noscript|svg|head)\b[^>]*>[^]*?<\/\1\s*>/gi, ' ')
-      .replace(/<[^>]*>/g, ' ');
-    text = decodeEntities(text);
+    const title = documentTitle(text);
+    text = `${title}\n${decodeEntities(documentBodyText(text))}`;
   }
-  return text.replace(/\s+/g, ' ').trim().slice(0, 40_000);
+  return sliceText(text.replace(/\s+/g, ' ').trim(), 0, 40_000);
 }
 
 /** Raw G2 audio is 16 kHz, mono, signed 16-bit little-endian PCM. */
@@ -199,7 +307,9 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
       combined.throwIfAborted();
       const response = await fetchApi(url, {
         method: body === undefined ? 'GET' : 'POST', redirect: 'error', signal: combined,
-        headers: { Authorization: `Bearer ${key}`, Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+        headers: { Authorization: `Bearer ${key}`, Accept: 'application/json',
+          ...(url === ORCA_COMPLETIONS ? { 'X-OrcaRouter-Include-Cost': 'true' } : {}),
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       if (!response.ok) {
@@ -226,8 +336,12 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
         { role: 'user', content: JSON.stringify(data) },
       ],
     }));
-    // Usage/token counts alone are not a confirmed monetary charge.
-    return { value: checked(schema, parseJson(response.choices[0]!.message.content)) };
+    // Inline USD is preliminary even when valid: never use it to settle or
+    // release a reservation. Missing/malformed metadata remains unknown.
+    // https://docs.orcarouter.ai/operations/per-request-cost
+    const cost = OrcaCostSchema.safeParse(response.usage);
+    return { value: checked(schema, parseJson(response.choices[0]!.message.content)),
+      ...(cost.success ? { reportedUsd: cost.data.cost_usd } : {}) };
   }
 
   async function searchX(username: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>> {
@@ -329,9 +443,54 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
       }
     },
     async assess(target: Target, sources: EvidenceSource[], signal): Promise<ProviderResult<Assessment>> {
-      return complete(AssessmentSchema,
-        'Return {identityVerified:boolean,needsConfirmation:boolean,candidates:[],cards:[{fact,suggestedQuestion,sourceId,excerpt}],followUpQuery:string|null,reason:string}. Use at most 3 cards. sourceId must be from the supplied sources. excerpt must be an EXACT CONTIGUOUS substring of that source text containing BOTH the exact personName and companyName. fact must be a short exact substring of excerpt, not a paraphrase, max 200 characters. suggestedQuestion is a separate Japanese conversation suggestion, max 180 characters. Verify identity only when the evidence explicitly connects the named person to the named company; never use a name match alone. With conflicting identities, needsConfirmation=true, identityVerified=false, cards=[]. Do not infer hobbies, friendships or sensitive traits. Only explicitly self-published hobbies/activities may be used. If evidence is missing, give a targeted followUpQuery or null when further research is not useful. Never treat search snippets as evidence.',
-        { target, sources: sources.slice(0, 4).map((source) => ({ sourceId: source.sourceId, kind: source.kind, url: source.url, title: source.title, text: source.text.slice(0, 10_000) })) }, signal);
+      const normalizeIdentity = (text: string) => text.normalize('NFKC').replace(/\s+/g, '').toLocaleLowerCase('ja');
+      const names = [target.personName, target.companyName].map(normalizeIdentity);
+      const selectedFacts = new Map<string, { sourceId: string; excerpt: string; fact: string }>();
+      const quotePrefix = `quote-${randomUUID()}`;
+      const sentenceSegmenter = new Intl.Segmenter('ja', { granularity: 'sentence' });
+      const evidence = sources.slice(0, 4).map((source, sourceIndex) => {
+        const text = sliceText(source.text, 0, 10_000);
+        const normalized = normalizeIdentity(text);
+        // Segment before windowing so a truncated long sentence cannot become
+        // a shorter claim with its subject, condition or negation cut away.
+        const sentences = Array.from(sentenceSegmenter.segment(source.text), (part) => {
+          const fact = part.segment.trim();
+          const start = part.index + part.segment.indexOf(fact);
+          return { fact, start, end: start + fact.length };
+        }).filter(({ fact }) => fact.length > 0 && fact.length <= 200);
+        const excerpts: { excerptId: string; text: string; facts: { factId: string; text: string }[] }[] = [];
+        // Fixed overlapping windows preserve contiguous raw source text and
+        // cap both quotation length and input size. Eligibility is not proof
+        // that a nearby fact is about this person: the model must assess that.
+        for (let start = 0; start < text.length && excerpts.length < 4; start += 500) {
+          const excerpt = sliceText(text, start, start + 1000);
+          const normalizedExcerpt = normalizeIdentity(excerpt);
+          if (names.every((name) => Boolean(name) && normalizedExcerpt.includes(name))) {
+            const excerptId = `${quotePrefix}-${sourceIndex}-${start}`;
+            const excerptStart = text.indexOf(excerpt, start);
+            const facts = sentences.filter((sentence) => sentence.start >= excerptStart && sentence.end <= excerptStart + excerpt.length)
+              .slice(0, 8).map(({ fact }, factIndex) => {
+                const factId = `${excerptId}-fact-${factIndex}`;
+                selectedFacts.set(factId, { sourceId: source.sourceId, excerpt, fact });
+                return { factId, text: fact };
+              });
+            excerpts.push({ excerptId, text: excerpt, facts });
+          }
+          if (start + 1000 >= text.length) break;
+        }
+        return { sourceId: source.sourceId, kind: source.kind, url: source.url, title: source.title, text,
+          cardEligible: names.every((name) => Boolean(name) && normalized.includes(name)), excerpts };
+      }).sort((left, right) => Number(right.cardEligible) - Number(left.cardEligible));
+      const result = await complete(SelectionAssessmentSchema,
+        'Return {identityVerified:boolean,needsConfirmation:boolean,candidates:[],cards:[{factId,suggestedQuestion}],followUpQuery:string|null,reason:string}. Use at most 3 cards. Cards may use only supplied sources with cardEligible=true. This flag is a string-match precondition, not verified identity. Assess ALL supplied sources for ambiguity or conflicts, including cardEligible=false sources. For each card SELECT a factId from source.excerpts[].facts; do not output or rewrite fact, sourceId, excerptId or excerpt text. Each supplied fact is a complete raw source sentence of at most 200 characters. Its supplied excerpt is an EXACT CONTIGUOUS substring of its source text, at most 1000 characters, containing BOTH personName and companyName. This co-occurrence does NOT establish attribution: verify that the selected fact describes the target person, not another person mentioned nearby. Do not equate aliases or translations. If no supplied fact supports the target, return cards=[]. suggestedQuestion is a separate conversation suggestion, max 180 characters. All suggestedQuestion and reason values must be Japanese. Verify identity only when the evidence explicitly connects the named person to the named company; never use a name match alone. With conflicting identities, needsConfirmation=true, identityVerified=false, cards=[]. Do not infer hobbies, friendships or sensitive traits. Only explicitly self-published hobbies/activities may be used. If evidence is missing, give a targeted followUpQuery or null when further research is not useful. Never treat search snippets as evidence.',
+        { target, sources: evidence }, signal);
+      const cards = result.value.cards.flatMap(({ factId, ...card }) => {
+        const selected = selectedFacts.get(factId);
+        // Unknown or stale selections fail closed. All factual strings come
+        // from this call's raw source, never from model-generated paraphrases.
+        return selected ? [{ ...card, ...selected }] : [];
+      });
+      return { ...result, value: checked(AssessmentSchema, { ...result.value, cards }) };
     },
     async transcribe(bytes, mimeType, signal): Promise<ProviderResult<string>> {
       const audio = prepareAudio(bytes, mimeType);
