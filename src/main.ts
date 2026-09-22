@@ -1,5 +1,5 @@
 import './style.css';
-import { ResearchInputSchema, ResearchResultSchema, type Card, type ResearchInput, type ResearchResult, type RuntimeStatus, type TraceEvent, type Scenario } from './shared/contracts.ts';
+import { ResearchInputSchema, ResearchResultSchema, type Card, type EvidenceSource, type ResearchInput, type ResearchResult, type RuntimeStatus, type TraceEvent, type Scenario } from './shared/contracts.ts';
 import { G2Runtime, type G2Status, type GlassesView } from './integrations/g2-runtime.ts';
 import { PhoneAudio } from './phone-audio.ts';
 import { StreamingAudio } from './streaming-audio.ts';
@@ -30,11 +30,11 @@ app.innerHTML = `
 <div class="controls"><button id="sample">架空の会話を入力</button><button id="connect">G2を接続</button></div>
 <label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。会話モードは音声をOpenAIへ逐次送信して認識し、OrcaRouterで調査します。音声は保存しません。短い録音は最大30秒です。</span></label>
 <label for="microphone">使うマイク</label><select id="microphone"><option value="g2" ${conversationLaunch ? 'selected' : ''}>Even G2のマイク</option><option value="phone" ${conversationLaunch ? '' : 'selected'}>スマートフォンのマイク</option></select>
-<div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="retry-listening" disabled>聞き直す</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
-<div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><p class="status hidden" id="correction-hint" role="status"></p><div id="candidates" class="candidates"></div>
+<div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="retry-listening" disabled>聞き直す</button><button id="lock-person" disabled>この人物で固定</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
+<p class="muted" id="person-state" role="status">G2：1回タップで聞き直し・2回で人物固定。スクロールで出典、最後の次は4件一覧。</p><div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><p class="status hidden" id="correction-hint" role="status"></p><div id="candidates" class="candidates"></div>
 </section><section class="panel"><div class="section-head"><h2>エージェントの判断</h2><span class="section-number">02 / PROCESS</span></div><p id="trace-empty" class="empty-trace">調査中の判断と復旧の記録がここに表示されます。</p><ol id="trace" class="trace" aria-label="調査の処理履歴"></ol><details><summary>実APIの設定状況</summary><p class="muted" id="configuration"></p><p class="muted">APIキーと費用上限はサーバー側で設定します。</p></details></section></div>
 <div><div class="section-head"><h2>調査結果と質問 · 4件一覧</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="4件の調査結果と質問"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="topic-board" id="card-board">${BOARD_MARKUP}</div><div class="hud-foot"><span id="hud-source">各カードを押すと原文・出典を表示</span><span id="hud-expiry">0 / 4件確認</span></div></section><nav class="card-nav" aria-label="出典詳細の選択"><button id="previous" aria-label="前の出典" disabled>← 前の出典</button><span id="card-count">0 / 0</span><button id="next" aria-label="次の出典" disabled>次の出典 →</button></nav>
-<div class="notice" id="result-note">体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。</div><div class="metrics"><div class="metric"><strong id="metric-time">—</strong><span>調査にかかった時間</span></div><div class="metric"><strong id="metric-calls">—</strong><span>AI / 検索 / 本文</span></div><div class="metric"><strong id="metric-cost">—</strong><span id="cost-label">実費は未計測</span></div></div><section class="panel evidence-panel"><div class="section-head"><h2>情報の根拠</h2><span class="section-number">04 / EVIDENCE</span></div><p class="muted" id="source-empty">本文の引用・出典・取得時刻を、カードごとに確認できます。</p><div id="sources"></div></section></div></div></main>
+<div class="notice" id="result-note">体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。</div><div class="metrics"><div class="metric"><strong id="metric-time">—</strong><span>調査にかかった時間</span></div><div class="metric"><strong id="metric-calls">—</strong><span>AI / 検索 / 本文</span></div><div class="metric"><strong id="metric-cost">—</strong><span id="cost-label">実費は未計測</span></div></div><section class="panel evidence-panel" id="evidence-panel" tabindex="-1"><div class="section-head"><h2>情報の根拠</h2><span class="section-number">04 / EVIDENCE</span></div><p class="muted" id="source-empty">本文の引用・出典・取得時刻を、カードごとに確認できます。</p><div id="sources"></div></section></div></div></main>
 <footer class="footer"><span>AI HACK 2026 · 業務を自律化するAIエージェント</span><span>人の確認が必要なときは、立ち止まる。</span></footer>`;
 
 let runtimeStatus: RuntimeStatus;
@@ -46,6 +46,8 @@ let currentId = '';
 let viewToken = 'initial';
 let result: ResearchResult | null = null;
 let cardIndex = 0;
+let sourcePage = -1;
+let lockedPerson: ResearchResult['target'] = null;
 let lastInput: ResearchInput | null = null;
 let running = false;
 let controller: AbortController | null = null;
@@ -61,6 +63,7 @@ let audioBytes = 0;
 let audioTimer: ReturnType<typeof setTimeout> | undefined;
 let audioSource: 'g2' | 'phone' = 'phone';
 let microphoneConnecting = false;
+let stoppingAudio: Promise<unknown> | null = null;
 let conversation: StreamingAudio | null = null;
 let pendingTranscript: { itemId: string; text: string } | null = null;
 let identifyingTranscript = false;
@@ -95,11 +98,14 @@ function refreshControls() {
   $('record').toggleAttribute('disabled', !recording && (microphoneConnecting || audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked));
   $('conversation').toggleAttribute('disabled', microphoneConnecting || recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live') || !$<HTMLInputElement>('consent').checked);
   $('retry-listening').toggleAttribute('disabled', !conversationRunning || !conversationId || resettingConversation);
+  $('lock-person').toggleAttribute('disabled', !conversationRunning || resettingConversation || !hasCurrentCards() || !result?.target);
+  $('lock-person').textContent = lockedPerson ? '固定を解除して聞き直す' : 'この人物で固定';
+  $('person-state').textContent = lockedPerson ? `${lockedPerson.personName}さんを固定中。聞き取りは継続。1回タップで解除・聞き直し。` : 'G2：1回タップで聞き直し・2回で人物固定。スクロールで出典、最後の次は4件一覧。';
   $('conversation').textContent = voicePhase === 'error' ? '会話モードを再開' : '会話モードを開始';
   $('record').textContent = recording ? conversationRunning ? '会話モードを終了' : '録音を止めて調べる' : '音声で入力';
   if (voicePhase !== 'off') queueVoiceDisplay();
 }
-function newViewToken() { viewToken = `${currentId}:${revision}`; glassesView = emptyGlassesView(); g2?.invalidateViews(viewToken); }
+function newViewToken() { lockedPerson = null; sourcePage = -1; viewToken = `${currentId}:${revision}`; glassesView = emptyGlassesView(); g2?.invalidateViews(viewToken); }
 // Count wide characters conservatively and preserve complete Unicode characters.
 function shortText(text: string, maximumWidth: number): string {
   const characters = Array.from(text.replace(/\s+/g, ' ').trim());
@@ -117,6 +123,38 @@ function topicLabel(card: Card): string {
     : topic === 'facebook' || kind === 'facebook' ? 'Facebook'
     : topic === 'recent_x' ? '最近X' : topic === 'popular_x' ? '過去X' : topic === 'profile' ? '人物・会社' : '';
 }
+function sourceLabel(source: EvidenceSource): string {
+  return ({ x: 'X', instagram: 'Instagram', facebook: 'Facebook', web: 'Web', fixture: '架空資料' })[source.kind];
+}
+function cardLabel(card: Card): string {
+  const category = topicLabel(card);
+  const source = result?.sources.find(entry => entry.sourceId === card.sourceId);
+  if (!source || source.kind === 'fixture') return category;
+  const platform = sourceLabel(source);
+  return category.includes(platform) ? category : [category, platform].filter(Boolean).join(' / ');
+}
+// Six short lines per page preserve the complete quoted passage without an ellipsis.
+function excerptPages(text: string): string[] {
+  const lines: string[] = []; let line = ''; let width = 0;
+  for (const character of Array.from(text.replace(/\s+/g, ' ').trim())) {
+    const size = /^[\x20-\x7e]$/.test(character) ? 1 : 2;
+    if (width + size > 36) { lines.push(line); line = ''; width = 0; }
+    line += character; width += size;
+  }
+  if (line) lines.push(line);
+  const pages: string[] = [];
+  for (let i = 0; i < lines.length; i += 6) pages.push(lines.slice(i, i + 6).join('\n'));
+  return pages.length ? pages : ['該当文はありません'];
+}
+function navigateGlassesSource(direction: 1 | -1) {
+  const cards = result?.cards.filter(card => Date.parse(card.expiresAt) > Date.now()).slice(0, 4) ?? [];
+  const total = cards.reduce((count, card) => count + excerptPages(card.excerpt).length, 0);
+  if (!total) return;
+  sourcePage += direction;
+  if (sourcePage >= total) sourcePage = -1;
+  if (sourcePage < -1) sourcePage = total - 1;
+  renderCard();
+}
 function isProgressive(value: ResearchResult | null): boolean {
   return value?.reasonCode === 'PROGRESSIVE_QUICK' || value?.reasonCode === 'PROGRESSIVE_ENRICHING';
 }
@@ -127,17 +165,18 @@ function hasCurrentCards(): boolean {
 function renderBoard(cards: Card[]) {
   for (let index = 0; index < 4; index++) {
     const slot = $<HTMLButtonElement>(`topic-${index}`); const card = cards[index];
-    const label = card ? topicLabel(card) : '';
+    const label = card ? cardLabel(card) : '';
     slot.disabled = !card; slot.classList.toggle('empty', !card); slot.classList.toggle('selected', !!card && index === cardIndex);
     slot.setAttribute('aria-pressed', String(!!card && index === cardIndex));
     slot.setAttribute('aria-label', card ? `${index + 1}件目${label ? `・${label}` : ''}の原文と出典を表示` : `${index + 1}件目は未確認`);
     slot.querySelector('.topic-number')!.textContent = `${index + 1} / ${card ? `${label ? `${label} · ` : ''}原文・出典 ↗` : '未確認'}`;
     slot.querySelector('.topic-fact')!.textContent = card ? card.displayFact || card.fact : '未確認';
     slot.querySelector('.topic-question')!.textContent = card ? card.displayQuestion || card.suggestedQuestion : '確認後に表示';
-    slot.onclick = card ? () => { cardIndex = index; renderCard(); } : null;
+    slot.onclick = card ? () => { cardIndex = index; renderCard(); const panel = $('evidence-panel'); panel.focus({ preventScroll: true }); panel.scrollIntoView?.({ behavior: 'smooth', block: 'start' }); } : null;
   }
 }
-function clearResult() {
+function clearResult(preserveSelection = false) {
+  if (!preserveSelection) { lockedPerson = null; sourcePage = -1; }
   result = null; cardIndex = 0;
   $('candidates').replaceChildren(); $('sources').replaceChildren(); $('source-empty').classList.remove('hidden');
   renderBoard([]);
@@ -159,6 +198,7 @@ async function renderGlassesView() {
     };
     footer = labels[voicePhase];
     if (voicePhase === 'listening') {
+      if (lockedPerson) footer += '・人物固定';
       const latest = Array.from(voicePreview.replace(/\s+/g, ' ').trim()).slice(-16).join('');
       footer += latest ? `｜${latest}` : '｜発話待ち';
     }
@@ -189,32 +229,42 @@ function reportVoiceError(message: string) {
     : /応答.*検証|応答.*確認/.test(message) ? '音声API応答エラー・再開してください'
     : /サービス|音声認識/.test(message) ? '音声API接続失敗・再開してください'
     : '音声接続切れ・再開してください';
-  setVoicePhase('error'); status(message, true); refreshControls();
+  setVoicePhase('error'); status(`${message} G2は1回タップ、スマホは「会話モードを再開」で再開できます。`, true);
+  void sendView('音声を再開できます', 'G2は1回タップで再開\nスマホは「会話モードを再開」', voiceErrorLabel); refreshControls();
 }
 function renderCard() {
   const cards = result?.cards.filter(c => Date.parse(c.expiresAt) > Date.now()).slice(0, 4) || [];
   if (!cards.length) {
-    if (result?.cards.length) { clearResult(); status('カードの有効期限が切れました。必要なら再調査してください。'); void sendView('これで誰でも雑談マスター', 'カードの有効期限が切れました。', '再調査してください'); }
+    if (result?.cards.length) { clearResult(); refreshControls(); status('カードの有効期限が切れました。必要なら再調査してください。'); void sendView('これで誰でも雑談マスター', 'カードの有効期限が切れました。', '再調査してください'); }
     return;
   }
   cardIndex = (cardIndex + cards.length) % cards.length;
   const card = cards[cardIndex]!;
   const source = result!.sources.find(s => s.sourceId === card.sourceId)!;
   renderBoard(cards);
-  $('hud-target').textContent = result!.target?.personName || '';
+  $('hud-target').textContent = `${lockedPerson ? '固定：' : ''}${result!.target?.personName || ''}`;
   $('hud-source').textContent = '短い事実と質問 / 原文・出典はカードを選択';
   $('hud-expiry').textContent = `${cards.length} / 4件確認`;
   $('card-count').textContent = `${cardIndex + 1} / ${cards.length}`;
   $('previous').toggleAttribute('disabled', cards.length < 2); $('next').toggleAttribute('disabled', cards.length < 2);
   $('sources').replaceChildren(); $('source-empty').classList.add('hidden');
   const evidence = document.createElement('div'); evidence.className = 'source';
-  const title = document.createElement('h3'); title.textContent = source.title;
+  const title = document.createElement('h3'); title.textContent = `${cardIndex + 1}. ${source.title}`;
+  const platform = document.createElement('p'); platform.className = 'source-platform'; platform.textContent = `出典：${sourceLabel(source)}`;
   const fullFact = document.createElement('p'); fullFact.className = 'source-fact'; fullFact.textContent = `事実（全文）：${card.fact}`;
   const fullQuestion = document.createElement('p'); fullQuestion.textContent = `質問の提案：${card.suggestedQuestion}`;
   const quote = document.createElement('blockquote'); quote.textContent = card.excerpt;
   const date = document.createElement('p'); date.className = 'muted'; date.textContent = `取得：${new Date(source.retrievedAt).toLocaleString('ja-JP')}`;
   const expiry = document.createElement('p'); expiry.className = 'muted'; expiry.textContent = `有効期限：${new Date(card.expiresAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}`;
-  evidence.append(title, fullFact, fullQuestion, quote, date, expiry);
+  evidence.append(title, platform, fullFact, fullQuestion);
+  const quoteLabel = document.createElement('p'); quoteLabel.className = 'muted'; quoteLabel.textContent = '根拠となった該当文'; evidence.append(quoteLabel, quote);
+  const originalText = source.xPost?.text ?? source.socialPost?.text;
+  if (originalText) {
+    const originalLabel = document.createElement('h4'); originalLabel.textContent = '取得した元投稿';
+    const original = document.createElement('blockquote'); original.className = 'source-original'; original.textContent = originalText;
+    evidence.append(originalLabel, original);
+  }
+  evidence.append(date, expiry);
   const label = topicLabel(card);
   if (label) { const category = document.createElement('p'); category.className = 'source-topic muted'; category.textContent = `話題：${label}`; evidence.insertBefore(category, fullFact); }
   if (source.xPost) {
@@ -238,14 +288,25 @@ function renderCard() {
     const posted = document.createElement('p'); posted.className = 'source-post-date muted';
     posted.textContent = `投稿：${new Date(source.socialPost.createdAt).toLocaleString('ja-JP')}`; evidence.append(posted);
   }
-  if (source.kind !== 'fixture' && /^https?:\/\//.test(source.url)) { const link = document.createElement('a'); link.href = source.url; link.textContent = '出典を開く ↗'; link.target = '_blank'; link.rel = 'noopener noreferrer'; evidence.append(link); }
+  if (source.kind !== 'fixture' && /^https?:\/\//.test(source.url)) { const link = document.createElement('a'); link.href = source.url; link.textContent = `${sourceLabel(source)}で${source.xPost || source.socialPost ? '元投稿' : '出典'}を開く ↗`; link.target = '_blank'; link.rel = 'noopener noreferrer'; evidence.append(link); }
   $('sources').append(evidence);
   const rows = Array.from({ length: 4 }, (_, index) => {
     const entry = cards[index];
-    const label = entry ? topicLabel(entry) : '';
+    const label = entry ? cardLabel(entry) : '';
     return entry ? `${index + 1}${label ? ` ${label}` : ''} 事:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')} 問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事:未確認 問:—`;
   });
-  void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件${isProgressive(result) ? ' 速報・追加調査中' : ''}`, rows.join('\n'), '事=事実 問=質問 / 原文はスマホ');
+  refreshControls();
+  if (sourcePage >= 0) {
+    const pages = cards.flatMap((entry, index) => {
+      const sections = excerptPages(entry.excerpt);
+      return sections.map((content, page) => ({ content, index, entry, page, count: sections.length }));
+    });
+    sourcePage = Math.min(sourcePage, pages.length - 1);
+    const page = pages[sourcePage]!;
+    void sendView(`${lockedPerson ? '固定 ' : ''}${page.index + 1} ${cardLabel(page.entry) || '出典'} 該当文 ${page.page + 1}/${page.count}`, page.content, 'スクロールで続き・最後の次は一覧');
+    return;
+  }
+  void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${lockedPerson ? '固定 ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件${isProgressive(result) ? ' 速報・追加調査中' : ''}`, rows.join('\n'), 'スクロール=出典 / 1回=再認識 2回=固定');
 }
 function addTrace(event: TraceEvent) {
   if ($('trace').children.length >= 60) return;
@@ -258,7 +319,11 @@ function showResult(value: ResearchResult) {
   if (failure && hasCurrentCards() && !mustStopConversation({ code: value.reasonCode, message: value.message })) {
     preserveCurrentCards({ code: value.reasonCode, message: value.message }); return;
   }
-  clearResult(); result = value;
+  if (lockedPerson && value.cards.length && value.target && (value.target.personName !== lockedPerson.personName || value.target.companyName !== lockedPerson.companyName)) {
+    status('固定した人物と異なる調査結果は表示しません。変更するには1回タップで聞き直してください。'); return;
+  }
+  if (!value.cards.length) lockedPerson = null;
+  clearResult(true); result = value;
   const message = isProgressive(value) ? `速報・追加調査中。${value.message}` : failure ? `${failure.message} ${failure.action}` : value.message;
   status(message);
   $('result-note').textContent = value.mode === 'demo' ? '架空の人物・固定資料によるデモです。表示の動作確認であり、実APIやG2実機の動作証明ではありません。' : message;
@@ -440,9 +505,28 @@ function acceptAudio(chunk: Uint8Array) {
   if (!recording || audioBytes + chunk.length > 960_000) return;
   audioChunks.push(chunk.slice()); audioBytes += chunk.length;
 }
-g2 = new G2Runtime({ onStatus: g2Status, onAudio: acceptAudio, onAction: action => { if (action === 'next') { cardIndex++; renderCard(); } else if (action === 'previous') { cardIndex--; renderCard(); } else if (action === 'retry') { if (conversationRunning) void retryConversation(); else { cardIndex++; renderCard(); } } else if (action === 'exit') void cancel(); } });
+g2 = new G2Runtime({ onStatus: g2Status, onAudio: acceptAudio, onAction: action => {
+  if (action === 'next') navigateGlassesSource(1);
+  else if (action === 'previous') navigateGlassesSource(-1);
+  else if (action === 'retry') {
+    if (conversationRunning) void retryConversation();
+    else if (voicePhase === 'error' && token && !document.hidden && !pageLeaving) void startConversation();
+  } else if (action === 'lock') lockCurrentPerson();
+  else if (action === 'exit') void cancel();
+} });
+function lockCurrentPerson() {
+  if (!conversationRunning || resettingConversation || !hasCurrentCards() || !result?.target || document.hidden || pageLeaving) return;
+  lockedPerson = { ...result.target };
+  // Leave the current person's additional sources running, but reject an
+  // identification response that was already in flight when the user locked.
+  conversationSubjectGeneration++; transcriptDrainId++; identifyingTranscript = false;
+  pendingTranscript = null; identifyController?.abort(); identifyController = null; identifyingRequest = null; audioBusy = false;
+  status(`${lockedPerson.personName}さんを固定しました。聞き取りは続けます。変更は1回タップで聞き直してください。`);
+  renderCard(); refreshControls();
+}
 const phone = new PhoneAudio({ onAudio: acceptAudio, onStopped: reason => { if (recording && audioSource === 'phone') { if (conversationRunning) void cancel(); else void stopRecording(reason !== 'error'); } }, onError: message => status(message, true) });
 function abortConversation() {
+  lockedPerson = null;
   const wasActive = conversationRunning;
   const group = conversationId;
   const activeRequest = running ? { requestId: currentId, subjectRevision: conversationRequestRevision || revision }
@@ -509,7 +593,7 @@ async function waitForNextUtterance(error: unknown) {
 async function processConversationTranscript(text: string, generation: number) {
   const subjectGeneration = conversationSubjectGeneration;
   const own = new AbortController();
-  const valid = () => !own.signal.aborted && subjectGeneration === conversationSubjectGeneration && !resettingConversation && generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
+  const valid = () => !own.signal.aborted && subjectGeneration === conversationSubjectGeneration && !resettingConversation && !lockedPerson && generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
   if (!valid()) return;
   const id = crypto.randomUUID(); const identifyRevision = revision + 1;
   identifyController = own; identifyingRequest = { requestId: id, subjectRevision: identifyRevision }; audioBusy = true; refreshControls();
@@ -552,7 +636,7 @@ async function processConversationTranscript(text: string, generation: number) {
   } finally { if (identifyController === own) { identifyController = null; identifyingRequest = null; } if (subjectGeneration === conversationSubjectGeneration && generation === audioGeneration) audioBusy = false; refreshControls(); }
 }
 async function drainTranscripts(generation: number) {
-  if (identifyingTranscript || resettingConversation) return;
+  if (identifyingTranscript || resettingConversation || lockedPerson) return;
   const drainId = ++transcriptDrainId;
   identifyingTranscript = true;
   try {
@@ -617,6 +701,12 @@ async function retryConversation() {
   }
 }
 async function startConversation() {
+  if (stoppingAudio) {
+    const generation = audioGeneration;
+    try { await stoppingAudio; } catch { return; }
+    if (generation !== audioGeneration || !token || document.hidden || pageLeaving) return;
+    return startConversation();
+  }
   if (!runtimeStatus.streamingEnabled || !$<HTMLInputElement>('consent').checked || $<HTMLSelectElement>('mode').value !== 'live' || running || recording || audioBusy || conversationRunning || microphoneConnecting) return;
   if ($<HTMLSelectElement>('microphone').value === 'g2' && !connected) { if (await prepareGlassesMicrophone()) void startConversation(); return; }
   const generation = ++audioGeneration; conversationRunning = true; recording = true;
@@ -641,7 +731,7 @@ async function startConversation() {
       partialTranscripts.delete(itemId); completedTranscript = `${completedTranscript}\n${text}`.trim().slice(-1200);
       voicePreview = text; queueVoiceDisplay();
       $<HTMLTextAreaElement>('text').value = completedTranscript;
-      pendingTranscript = { itemId, text: text.slice(0, 2000) }; void drainTranscripts(generation);
+      if (!lockedPerson) { pendingTranscript = { itemId, text: text.slice(0, 2000) }; void drainTranscripts(generation); }
     },
     onError: error => { if (generation === audioGeneration) { void stopRecording(false); reportVoiceError(error.message); } },
     onClose: () => { if (generation === audioGeneration && conversationRunning) { void stopRecording(false); reportVoiceError('音声接続が終了しました。会話モードを再開してください。'); } },
@@ -691,7 +781,10 @@ async function stopRecording(transcribe: boolean) {
     abortConversation();
     audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer);
     audioChunks = []; audioBytes = 0;
-    await (audioSource === 'g2' ? g2.stopAudio() : phone.stop()); refreshControls(); return;
+    const pending = audioSource === 'g2' ? g2.stopAudio() : phone.stop();
+    stoppingAudio = pending;
+    try { await pending; } finally { if (stoppingAudio === pending) stoppingAudio = null; refreshControls(); }
+    return;
   }
   if (!recording) return;
   const generation = audioGeneration;
@@ -739,6 +832,7 @@ $('connect').onclick = () => { void connectGlasses(); };
 $('consent').onchange = () => { if (!$<HTMLInputElement>('consent').checked) void stopRecording(false); refreshControls(); };
 $('conversation').onclick = () => { void startConversation(); };
 $('retry-listening').onclick = () => { void retryConversation(); };
+$('lock-person').onclick = () => { if (lockedPerson) void retryConversation(); else lockCurrentPerson(); };
 $('record').onclick = () => { if (conversationRunning) void cancel(); else if (recording) void stopRecording(true); else void startRecording(); };
 $('mode').onchange = () => { currentId = crypto.randomUUID(); newViewToken(); clearResult(); void sendView('これで誰でも雑談マスター', '調査を開始してください。', 'マイクは停止中'); const demo = $<HTMLSelectElement>('mode').value === 'demo'; $('scenario-field').classList.toggle('hidden', !demo); $('mode-badge').textContent = demo ? '体験デモ · 架空の人物・固定データ' : '実API · 公開情報を調査'; $('hud-mode').textContent = demo ? 'DEMO / FICTIONAL DATA' : 'LIVE / PUBLIC SOURCES'; $('result-note').textContent = demo ? '体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。' : '個人の非公開情報は調査しません。情報が曖昧な場合は確認を求めます。'; refreshControls(); };
 $('resume').onclick = async () => {
