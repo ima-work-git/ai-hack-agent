@@ -203,7 +203,11 @@ async function stopRecording(transcribe: boolean) {
   const valid = () => generation === audioGeneration && id === currentId && !!token && !document.hidden && $<HTMLInputElement>('consent').checked;
   refreshControls();
   await (audioSource === 'g2' ? g2.stopAudio() : phone.stop());
-  if (!valid() || !chunks.length) { chunks.length = 0; if (generation === audioGeneration) { audioBusy = false; refreshControls(); } return; }
+  const canTranscribe = valid();
+  if (!canTranscribe || !chunks.length) {
+    if (canTranscribe && !chunks.length) status('音声を取得できませんでした。マイクの許可と接続を確認して、もう一度録音してください。', true);
+    chunks.length = 0; if (generation === audioGeneration) { audioBusy = false; refreshControls(); } return;
+  }
   controller = new AbortController(); const own = controller; status('音声を文字に変換しています…');
   try {
     const wav = pcmToWav(chunks); chunks.length = 0;

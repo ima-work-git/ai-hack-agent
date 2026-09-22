@@ -143,6 +143,24 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
   });
 
+  it('shows an actionable error and permits retry when an explicit stop captured no audio', async () => {
+    await boot(); chooseLiveAndConsent();
+    click('record'); await flush();
+    expect(devices.phone!.start).toHaveBeenCalledOnce();
+    click('record'); await flush();
+    expect(requests('/api/transcribe')).toHaveLength(0);
+    expect(requests('/api/research')).toHaveLength(0);
+    expect(element('status').textContent).toContain('音声を取得できませんでした');
+    expect(element('status').classList.contains('error')).toBe(true);
+    expect(element('record').textContent).toBe('音声で入力');
+    expect(element<HTMLButtonElement>('record').disabled).toBe(false);
+    click('record'); await flush();
+    devices.phone!.options.onAudio(new Uint8Array([0, 0, 255, 127]));
+    click('record'); await flush();
+    expect(requests('/api/transcribe')).toHaveLength(1);
+    expect(element('fact').textContent).toBe(FACT);
+  });
+
   it.each(['cancel', 'consent', 'pagehide'] as const)('never sends audio after %s while microphone stop is pending', async action => {
     await boot(); await recordPhone();
     const stopped = delayPhoneStop();
@@ -158,6 +176,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(requests('/api/transcribe')).toHaveLength(0);
     expect(requests('/api/research')).toHaveLength(0);
     expect(element('fact').textContent).not.toBe(FACT);
+    expect(element('status').classList.contains('error')).toBe(false);
   });
 
   it('leaving the page during active recording stops hardware without starting transcription', async () => {
