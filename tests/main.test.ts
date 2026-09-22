@@ -490,6 +490,27 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(devices.streaming!.cancel).toHaveBeenCalledOnce();
   });
 
+  it.each(['audio_start_timeout', 'audio_start_failed', 'display_timeout'] as const)('preserves the G2 %s error instead of silently showing stopped', async reason => {
+    await boot(); chooseLive(); click('connect'); await flush();
+    devices.g2!.startAudio.mockImplementationOnce(async () => { devices.g2!.options.onStatus?.({ state: 'error', reason }); return false; });
+    click('conversation'); await flush();
+    expect(element('conversation').textContent).toBe('会話モードを再開');
+    expect(element('status').textContent).not.toBe('停止しました。遅れて届いた結果は表示しません。');
+    expect(element('status').textContent).toMatch(/G2|通信/);
+    expect(devices.streaming!.cancel).toHaveBeenCalledOnce();
+    expect(devices.g2!.stopAudio).toHaveBeenCalledOnce();
+    expect(requests('/api/conversation')).toHaveLength(1);
+  });
+
+  it('does not repaint an active microphone with the idle connection screen', async () => {
+    await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
+    const count = devices.g2!.connect.mock.calls.length;
+    click('connect'); await flush();
+    expect(devices.g2!.connect).toHaveBeenCalledTimes(count);
+    expect(devices.streaming!.cancel).not.toHaveBeenCalled();
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).footer).toContain('聞取中');
+  });
+
   it('starts the phone microphone inside the tap while ASR is still preparing', async () => {
     const setup = deferred<Response>(); routes.set('/api/conversation', () => setup.promise);
     await boot(); chooseLive(); click('conversation');
@@ -960,7 +981,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(devices.phone!.start).not.toHaveBeenCalled();
   });
 
-  it('prepares live G2 conversation from a QR without preregistration or starting the microphone', async () => {
+  it('automatically starts G2 conversation once after verified QR redemption without preregistration', async () => {
     routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], streamingEnabled: true, accessCodeRequired: true }));
     window.history.replaceState(null, '', '/?conversation=1#login=' + 'c'.repeat(64));
     routes.set('/api/session/qr/redeem', async () => jsonResponse({ token: 'qr-session', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false }));
@@ -969,12 +990,107 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element<HTMLSelectElement>('mode').value).toBe('live');
     expect(element<HTMLTextAreaElement>('text').value).toBe('');
     expect(devices.g2!.connect).toHaveBeenCalledOnce();
-    expect(devices.g2!.startAudio).not.toHaveBeenCalled();
-    expect(requests('/api/conversation')).toHaveLength(0);
-    expect(requests('/api/research')).toHaveLength(0);
-    click('conversation'); await flush();
-    expect(devices.g2!.startAudio).toHaveBeenCalledWith({ continuous: true });
+    expect(devices.g2!.startAudio).toHaveBeenCalledExactlyOnceWith({ continuous: true });
     expect(requests('/api/conversation')).toHaveLength(1);
+    expect(requests('/api/session/restore')).toHaveLength(0);
+    expect(requests('/api/research')).toHaveLength(0);
+    expect(element('status').textContent).toContain('ストリーミング認識中');
+    click('conversation'); click('connect'); await flush();
+    expect(devices.g2!.startAudio).toHaveBeenCalledOnce();
+    expect(requests('/api/conversation')).toHaveLength(1);
+    expect(devices.g2!.connect).toHaveBeenCalledOnce();
+    click('cancel'); await flush();
+    document.dispatchEvent(new Event('visibilitychange')); await flush();
+    expect(requests('/api/conversation')).toHaveLength(1);
+  });
+
+  it('requires successful conversation QR redemption even with a remembered login', async () => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], streamingEnabled: true, accessCodeRequired: true }));
+    routes.set('/api/session/restore', async () => jsonResponse({ token: 'remembered', revision: 0, expiresAt: Date.now() + 900_000 }));
+    routes.set('/api/session/qr/redeem', async () => new Response('{}', { status: 401 }));
+    window.history.replaceState(null, '', '/?conversation=1#login=' + 'd'.repeat(64));
+    await boot();
+    expect(requests('/api/session/qr/redeem')).toHaveLength(1);
+    expect(requests('/api/session/restore')).toHaveLength(0);
+    expect(requests('/api/conversation')).toHaveLength(0);
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('explains unavailable QR streaming with liveEnabled=%s instead of leaving an idle screen', async liveEnabled => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled, missing: [], streamingEnabled: false, accessCodeRequired: true }));
+    routes.set('/api/session/qr/redeem', async () => jsonResponse({ token: 'qr', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false }));
+    window.history.replaceState(null, '', '/?conversation=1#login=' + 'a'.repeat(64));
+    await boot();
+    expect(element('status').textContent).toContain('音声認識の設定');
+    expect(requests('/api/conversation')).toHaveLength(0);
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled(); expect(devices.phone!.start).not.toHaveBeenCalled();
+  });
+
+  it('never auto-starts on a conversation query without a fresh QR fragment', async () => {
+    window.history.replaceState(null, '', '/?conversation=1');
+    await boot();
+    expect(requests('/api/conversation')).toHaveLength(0);
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled();
+    click('conversation'); await flush();
+    expect(requests('/api/conversation')).toHaveLength(1);
+  });
+
+  it.each(['cancel', 'background', 'pagehide', 'end'] as const)('discards the pending automatic QR start after %s during G2 connection', async action => {
+    const auth = deferred<Response>();
+    routes.set('/api/session/qr/redeem', () => auth.promise);
+    window.history.replaceState(null, '', '/?conversation=1#login=' + 'e'.repeat(64));
+    const starting = boot();
+    await vi.waitFor(() => expect(requests('/api/session/qr/redeem')).toHaveLength(1));
+    const connecting = deferred<boolean>();
+    devices.g2!.connect.mockReturnValueOnce(connecting.promise);
+    auth.resolve(jsonResponse({ token: 'qr', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false }));
+    await starting;
+    expect(devices.g2!.connect).toHaveBeenCalledOnce();
+    expect(requests('/api/conversation')).toHaveLength(0);
+    expect(element<HTMLButtonElement>('cancel').disabled).toBe(false);
+    if (action === 'background') { vi.spyOn(document, 'hidden', 'get').mockReturnValue(true); document.dispatchEvent(new Event('visibilitychange')); }
+    else if (action === 'pagehide') window.dispatchEvent(new Event('pagehide'));
+    else click(action);
+    await flush();
+    devices.g2!.options.onStatus?.({ state: 'connected' }); connecting.resolve(true); await flush();
+    expect(requests('/api/conversation')).toHaveLength(0);
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled();
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false); document.dispatchEvent(new Event('visibilitychange')); await flush();
+    expect(requests('/api/conversation')).toHaveLength(0);
+  });
+
+  it('discards a failed G2 connection arriving after canceling QR auto-start', async () => {
+    const auth = deferred<Response>(); routes.set('/api/session/qr/redeem', () => auth.promise);
+    window.history.replaceState(null, '', '/?conversation=1#login=' + 'e'.repeat(64));
+    const starting = boot(); await vi.waitFor(() => expect(requests('/api/session/qr/redeem')).toHaveLength(1));
+    const connecting = deferred<boolean>(); devices.g2!.connect.mockReturnValueOnce(connecting.promise);
+    auth.resolve(jsonResponse({ token: 'qr', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false })); await starting;
+    click('cancel'); await flush(); const stopped = element('status').textContent;
+    connecting.resolve(false); await flush();
+    expect(element('status').textContent).toBe(stopped);
+    expect(element('conversation').textContent).toBe('会話モードを開始');
+    expect(requests('/api/conversation')).toHaveLength(0);
+  });
+
+  it('cancels the automatic start if backgrounded while QR authentication is pending', async () => {
+    const auth = deferred<Response>(); routes.set('/api/session/qr/redeem', () => auth.promise);
+    window.history.replaceState(null, '', '/?conversation=1#login=' + 'f'.repeat(64));
+    const starting = boot(); await vi.waitFor(() => expect(requests('/api/session/qr/redeem')).toHaveLength(1));
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true); document.dispatchEvent(new Event('visibilitychange')); await flush();
+    auth.resolve(jsonResponse({ token: 'qr', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false })); await starting;
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false); document.dispatchEvent(new Event('visibilitychange')); await flush();
+    expect(requests('/api/conversation')).toHaveLength(0); expect(devices.g2!.startAudio).not.toHaveBeenCalled();
+  });
+
+  it('explains unavailable G2 auto-start without silently using the phone microphone', async () => {
+    const auth = deferred<Response>(); routes.set('/api/session/qr/redeem', () => auth.promise);
+    window.history.replaceState(null, '', '/?conversation=1#login=' + 'a'.repeat(64));
+    const starting = boot(); await vi.waitFor(() => expect(requests('/api/session/qr/redeem')).toHaveLength(1));
+    devices.g2!.connect.mockResolvedValueOnce(false);
+    auth.resolve(jsonResponse({ token: 'qr', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false })); await starting;
+    expect(element('status').textContent).toContain('Evenアプリ内');
+    expect(element('conversation').textContent).toBe('会話モードを再開');
+    expect(devices.phone!.start).not.toHaveBeenCalled(); expect(requests('/api/conversation')).toHaveLength(0);
   });
 
   it('uses an existing remembered login without spending another QR grant', async () => {
@@ -1217,7 +1333,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(complete).toBe(value.cards[0]!.excerpt);
   });
 
-  it('has no consent checkbox, never auto-starts audio, and permits explicit start under prior consent', async () => {
+  it('has no consent checkbox, does not auto-start on a normal URL, and permits explicit start under prior consent', async () => {
     await boot(); chooseLive();
     expect(document.getElementById('consent')).toBeNull();
     expect(element('audio-notice').textContent).toContain('事前に済んでいる');
