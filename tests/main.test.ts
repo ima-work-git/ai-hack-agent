@@ -204,21 +204,24 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     it('starts on an empty list and keeps recognition and results there until a person is explicitly selected', async () => {
       await start(); const voice = devices.streaming!;
       expect(view().header).toContain('認識した人物 0/0');
+      expect(view().textSize).toBeUndefined();
       expect(people()).toHaveLength(0); expect(element('sources').children).toHaveLength(0);
       expect(element('card-count').textContent).toBe('0 / 0');
       await say(0); await say(1);
       expect(people()).toHaveLength(2);
       expect(view().header).toContain('認識した人物');
       expect(view().content).toContain(names[0]); expect(view().content).toContain(names[1]);
-      expect(view().content).not.toContain('推奨質問:');
+      expect(view().content).not.toContain('⭐️推奨質問：');
       expect(element('sources').children).toHaveLength(0); expect(element('card-count').textContent).toBe('0 / 0');
       const paid = requests('/api/research').length; const identifies = requests('/api/conversation/identify').length;
       await action('next'); expect(view().content).toContain(`→ 2 ${names[1]}`);
       await action('previous'); expect(view().content).toContain(`→ 1 ${names[0]}`);
       await action('next'); await action('primary');
       expect(view().header).toContain(names[1]); expect(element('hud-target').textContent).toBe(names[1]);
-      expect(view().content).toContain('推奨質問:');
+      expect(view().content).toContain('⭐️推奨質問：');
+      expect(view().textSize).toBe('small');
       await action('secondary'); expect(view().header).toContain('認識した人物');
+      expect(view().textSize).toBeUndefined();
       expect(element('sources').children).toHaveLength(0); expect(element('card-count').textContent).toBe('0 / 0');
       expect(requests('/api/research')).toHaveLength(paid); expect(requests('/api/conversation/identify')).toHaveLength(identifies);
       await say(2);
@@ -269,6 +272,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
       await action('secondary'); expect(view().header).toContain(names[0]);
       expect(people()).toHaveLength(3); expect(view().header).toContain(names[0]); expect(view().content).not.toContain(names[2]);
       await action('next'); await action('primary'); const excerpt = view().content;
+      expect(view().textSize).toBe('small');
       expect(view().header).toContain('該当文');
       await say(3);
       expect(view().header).toContain('該当文'); expect(view().content).toBe(excerpt); expect(element('sources').textContent).toContain(names[0]);
@@ -1491,7 +1495,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('card-board').querySelectorAll('button:disabled')).toHaveLength(0);
     expect(element('hud-expiry').textContent).toBe('4 / 4件確認');
     const initialView = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
-    expect(initialView.content.split('\n\n')).toEqual(words.map((word, index) => `${index + 1} 事実:公開事実${word}。\n推奨質問:質問${word}？`));
+    expect(initialView.content.split('\n\n')).toEqual(words.map((word, index) => `${index + 1} 事実:公開事実${word}。\n⭐️推奨質問：質問${word}？`));
     click('next'); await flush();
     expect(element('card-count').textContent).toBe('2 / 4');
     expect(element('sources').querySelector('.source-fact')!.textContent).toBe('事実（全文）：公開事実に。');
@@ -1519,7 +1523,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect([...element('card-board').querySelectorAll('.topic-number')].map(node => node.textContent))
       .toEqual(labels.map((label, index) => `${index + 1} / ${label} · 原文・出典 ↗`));
     const board = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
-    expect(board.content.split('\n\n')).toEqual(labels.map((label, index) => `${index + 1} ${label} 事実:公開事実${index + 1}です。\n推奨質問:活動${index + 1}の工夫は？`));
+    expect(board.content.split('\n\n')).toEqual(labels.map((label, index) => `${index + 1} ${label} 事実:公開事実${index + 1}です。\n⭐️推奨質問：活動${index + 1}の工夫は？`));
     expect(board.content).not.toContain('…');
     expect(element('sources').querySelector('.source-post-date')!.textContent).toContain('2026/9/20');
     expect(element('sources').querySelector('.source-post-metrics')!.textContent).toBe('取得時の反響：いいね 1,200 / リポスト 34 / 返信 5 / 引用 6');
@@ -1882,7 +1886,7 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(element('sources').querySelector('.source-fact')!.textContent).toBe(`事実（全文）：${fact}`);
     expect(element('sources').querySelector('blockquote')!.textContent).toBe(fact);
     const firstRow = (devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content.split('\n\n')[0]!;
-    expect(firstRow).toContain(`事実:${displayFact}`); expect(firstRow).toContain(`推奨質問:${displayQuestion}`); expect(firstRow).not.toContain('…');
+    expect(firstRow).toContain(`事実:${displayFact}`); expect(firstRow).toContain(`⭐️推奨質問：${displayQuestion}`); expect(firstRow).not.toContain('…');
     expect(firstRow).not.toContain('\ufffd');
     const width = Math.max(...firstRow.split('\n').map(line => Array.from(line).reduce((sum, character) => sum + (/^[\x20-\x7e]$/.test(character) ? 1 : 2), 0)));
     expect(width).toBeLessThanOrEqual(45);

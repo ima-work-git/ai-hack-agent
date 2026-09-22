@@ -13,6 +13,10 @@ export interface PublicFigureCatalogEntry {
   readonly kana: string;
   readonly publicNames: readonly string[];
   readonly commonASRHomophones: readonly string[];
+  /** User-supplied event nicknames, NOT public aliases or ASR homophones.
+   * Search choices may offer these with explicit provenance and confirmation;
+   * identity grounding, resolution and source verification must ignore them. */
+  readonly userProvidedSearchNames?: readonly string[];
   /** Keep an uncertain ASR spelling selectable even when a company corroborates it. */
   readonly asrCorrectionRequiresConfirmation?: boolean;
   readonly officialProfileUrl: string;
@@ -32,6 +36,95 @@ export interface PublicFigureCatalogEntry {
 }
 
 export const PUBLIC_FIGURE_CATALOG: readonly PublicFigureCatalogEntry[] = [
+  {
+    id: 'koma-ai-yorozuya', canonicalName: 'こま', kana: 'こま',
+    publicNames: ['こまさん', 'ai_yorozuya', '@ai_yorozuya'], commonASRHomophones: [],
+    // Supplied by the user as the event organizer's name. No primary source
+    // establishing this surname-to-account relationship was found.
+    userProvidedSearchNames: ['高野', 'たかの'],
+    officialProfileUrl: 'https://note.com/ai_yorozuya',
+    readingBasis: 'kana-primary-source',
+    xHandle: 'ai_yorozuya', xHandleSourceUrl: 'https://note.com/ai_yorozuya/n/n0631c3a30f0c',
+    checkedOn: '2026-09-23',
+  },
+  {
+    id: 'shohei-ohtani', canonicalName: '大谷翔平', kana: 'おおたにしょうへい',
+    publicNames: ['Shohei Ohtani'], commonASRHomophones: [],
+    officialProfileUrl: 'https://www.mlb.com/player/shohei-ohtani-660271',
+    readingSourceUrl: 'https://npb.jp/bis/players/01305137.html', readingBasis: 'kana-primary-source',
+    // No independently verified personal X account: retain ordinary Web discovery.
+    checkedOn: '2026-09-23',
+  },
+  {
+    id: 'sam-altman', canonicalName: 'サム・アルトマン', kana: 'さむあるとまん',
+    publicNames: ['Sam Altman', 'サム アルトマン'], commonASRHomophones: [],
+    officialProfileUrl: 'https://blog.samaltman.com/',
+    readingSourceUrl: 'https://openai.com/ja-JP/index/our-principles/', readingBasis: 'kana-primary-source',
+    xHandle: 'sama', xHandleSourceUrl: 'https://blog.samaltman.com/',
+    companyClues: [{ name: 'OpenAI', aliases: ['オープンAI', 'オープンエーアイ'], sourceUrl: 'https://openai.com/index/introducing-openai-japan/' }],
+    checkedOn: '2026-09-23',
+  },
+  {
+    id: 'elon-musk', canonicalName: 'イーロン・マスク', kana: 'いーろんますく',
+    publicNames: ['Elon Musk', 'イーロン マスク'], commonASRHomophones: [],
+    officialProfileUrl: 'https://www.tesla.com/ja_jp/elon-musk', readingBasis: 'kana-primary-source',
+    xHandle: 'elonmusk', xHandleSourceUrl: 'https://ir.tesla.com/press-release/tesla-motors-releases-third-quarter-2013-financial-results',
+    companyClues: [
+      { name: 'Tesla', aliases: ['テスラ'], sourceUrl: 'https://www.tesla.com/ja_jp/elon-musk' },
+      { name: 'SpaceX', aliases: ['スペースX', 'スペースエックス'], sourceUrl: 'https://www.tesla.com/ja_jp/elon-musk' },
+    ],
+    checkedOn: '2026-09-23',
+  },
+  {
+    id: 'andrej-karpathy', canonicalName: 'Andrej Karpathy', kana: 'あんどれいかーぱしー',
+    publicNames: ['アンドレイ・カーパシー', 'アンドレイ カーパシー'], commonASRHomophones: [],
+    officialProfileUrl: 'https://karpathy.ai/', readingBasis: 'romanized-primary-source',
+    xHandle: 'karpathy', xHandleSourceUrl: 'https://github.com/karpathy',
+    checkedOn: '2026-09-23',
+  },
+  {
+    id: 'yutaka-matsuo', canonicalName: '松尾豊', kana: 'まつおゆたか',
+    publicNames: ['Yutaka Matsuo'], commonASRHomophones: [],
+    officialProfileUrl: 'https://ymatsuo.com/', readingBasis: 'romanized-primary-source',
+    checkedOn: '2026-09-23',
+  },
+  {
+    id: 'oki-matsumoto', canonicalName: '松本大', kana: 'まつもとおおき',
+    publicNames: [], commonASRHomophones: [],
+    officialProfileUrl: 'https://www.monexgroup.jp/jp/company/chronicle/25th/talk.html',
+    readingSourceUrl: 'https://www.monexgroup.jp/jp/news_release/irnews/auto_20230530588932/pdfFile.pdf',
+    readingBasis: 'kana-primary-source', checkedOn: '2026-09-23',
+  },
+  {
+    id: 'yoshiaki-murakami', canonicalName: '村上世彰', kana: 'むらかみよしあき',
+    publicNames: [], commonASRHomophones: [],
+    officialProfileUrl: 'https://murakamizaidan.jp/concept/',
+    readingSourceUrl: 'https://bunshun.jp/bungeishunju/author/5d91c36b7765619c0a010000',
+    readingBasis: 'kana-primary-source', checkedOn: '2026-09-23',
+  },
+  {
+    id: 'daisuke-okanohara', canonicalName: '岡野原大輔', kana: 'おかのはらだいすけ',
+    publicNames: ['Daisuke Okanohara'], commonASRHomophones: [],
+    officialProfileUrl: 'https://hillbig.github.io/', readingBasis: 'romanized-primary-source',
+    xHandle: 'hillbig', xHandleSourceUrl: 'https://hillbig.github.io/AIEXPO2024spring_okanohara.pdf',
+    checkedOn: '2026-09-23',
+  },
+  {
+    id: 'toru-nishikawa', canonicalName: '西川徹', kana: 'にしかわとおる',
+    publicNames: ['Toru Nishikawa'], commonASRHomophones: [],
+    officialProfileUrl: 'https://www.preferred.jp/ja/company/leadership',
+    readingSourceUrl: 'https://www.preferred.jp/wp-content/uploads/2025/07/PFN_cofounders_biographies_en_20250701.pdf',
+    readingBasis: 'romanized-primary-source', checkedOn: '2026-09-23',
+  },
+  {
+    id: 'takayuki-fukatsu', canonicalName: '深津貴之', kana: 'ふかつたかゆき',
+    publicNames: [], commonASRHomophones: [],
+    officialProfileUrl: 'https://note.theguild.jp/n/n93dc7e7c12d8',
+    readingSourceUrl: 'https://www.ssu.co.jp/news/2025/11/06/ai-dialogue-relations-team/',
+    readingBasis: 'kana-primary-source',
+    xHandle: 'fladdict', xHandleSourceUrl: 'https://note.theguild.jp/n/n93dc7e7c12d8',
+    checkedOn: '2026-09-23',
+  },
   {
     id: 'hiroyuki-nishimura', canonicalName: '西村博之', kana: 'にしむらひろゆき',
     publicNames: ['ひろゆき', 'Hiroyuki Nishimura'],
