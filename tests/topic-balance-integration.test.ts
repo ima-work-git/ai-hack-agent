@@ -143,6 +143,22 @@ describe('OrcaRouter balanced assessment candidate boundaries', () => {
     }
   });
 
+  it('offers a complete short quoted post instead of an unclosed quote fragment', async () => {
+    const all = sources(); const source = all[3]!;
+    const raw = '先日の会話。友人「この展示が好きです。」私は「また行きたい。」と話しました。';
+    source.text = `${source.text.slice(0, source.text.indexOf('\n公開投稿: '))}\n公開投稿: ${raw}`;
+    source.xPost = { ...source.xPost!, text: raw };
+    const api = vi.fn<typeof fetch>(async (_url, init) => {
+      const sent = JSON.parse(JSON.parse(String(init?.body)).messages[1].content).sources as SentSource[];
+      const facts = sent.find(entry => entry.sourceId === source.sourceId)!.excerpts.flatMap(excerpt => excerpt.facts);
+      expect(facts.some(fact => fact.text === raw)).toBe(true);
+      for (const fact of facts) expect((fact.text.match(/「/g) ?? []).length).toBe((fact.text.match(/」/g) ?? []).length);
+      return completion(assessment([]));
+    });
+    await createLiveProvider({ orcaApiKey: 'fixture', orcaModel: 'fixture', tavilyApiKey: 'fixture' }, { fetch: api }).assess(target, all, new AbortController().signal);
+    expect(api).toHaveBeenCalledOnce();
+  });
+
   it('does not offer copied headers when raw post metadata and the actual source body disagree', async () => {
     const all = sources(); all[1] = { ...all[1]!, xPost: { ...all[1]!.xPost!, text: '本文と一致しない投稿メタデータです。' } };
     const api = vi.fn<typeof fetch>(async (_url, init) => {

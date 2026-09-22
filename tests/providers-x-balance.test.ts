@@ -212,7 +212,7 @@ describe('bounded balanced X topics', () => {
   });
 
   it('does not fetch extra candidates when a nonempty timeline is entirely rejected by topic/identity checks', async () => {
-    const api = apiMock([recent('100', { text: '病気の治療を始めました。' }), recent('101', { author_id: '999' })], [historic()]);
+    const api = apiMock([recent('100', { text: '病気の治療を始めました。' }), recent('101', { author_id: '999' }), recent('102', { text: '小児科でインフル検査待ちでした。' })], [historic()]);
     const hits = (await providerWith(api).provider.search('@fixture_person', signal())).value;
     expect(hits.map(hit => hit.topic)).toEqual(['profile', 'popular_x']);
     expect(api).toHaveBeenCalledTimes(3);

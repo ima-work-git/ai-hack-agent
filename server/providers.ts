@@ -636,6 +636,12 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
               return { fact, start, end: start + fact.length };
             }).filter(({ fact }) => fact.length > 0 && fact.length <= 200)
             : [];
+          const wholePost = source.xPost.text.trim();
+          if (postStart >= 0 && source.text.slice(postStart) === source.xPost.text && wholePost.length <= 200 &&
+              !sentences.some(sentence => sentence.fact === wholePost)) {
+            const start = postStart + source.xPost.text.indexOf(wholePost);
+            sentences.unshift({ fact: wholePost, start, end: start + wholePost.length });
+          }
         }
         // These mechanically identifiable fragments are not useful talk facts.
         // Keep short professional descriptions (e.g. 作家) and all raw offsets.
@@ -645,7 +651,16 @@ export function createLiveProvider(config: ProviderConfig, dependencies: Provide
           const content = fact.replace(/^公開投稿:\s*/u, '').trim();
           if (/^(?:https?:\/\/\S+\s*)+$/u.test(content)) return false;
           const bare = content.replace(/[\s。.!！?？、,〜~…]/gu, '');
-          if (source.xPost && /[、，,:：]$/u.test(fact)) return false;
+          if (source.xPost) {
+            const quotes: string[] = [];
+            for (const character of fact) {
+              if (character === '「' || character === '『') quotes.push(character);
+              else if (character === '」' || character === '』') {
+                if (quotes.pop() !== (character === '」' ? '「' : '『')) return false;
+              }
+            }
+            if (quotes.length || /[、，,:：]$/u.test(fact)) return false;
+          }
           if (source.xPost && /^(?:最近|先日|今日|昨日|この前|以前)(?:あった|の)?(?:会話|話|出来事|こと)$/u.test(bare)) return false;
           return !/^(?:たしかに|確かに|なるほど|はい|いいえ|そうですね|そうです|そうなんですね|了解|了解です|ありがとう|ありがとうございます|おはようございます|こんにちは|こんばんは|すごい|すごいですね|同意|同感)$/u.test(bare);
         });
