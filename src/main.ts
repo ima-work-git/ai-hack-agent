@@ -9,6 +9,7 @@ import { pcmToWav } from './audio.ts';
 
 // A short-lived QR grant is read once, then removed before any API request.
 let qrLoginTicket = new URLSearchParams(window.location.hash.slice(1)).get('login') || '';
+const conversationLaunch = new URLSearchParams(window.location.search).get('conversation') === '1';
 if (new URLSearchParams(window.location.hash.slice(1)).has('login')) {
   window.history.replaceState(null, '', window.location.pathname + window.location.search);
 }
@@ -25,7 +26,7 @@ app.innerHTML = `
 <div class="notice hidden" id="resume-notice">前のセッションがあります。内容を表示するには、再開してください。<div class="controls"><button id="resume">前の内容を再開</button></div></div>
 <div class="grid"><div><section class="panel"><div class="section-head"><h2>会話から調べる</h2><span class="section-number">01 / INPUT</span></div><p class="muted">氏名と会社名を手がかりに、公開情報を確認します。</p>
 <div class="field-row"><div><label for="mode">利用モード</label><select id="mode"><option value="demo">体験デモ</option><option value="live" id="live-option" disabled>実APIで調査</option></select></div><div id="scenario-field"><label for="scenario">確認する場面</label><select id="scenario"><option value="normal">通常・自律的な追加調査</option><option value="ambiguous">同姓同名・候補を確認</option><option value="failure">検索障害・一部の根拠を表示</option><option value="no_evidence">根拠なし・推測せず終了</option></select></div></div>
-<label for="text">会社名と氏名、または会話の文字起こし</label><textarea id="text" maxlength="2000" placeholder="例：〇〇株式会社の〇〇さんです。" spellcheck="false"></textarea>
+<label for="text">会社名と氏名、または会話の文字起こし</label><p class="muted">事前登録・入力は不要です。会話モードを開始すると、会話から人物と会社を見つけて調べます。</p><textarea id="text" maxlength="2000" placeholder="会話モードでは自動で文字が入ります。手入力もできます。" spellcheck="false"></textarea>
 <div class="controls"><button id="sample">架空の会話を入力</button><button id="connect">G2を接続</button></div>
 <label class="check"><input id="consent" type="checkbox"><span>音声を使う前に、会話相手へ説明し同意を得ました。会話モードは音声をOpenAIへ逐次送信して認識し、OrcaRouterで調査します。音声は保存しません。短い録音は最大30秒です。</span></label>
 <div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
@@ -183,6 +184,11 @@ function acceptSession(data: { token: string; revision: number; expiresAt: numbe
   $<HTMLInputElement>('consent').checked = false;
   $('resume-notice').classList.toggle('hidden', !data.hasPrevious && !data.interrupted);
   if (data.interrupted) status('前の調査が中断されました。マイクは停止しています。必要なら再調査してください。');
+  if (conversationLaunch && runtimeStatus.liveEnabled) {
+    $<HTMLSelectElement>('mode').value = 'live'; $('mode').dispatchEvent(new Event('change'));
+    status('人物・会社の入力は不要です。同意を確認して「会話モードを開始」を押してください。');
+    if (!connected) void connectGlasses();
+  }
   refreshControls();
 }
 function setAuthBusy(busy: boolean) {
@@ -434,7 +440,11 @@ $('login-form').onsubmit = event => { event.preventDefault(); void login(); };
 $('sample').onclick = () => { $<HTMLTextAreaElement>('text').value = DEMO_TEXT; };
 $('research').onclick = () => { void research(); }; $('cancel').onclick = () => { void cancel(); };
 $('previous').onclick = () => { cardIndex--; renderCard(); }; $('next').onclick = () => { cardIndex++; renderCard(); };
-$('connect').onclick = async () => { const ok = await g2.connect({ header: '会話アシスタント', content: '接続しました。スマートフォンから調査を開始してください。', footer: 'マイクは停止中' }, viewToken); if (!ok) status('Evenアプリからこの画面を開いて接続してください。通常のブラウザーではプレビューを利用できます。'); };
+async function connectGlasses() {
+  const ok = await g2.connect({ header: '会話アシスタント', content: '登録は不要です。スマートフォンで同意を確認し、会話モードを開始してください。', footer: 'マイクは停止中' }, viewToken);
+  if (!ok) status('Evenアプリからこの画面を開いて接続してください。通常のブラウザーではプレビューを利用できます。');
+}
+$('connect').onclick = () => { void connectGlasses(); };
 $('consent').onchange = () => { if (!$<HTMLInputElement>('consent').checked) void stopRecording(false); refreshControls(); };
 $('conversation').onclick = () => { void startConversation(); };
 $('record').onclick = () => { if (conversationRunning) void cancel(); else if (recording) void stopRecording(true); else void startRecording(); };

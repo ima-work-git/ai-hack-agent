@@ -4,8 +4,13 @@ import {
   OsEventTypeList,
   TextContainerProperty,
   TextContainerUpgrade,
+  ImageContainerProperty,
+  ImageRawDataUpdate,
+  ImageRawDataUpdateResult,
+  RebuildPageContainer,
   waitForEvenAppBridge,
 } from '@evenrealities/even_hub_sdk'
+import { renderGlassesBitmap } from './g2-bitmap'
 
 export interface GlassesView {
   header: string
@@ -28,6 +33,8 @@ export interface G2Event {
 export interface G2Bridge {
   createStartUpPageContainer(page: CreateStartUpPageContainer): Promise<number>
   textContainerUpgrade(text: TextContainerUpgrade): Promise<boolean>
+  updateImageRawData?(image: ImageRawDataUpdate): Promise<ImageRawDataUpdateResult>
+  rebuildPageContainer?(page: RebuildPageContainer): Promise<boolean>
   audioControl(open: boolean, source?: AudioInputSource): Promise<boolean>
   onEvenHubEvent(callback: (event: G2Event) => void): () => void
   onDeviceStatusChanged(callback: (status: { connectType: string }) => void): () => void
@@ -43,6 +50,8 @@ export interface G2RuntimeOptions {
   timeoutMs?: number
   /** For ordinary capture: can shorten its window, never extend it beyond 30 seconds. */
   maxAudioMs?: number
+  /** Test injection; production uses a local Canvas, never an external image API. */
+  renderBitmap?: typeof renderGlassesBitmap
 }
 
 interface ViewJob {
@@ -97,6 +106,7 @@ export class G2Runtime {
   private viewSequence = 0
   private pending: ViewJob | null = null
   private flushing = false
+  private imageMode = false
 
   constructor(private readonly options: G2RuntimeOptions = {}) {
     this.timeoutMs = Number.isFinite(options.timeoutMs)
@@ -236,6 +246,8 @@ export class G2Runtime {
         : invoke(this.options.getBridge ?? waitForEvenAppBridge))
       if (this.disposed || version !== this.connectionVersion) return false
       this.bridge = bridge
+      this.imageMode = Boolean(bridge.updateImageRawData && bridge.rebuildPageContainer &&
+        (this.options.renderBitmap ?? renderGlassesBitmap)(SAFE_VIEW.content))
       // Never put a person's details in an uncancellable startup operation.
       const result = await this.deadline(invoke(() => bridge.createStartUpPageContainer(this.startupPage())))
       if (this.disposed || version !== this.connectionVersion) return false
@@ -257,6 +269,7 @@ export class G2Runtime {
       this.notify('connected', 'bridge_acknowledged')
       // Invalidation while connect was waiting must not resurrect an old view.
       if (initialView && token === this.token && viewEpoch === this.viewEpoch) return this.render(initialView, token)
+      if (this.imageMode) return this.render(SAFE_VIEW, this.token)
       return true
     } catch (error) {
       this.connected = false
@@ -322,8 +335,31 @@ export class G2Runtime {
         const job = this.pending
         this.pending = null
         let success = true
+        if (this.imageMode && this.current(job)) {
+          try {
+            const images = (this.options.renderBitmap ?? renderGlassesBitmap)(job.view.content)
+            let accepted = images !== null
+            if (images) for (const [index, imageData] of images.entries()) {
+              if (!this.current(job)) { accepted = false; break }
+              const result = await this.deadline(invoke(() => this.bridge!.updateImageRawData!(new ImageRawDataUpdate({
+                containerID: index + 4, containerName: `small-text-${index}`, imageData,
+              }))))
+              if (!ImageRawDataUpdateResult.isSuccess(result)) { accepted = false; break }
+            }
+            if (!accepted && this.current(job)) await this.fallbackToText()
+          } catch (error) {
+            try {
+              if (error instanceof BridgeTimeout || !this.current(job)) throw error
+              await this.fallbackToText()
+            } catch {
+              success = false; this.fatal = true; this.cancelViews(); void this.stopAudio()
+              if (!this.disposed) this.notify('error', error instanceof BridgeTimeout ? 'display_timeout' : 'display_failed')
+            }
+          }
+        }
         for (const [index, name] of (['header', 'content', 'footer'] as const).entries()) {
           if (!this.current(job)) { success = false; break }
+          if (this.imageMode && name === 'content') continue
           try {
             const accepted = await this.deadline(invoke(() => this.bridge!.textContainerUpgrade(
               new TextContainerUpgrade({ containerID: index + 1, containerName: name, content: job.view[name] }),
@@ -387,14 +423,28 @@ export class G2Runtime {
     try { this.options.onAction?.(action) } catch { /* No data or callback exception is logged. */ }
   }
 
+  private async fallbackToText(): Promise<void> {
+    this.imageMode = false
+    const page = this.startupPage()
+    const accepted = await this.deadline(invoke(() => this.bridge!.rebuildPageContainer!(new RebuildPageContainer({
+      containerTotalNum: page.containerTotalNum, textObject: page.textObject,
+    }))))
+    if (!accepted) throw new Error('text_fallback_failed')
+  }
+
   private startupPage(): CreateStartUpPageContainer {
     const geometry = [{ y: 0, height: 48 }, { y: 52, height: 184 }, { y: 240, height: 48 }]
     const names = ['header', 'content', 'footer'] as const
     const textObject = names.map((name, index) => new TextContainerProperty({
       xPosition: 0, yPosition: geometry[index]!.y, width: 576, height: geometry[index]!.height,
       borderWidth: index === 2 ? 0 : 1, borderColor: 5, borderRadius: 4, paddingLength: 6,
-      containerID: index + 1, containerName: name, content: SAFE_VIEW[name], isEventCapture: index === 1 ? 1 : 0,
+      containerID: index + 1, containerName: name, content: this.imageMode && name === 'content' ? ' ' : SAFE_VIEW[name], isEventCapture: index === 1 ? 1 : 0,
+      ...(this.imageMode ? { zOrderIndex: index + 1 } : {}),
     }))
-    return new CreateStartUpPageContainer({ containerTotalNum: textObject.length, textObject })
+    const imageObject = this.imageMode ? [0, 1].map(index => new ImageContainerProperty({
+      xPosition: index * 288, yPosition: 66, width: 288, height: 144,
+      containerID: index + 4, containerName: `small-text-${index}`, zOrderIndex: index + 4,
+    })) : undefined
+    return new CreateStartUpPageContainer({ containerTotalNum: textObject.length + (imageObject?.length ?? 0), textObject, ...(imageObject ? { imageObject } : {}) })
   }
 }

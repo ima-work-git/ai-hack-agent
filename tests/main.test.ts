@@ -343,6 +343,25 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(devices.phone!.start).not.toHaveBeenCalled();
   });
 
+  it('prepares live G2 conversation from a QR without preregistration or starting the microphone', async () => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], streamingEnabled: true, accessCodeRequired: true }));
+    window.history.replaceState(null, '', '/?conversation=1#login=' + 'c'.repeat(64));
+    routes.set('/api/session/qr/redeem', async () => jsonResponse({ token: 'qr-session', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false }));
+    await boot();
+    expect(window.location.hash).toBe('');
+    expect(element<HTMLSelectElement>('mode').value).toBe('live');
+    expect(element<HTMLTextAreaElement>('text').value).toBe('');
+    expect(devices.g2!.connect).toHaveBeenCalledOnce();
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled();
+    expect(requests('/api/conversation')).toHaveLength(0);
+    expect(requests('/api/research')).toHaveLength(0);
+    element<HTMLInputElement>('consent').checked = true;
+    element('consent').dispatchEvent(new Event('change'));
+    click('conversation'); await flush();
+    expect(devices.g2!.startAudio).toHaveBeenCalledWith({ continuous: true });
+    expect(requests('/api/conversation')).toHaveLength(1);
+  });
+
   it('uses an existing remembered login without spending another QR grant', async () => {
     routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, accessCodeRequired: true }));
     window.history.replaceState(null, '', '/#login=' + 'b'.repeat(64));

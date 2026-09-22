@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AudioInputSource, OsEventTypeList } from '@evenrealities/even_hub_sdk'
+import { AudioInputSource, ImageRawDataUpdateResult, OsEventTypeList } from '@evenrealities/even_hub_sdk'
 import { G2Runtime, type G2Bridge, type G2Event, type GlassesView } from '../src/integrations/g2-runtime'
 
 function deferred<T>() {
@@ -61,6 +61,38 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     const update = vi.mocked(bridge.textContainerUpgrade).mock.calls.find(([value]) => value.containerName === 'content')![0]
     expect(update.content).toBe(rows)
     expect(update.content!.split('\n')).toHaveLength(4)
+    await runtime.dispose()
+  })
+
+  it('serializes two small-text image tiles and rebuilds ordinary text if images are rejected', async () => {
+    const { bridge } = fakeBridge()
+    bridge.updateImageRawData = vi.fn(async () => ImageRawDataUpdateResult.success)
+    bridge.rebuildPageContainer = vi.fn(async () => true)
+    const runtime = new G2Runtime({ bridge, renderBitmap: () => [new Uint8Array([1]), new Uint8Array([2])] })
+    expect(await runtime.connect()).toBe(true)
+    const page = vi.mocked(bridge.createStartUpPageContainer).mock.calls[0]![0]
+    expect(page.containerTotalNum).toBe(5)
+    expect(page.imageObject).toHaveLength(2)
+    expect(page.textObject!.filter(container => container.isEventCapture === 1)).toHaveLength(1)
+    expect([...page.textObject!, ...page.imageObject!].map(container => container.zOrderIndex)).toEqual([1, 2, 3, 4, 5])
+    for (const image of page.imageObject!) {
+      expect(image.width).toBe(288); expect(image.height).toBe(144)
+      expect(image.xPosition! + image.width!).toBeLessThanOrEqual(576)
+      expect(image.yPosition! + image.height!).toBeLessThanOrEqual(288)
+    }
+    vi.mocked(bridge.updateImageRawData).mockClear()
+    const first = deferred<ImageRawDataUpdateResult>()
+    vi.mocked(bridge.updateImageRawData).mockImplementationOnce(() => first.promise)
+    const rendered = runtime.render(view('small'))
+    expect(bridge.updateImageRawData).toHaveBeenCalledTimes(1)
+    first.resolve(ImageRawDataUpdateResult.success)
+    expect(await rendered).toBe(true)
+    expect(bridge.updateImageRawData).toHaveBeenCalledTimes(2)
+    vi.mocked(bridge.updateImageRawData).mockResolvedValue(ImageRawDataUpdateResult.imageSizeInvalid)
+    expect(await runtime.render(view('fallback'))).toBe(true)
+    expect(bridge.rebuildPageContainer).toHaveBeenCalledOnce()
+    expect(vi.mocked(bridge.rebuildPageContainer).mock.calls[0]![0].containerTotalNum).toBe(3)
+    expect(vi.mocked(bridge.textContainerUpgrade).mock.calls.some(([update]) => update.content === 'fallback-content')).toBe(true)
     await runtime.dispose()
   })
 
