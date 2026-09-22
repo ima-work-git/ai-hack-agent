@@ -64,6 +64,30 @@ describe('bounded OrcaRouter adapter', () => {
     expect(api).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['https://x.com/fixture_user?lang=ja', 'https://twitter.com/Fixture_User/'])('permits only the handle identified by supplied profile URL %s', async (url) => {
+    const expected = { ...plan, query: '株式会社灯 山田花子 @fixture_user' };
+    const api = mockFetch(completion(expected));
+    const result = await createLiveProvider(config, { fetch: api }).plan({ ...input, text: `${input.text} ${url}` }, signal());
+    expect(result.value).toEqual(expected);
+  });
+
+  it.each(['https://x.com.evil.example.org/fixture_user', 'https://x.com/fixture_user/status/123',
+    'https://fixture_user@x.com/other_user', 'http://x.com/fixture_user'])('does not grant model-generated handles from non-profile URL %s', async (url) => {
+    const api = mockFetch(completion({ ...plan, query: '株式会社灯 山田花子 @fixture_user' }));
+    await expect(createLiveProvider(config, { fetch: api }).plan({ ...input, text: `${input.text} ${url}` }, signal()))
+      .rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
+  });
+
+  it('keeps URL-only input unresolved and does not allow account lookup to invent missing identity', async () => {
+    const api = mockFetch(completion({ ...plan, query: '@fixture_user' }));
+    const provider = createLiveProvider(config, { fetch: api });
+    const urlOnly = { ...input, text: 'https://x.com/fixture_user?lang=ja' };
+    expect(await provider.plan(urlOnly, signal())).toMatchObject({ value: { target: null, needsConfirmation: true, candidates: [] }, actualUsd: 0 });
+    expect(api).not.toHaveBeenCalled();
+    await expect(provider.plan({ ...urlOnly, text: `${urlOnly.text} の人を調べて` }, signal())).rejects.toMatchObject({ code: 'UNGROUNDED_PLAN' });
+    expect(api).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects extra model output fields rather than trusting generated URLs', async () => {
     const api = mockFetch(completion({ ...assessment, url: 'https://invented.example.org/' }));
     await expect(createLiveProvider(config, { fetch: api }).assess(target, [], signal()))
