@@ -61,7 +61,7 @@
 | 項目 | URLまたは識別子 | 担当 | 確認状態 |
 | --- | --- | --- | --- |
 | Googleフォーム | [未提供] | [未確定] | 未確認 |
-| GitHubリポジトリ／ソースコード | [ima-work-git/ai-hack-agent](https://github.com/ima-work-git/ai-hack-agent) | ima-work-git | Public作成済み・プロダクト未実装 |
+| GitHubリポジトリ／ソースコード | [ima-work-git/ai-hack-agent](https://github.com/ima-work-git/ai-hack-agent) | ima-work-git | Public・[MVP実装済み（PR #8）](https://github.com/ima-work-git/ai-hack-agent/pull/8)・実API/実機未検証 |
 | 提出版のコミットSHAまたはタグ | [未確定] | [未確定] | 未固定 |
 | デモ動画（180秒以内） | [未作成] | [未確定] | 尺・音声・閲覧確認待ち |
 | Qiita／Zenn記事 | [未作成] | [未確定] | 必須記載・閲覧確認待ち |
