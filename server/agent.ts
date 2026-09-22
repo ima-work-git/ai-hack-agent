@@ -4,6 +4,7 @@ import {
 } from '../src/shared/contracts.ts';
 import type { Assessment, Candidate, Card, EvidenceSource, ResearchInput, ResearchResult, Target, TraceEvent } from '../src/shared/contracts.ts';
 import { extractExplicitXHandles } from '../src/shared/x-account.ts';
+import { evidenceMatchesCard, selectBalancedCards } from '../src/shared/card-balance.ts';
 import { isAllowedConversationTopic } from '../src/shared/topic-policy.ts';
 import { evidenceMatchesTarget, normalizeIdentity, verifiedAliasForInputTarget, verifiedAliasForTarget } from '../src/shared/identity-aliases.ts';
 import type { ProviderResult, ResearchProvider } from './provider-contract.ts';
@@ -46,6 +47,7 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
   let candidates: Candidate[] = [];
   let hadFailure = false;
   let publicIdentityVerified = false;
+  let balancedTopics = false;
   let counts = { llm: 0, search: 0, page: 0 };
   let observedCost = 0;
   let reservedCost = 0;
@@ -147,13 +149,17 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
   const gather = async (query: string, initialSearch: boolean) => {
     // Keep at least two of the four total attempts available for follow-up web
     // evidence, even when the initial timeline/search returns many candidates.
-    const pageCeiling = initialSearch ? Math.min(limits.page, counts.page + 2) : limits.page;
+    let pageCeiling = initialSearch ? Math.min(limits.page, counts.page + 2) : limits.page;
     emit('search', target?.companyName ? '対象の氏名と会社名に絞って公開情報を検索します。' : '氏名から公式プロフィールと公開活動の根拠を検索します。');
     let hits;
     try { hits = SearchHitSchema.array().max(10).parse(await call('search', signal => provider.search(queryForTarget(query, initialSearch), signal))); }
     catch (error) { if (fatal(error)) throw error; hadFailure = true; emit('recovery', '検索を取得できませんでした。別の検索か検証済みの情報へ縮退します。'); return; }
+    if (initialSearch && hits.some(hit => hit.topic)) {
+      balancedTopics = true; limits.page = 6; pageCeiling = 4;
+      emit('balance', '最近のX投稿2件・過去の反響1件・人物や会社1件の配分で根拠を集めます。');
+    }
     const knownPublicPerson = !initialSearch && target ? verifiedAliasForTarget(target) : undefined;
-    if (knownPublicPerson?.scope === 'public-person') {
+    if (knownPublicPerson && (knownPublicPerson.scope === 'public-person' || balancedTopics)) {
       // These are known public identity locations, not cached factual evidence.
       // Fetch their real text within the same page allowance, then apply all
       // normal identity, attribution and exact-quotation guards.
@@ -205,13 +211,15 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
         emit('discard', '健康や私生活に関わる話題を含むため、カード全体を除外しました。'); continue;
       }
       const source = sources.find(s => s.sourceId === proposal.sourceId);
-      if (!source || !contains(source.text, proposal.excerpt) || !matches(proposal.excerpt, target, source.url) || !contains(proposal.excerpt, proposal.fact)) {
+      if (!source || !contains(source.text, proposal.excerpt) || !evidenceMatchesCard(proposal.excerpt, target, source, sources) || !contains(proposal.excerpt, proposal.fact) || source.xPost && !contains(source.xPost.text, proposal.fact)) {
         emit('discard', '出典、対象名・所属、本文引用の検査に通らないカードを棄却しました。'); continue;
       }
-      if (cards.some(c => normalize(c.fact) === normalize(proposal.fact)) || cards.length >= 4) continue;
+      if (cards.some(c => normalize(c.fact) === normalize(proposal.fact)) || cards.length >= 8) continue;
       const { displayFact, displayQuestion, ...verifiedProposal } = proposal;
       cards.push({ ...verifiedProposal, ...validatedCardDisplay(proposal.fact, proposal.excerpt, displayFact, displayQuestion), cardId: randomUUID(), expiresAt: new Date(now() + 300_000).toISOString(), requestId: input.requestId, subjectRevision: input.subjectRevision });
     }
+    if (balancedTopics) cards = selectBalancedCards(cards, sources);
+    else cards = cards.slice(0, 4);
     emit('verify', `${cards.length}件のカードが本文引用と対象照合の検査を通りました。`);
     return true;
   };
@@ -252,6 +260,10 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       return finish(hadFailure ? 'failed' : 'no_evidence', hadFailure ? 'SOURCES_UNAVAILABLE' : 'NO_VERIFIABLE_EVIDENCE',
         hadFailure ? '情報源を取得できず、根拠を確認できませんでした。入力または接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
     }
+    if (balancedTopics && counts.search < limits.search && counts.page < limits.page) {
+      emit('replan', '人物・会社の公式情報を追加し、投稿者と所属の根拠を照合します。');
+      await gather('公式 プロフィール 事業', false);
+    }
     let assessment = await assess();
     const accepted = applyAssessment(assessment);
     // X may lack primary identity evidence or useful facts. A candidate
@@ -273,6 +285,15 @@ export async function runAgent(rawInput: ResearchInput, provider: ResearchProvid
       }
     }
     if (!target.companyName && !publicIdentityVerified) return finish('awaiting_confirmation', 'PUBLIC_IDENTITY_CONFIRMATION_REQUIRED', '公開プロフィールだけでは対象を一人に絞れませんでした。活動名、所属や公式URLなどの手掛かりを確認してください。');
+    if (balancedTopics && cards.length) {
+      const recent = cards.filter(card => card.topic === 'recent_x').length;
+      const popular = cards.filter(card => card.topic === 'popular_x').length;
+      const profile = cards.filter(card => card.topic === 'profile').length;
+      if (recent !== 2 || popular !== 1 || profile !== 1) {
+        emit('balance', `最近X${recent}件・過去の反響${popular}件・人物や会社${profile}件。取得・検証できない枠は別の確認済み話題で補います。`);
+        return finish('partial', 'TOPIC_BALANCE_PARTIAL', '希望の配分に必要な投稿を確認できなかったため、取得した根拠のある話題を表示します。');
+      }
+    }
     if (cards.length) return finish(hadFailure ? 'partial' : 'ready', hadFailure ? 'PARTIAL_SOURCES_UNAVAILABLE' : 'EVIDENCE_VERIFIED', hadFailure ? '取得できなかった資料があります。確認できた根拠だけを表示します。' : '本文と対象を照合した話題カードを表示します。');
     return finish(hadFailure ? 'failed' : 'no_evidence', hadFailure ? 'SOURCES_UNAVAILABLE' : 'NO_VERIFIABLE_EVIDENCE', hadFailure ? '一部の資料を取得できず、取得済みの資料からも対象と事実を照合できませんでした。入力や接続を確認してください。' : '対象に結び付く本文の根拠が見つかりませんでした。');
   } catch (error) {

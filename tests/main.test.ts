@@ -741,6 +741,52 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toBe(initialView.content);
   });
 
+  it('labels two recent X cards, one past X card and one profile card, with post evidence on the phone', async () => {
+    const value = researchResult();
+    const topics = ['recent_x', 'recent_x', 'popular_x', 'profile'] as const;
+    const labels = ['最近X', '最近X', '過去X', '人物・会社'];
+    value.cards = topics.map((topic, index) => ({ ...value.cards[0]!, topic, cardId: `topic-card-${index}`,
+      sourceId: `topic-source-${index}`, fact: `公開事実${index + 1}です。`, suggestedQuestion: `活動${index + 1}の工夫は？`, excerpt: `公開事実${index + 1}です。` }));
+    value.sources = topics.map((topic, index) => ({ ...value.sources[0]!, topic, sourceId: `topic-source-${index}`,
+      text: value.cards[index]!.fact, kind: index === 3 ? 'web' : 'x',
+      ...(index === 3 ? {} : { xPost: { id: String(100 + index), authorId: '900', username: 'fixture_user', text: value.cards[index]!.fact,
+        createdAt: '2026-09-20T03:00:00.000Z', likeCount: 1200, repostCount: 34, replyCount: 5, quoteCount: 6,
+        ...(topic === 'popular_x' ? { selectionScope: 'full_archive_sample' as const } : {}) } }),
+    }));
+    routes.set('/api/session/resume', async () => jsonResponse({ result: value }));
+    await boot(); click('connect'); await flush(); click('resume'); await flush();
+    expect([...element('card-board').querySelectorAll('.topic-number')].map(node => node.textContent))
+      .toEqual(labels.map((label, index) => `${index + 1} / ${label} · 原文・出典 ↗`));
+    const board = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(board.content.split('\n')).toEqual(labels.map((label, index) => `${index + 1} ${label} 事:公開事実${index + 1}です。 問:活動${index + 1}の工夫は？`));
+    expect(board.content).not.toContain('…');
+    expect(element('sources').querySelector('.source-post-date')!.textContent).toContain('2026/9/20');
+    expect(element('sources').querySelector('.source-post-metrics')!.textContent).toBe('取得時の反響：いいね 1,200 / リポスト 34 / 返信 5 / 引用 6');
+    expect(element('sources').querySelector('.source-selection-scope')).toBeNull();
+    click('topic-2'); await flush();
+    expect(element('sources').querySelector('.source-topic')!.textContent).toBe('話題：過去X');
+    expect(element('sources').querySelector('.source-selection-scope')!.textContent).toBe('過去の反響：全期間の検索候補から選定');
+    expect(element('sources').textContent).not.toMatch(/歴代最多|全投稿中|最多いいね/);
+    click('topic-3'); await flush();
+    expect(element('sources').querySelector('.source-topic')!.textContent).toBe('話題：人物・会社');
+    expect(element('sources').querySelector('.source-post-metrics')).toBeNull();
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toBe(board.content);
+  });
+
+  it('keeps the real category when a profile fills a missing past-X slot, including source-only metadata', async () => {
+    const value = researchResult();
+    const topics = ['recent_x', 'recent_x', 'profile', 'profile'] as const;
+    value.cards = topics.map((_, index) => ({ ...value.cards[0]!, cardId: `fallback-card-${index}`, sourceId: `fallback-source-${index}` }));
+    value.sources = topics.map((topic, index) => ({ ...value.sources[0]!, topic, sourceId: `fallback-source-${index}` }));
+    routes.set('/api/session/resume', async () => jsonResponse({ result: value }));
+    await boot(); click('connect'); await flush(); click('resume'); await flush();
+    expect(element('hud-expiry').textContent).toBe('4 / 4件確認');
+    expect([...element('card-board').querySelectorAll('.topic-number')].map(node => node.textContent))
+      .toEqual(['1 / 最近X · 原文・出典 ↗', '2 / 最近X · 原文・出典 ↗', '3 / 人物・会社 · 原文・出典 ↗', '4 / 人物・会社 · 原文・出典 ↗']);
+    expect(element('card-board').textContent).not.toContain('過去X');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).not.toContain('過去X');
+  });
+
   it.each([0, 1])('leaves unsupported slots unconfirmed when only %s cards have evidence', async count => {
     const value = researchResult();
     value.cards = value.cards.slice(0, count);
