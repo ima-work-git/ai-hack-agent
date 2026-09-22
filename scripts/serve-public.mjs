@@ -10,6 +10,8 @@ import { pathToFileURL } from 'node:url';
 import { parseEnv } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { Resolver } from 'node:dns/promises';
+import { safeRequest } from '../server/safe-fetch.ts';
 
 export const PORTS = Object.freeze({ app: 4173, metrics: 20243, supervisor: 20244 });
 const BRANCH = 'live-endpoint';
@@ -156,11 +158,47 @@ export async function publishEndpoint({ repository, origin, now = Date.now(), gh
   return record;
 }
 
-export async function healthProbe(url, { statusJson = false, signal, fetchRequest = fetch } = {}) {
+function isDnsFailure(error) {
+  for (let depth = 0; error && depth < 5; depth++, error = error.cause) {
+    if (error.code === 'ENOTFOUND' || error.code === 'EAI_AGAIN') return true;
+  }
+  return false;
+}
+
+async function resolveProbeIpv4(hostname, signal) {
+  signal.throwIfAborted();
+  // An independent resolver bypasses the OS getaddrinfo cache. Cancelling it
+  // cannot cancel another caller's DNS requests.
+  const resolver = new Resolver({ timeout: 2000, tries: 2 });
+  const onAbort = () => resolver.cancel();
+  signal.addEventListener('abort', onAbort, { once: true });
+  try { return await resolver.resolve4(hostname); }
+  finally { signal.removeEventListener('abort', onAbort); }
+}
+
+const validStatusBody = body => body !== null && typeof body === 'object' &&
+  typeof body.liveEnabled === 'boolean' && typeof body.version === 'string';
+
+export async function healthProbe(url, { statusJson = false, signal, fetchRequest = fetch, resolve4 = resolveProbeIpv4, request } = {}) {
   const timeout = new AbortController(); const timer = setTimeout(() => timeout.abort(), 10_000);
+  const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
   try {
-    const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
-    const response = await fetchRequest(url, { redirect: 'error', signal: combined, headers: { Accept: 'application/json' } });
+    let response;
+    try { response = await fetchRequest(url, { redirect: 'error', signal: combined, headers: { Accept: 'application/json' } }); }
+    catch (error) {
+      const path = '/api/status';
+      // Only our exact public status URL can use this fallback. Other hosts,
+      // local endpoints, HTTP/TLS errors and non-DNS failures keep failing.
+      if (combined.aborted || !statusJson || !isDnsFailure(error) || typeof url !== 'string' ||
+          !url.endsWith(path) || !validOrigin(url.slice(0, -path.length))) throw error;
+      const fallback = await safeRequest(url, { signal: combined, maxBytes: 16_384, maxRedirects: 0,
+        headers: { Accept: 'application/json' } }, {
+        resolve: async hostname => (await resolve4(hostname, combined)).map(address => ({ address, family: 4 })),
+        request,
+      });
+      combined.throwIfAborted();
+      return fallback.status >= 200 && fallback.status < 300 && validStatusBody(JSON.parse(fallback.body.toString('utf8')));
+    }
     if (!response.ok) { await response.body?.cancel(); return false; }
     if (!statusJson) { await response.body?.cancel(); return true; }
     if (Number(response.headers.get('content-length')) > 16_384 || !response.body) { await response.body?.cancel(); return false; }
@@ -175,8 +213,8 @@ export async function healthProbe(url, { statusJson = false, signal, fetchReques
       }
     } finally { combined.removeEventListener('abort', onAbort); reader.releaseLock(); }
     const body = JSON.parse(text);
-    return typeof body.liveEnabled === 'boolean' && typeof body.version === 'string';
-  } catch { return false; } finally { clearTimeout(timer); }
+    return validStatusBody(body);
+  } catch { return false; } finally { timeout.abort(); clearTimeout(timer); }
 }
 
 export async function networkAvailable({ signal, fetchRequest = fetch } = {}) {
