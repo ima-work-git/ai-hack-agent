@@ -526,7 +526,10 @@ $('resume').onclick = async () => {
   } catch (e) { if (token === expectedToken && viewToken === expectedView) status(e instanceof Error ? e.message : '再開できませんでした。'); }
 };
 $('end').onclick = async () => { if (authBusy) return; setAuthBusy(true); authGeneration++; await cancel(); try { await api('/api/session/forget', json({})); token = ''; expiresAt = 0; clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = '会話データと、この端末のログインの記憶を削除しました。'; } catch (e) { status(e instanceof Error ? e.message : '削除を確認できませんでした。'); } finally { setAuthBusy(false); } };
-document.addEventListener('visibilitychange', () => { if (document.hidden) { void cancel(); } });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { void cancel(); }
+  else if (!token && qrLoginTicket && runtimeStatus && !authBusy && !pageLeaving) { void redeemQrLogin(); }
+});
 window.addEventListener('pagehide', () => { pageLeaving = true; qrLoginTicket = ''; abortConversation(); clearTimeout(voiceDisplayTimer); voiceDisplayTimer = undefined; voicePreview = ''; authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
 setInterval(() => { if (result?.cards.some(card => Date.parse(card.expiresAt) <= Date.now())) renderCard(); if (token && expiresAt > 0 && expiresAt <= Date.now()) void expireSession(); }, 15_000);
 try {

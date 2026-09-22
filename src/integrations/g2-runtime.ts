@@ -52,6 +52,8 @@ export interface G2RuntimeOptions {
   maxAudioMs?: number
   /** Test injection; production uses a local Canvas, never an external image API. */
   renderBitmap?: typeof renderGlassesBitmap
+  /** Off by default until image transfer latency has been verified on hardware. */
+  enableImageText?: boolean
 }
 
 interface ViewJob {
@@ -250,7 +252,7 @@ export class G2Runtime {
         : invoke(this.options.getBridge ?? waitForEvenAppBridge))
       if (this.disposed || version !== this.connectionVersion) return false
       this.bridge = bridge
-      this.imageMode = Boolean(bridge.updateImageRawData && bridge.rebuildPageContainer &&
+      this.imageMode = Boolean(this.options.enableImageText && bridge.updateImageRawData && bridge.rebuildPageContainer &&
         (this.options.renderBitmap ?? renderGlassesBitmap)(SAFE_VIEW.content))
       // Never put a person's details in an uncancellable startup operation.
       const result = await this.deadline(invoke(() => bridge.createStartUpPageContainer(this.startupPage())))

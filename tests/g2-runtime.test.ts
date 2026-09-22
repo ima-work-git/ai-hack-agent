@@ -68,7 +68,7 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     const { bridge } = fakeBridge()
     bridge.updateImageRawData = vi.fn(async () => ImageRawDataUpdateResult.success)
     bridge.rebuildPageContainer = vi.fn(async () => true)
-    const runtime = new G2Runtime({ bridge, renderBitmap: () => [new Uint8Array([1]), new Uint8Array([2])] })
+    const runtime = new G2Runtime({ bridge, enableImageText: true, renderBitmap: () => [new Uint8Array([1]), new Uint8Array([2])] })
     expect(await runtime.connect()).toBe(true)
     const page = vi.mocked(bridge.createStartUpPageContainer).mock.calls[0]![0]
     expect(page.containerTotalNum).toBe(5)
@@ -107,7 +107,7 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     const f = fakeBridge()
     f.bridge.updateImageRawData = vi.fn(async () => ImageRawDataUpdateResult.success)
     f.bridge.rebuildPageContainer = vi.fn(async () => true)
-    const runtime = new G2Runtime({ bridge: f.bridge, renderBitmap: () => [new Uint8Array([1]), new Uint8Array([2])] })
+    const runtime = new G2Runtime({ bridge: f.bridge, enableImageText: true, renderBitmap: () => [new Uint8Array([1]), new Uint8Array([2])] })
     await runtime.connect(); await runtime.render(view('original'))
     vi.mocked(f.bridge.updateImageRawData).mockClear()
     const first = deferred<ImageRawDataUpdateResult>()
