@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src https://api.github.com; base-uri 'none'; form-action 'none'; object-src 'none'">
+    <title>これで誰でも雑談マスター</title>
+    <link rel="stylesheet" href="./style.css">
+    <script type="module" src="./launch.mjs"></script>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">EVEN G2 · AI HACK</p>
+      <h1>これで誰でも<br>雑談マスター</h1>
+      <p id="launch-status" role="status" aria-live="polite">接続先を確認しています。</p>
+      <p id="launch-help">PCの起動とネット接続を確認してください。</p>
+      <button id="launch-retry" type="button" disabled>再確認</button>
+      <noscript><p>接続するには、JavaScriptを有効にしてQRコードを読み直してください。</p></noscript>
+    </main>
+  </body>
+</html>
