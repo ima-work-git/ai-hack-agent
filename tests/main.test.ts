@@ -112,6 +112,8 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
       if (route) return route(init);
       if (path === '/api/status') return jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, xEnabled: false, accessCodeRequired: false, version: 'fixture' });
       if (path === '/api/session') return jsonResponse(init.method === 'DELETE' ? {} : { token: 'fixture-session-token', revision: 3, expiresAt: Date.now() + 900_000, hasPrevious: true, interrupted: false });
+      if (path === '/api/session/restore') return new Response('{}', { status: 401 });
+      if (path === '/api/session/forget') return jsonResponse({ ended: true });
       if (path === '/api/transcribe') return jsonResponse({ text: '架空検証社の架空の検証参加者です。' });
       if (path === '/api/research') return resultResponse(JSON.parse(String(init.body)) as ResearchInput);
       if (path === '/api/cancel') return jsonResponse({ cancelled: true });
@@ -129,6 +131,95 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
       if (type === 'pagehide') window.removeEventListener(type, listener, options);
     }
     vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals();
+  });
+
+  it('restores a remembered device without showing previous cards or starting work', async () => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, accessCodeRequired: true }));
+    routes.set('/api/session/restore', async () => jsonResponse({ token: 'restored', revision: 4, expiresAt: Date.now() + 900_000, hasPrevious: true, interrupted: false }));
+    await boot();
+    expect(element('workspace').classList.contains('hidden')).toBe(false);
+    expect(requests('/api/session')).toHaveLength(0);
+    expect(requests('/api/session/restore')).toHaveLength(1);
+    expect(requests('/api/session/resume')).toHaveLength(0);
+    expect(requests('/api/research')).toHaveLength(0);
+    expect(element('fact').textContent).not.toBe(FACT);
+    expect(element('resume-notice').classList.contains('hidden')).toBe(false);
+    expect(devices.phone!.start).not.toHaveBeenCalled();
+    expect(devices.g2!.startAudio).not.toHaveBeenCalled();
+  });
+
+  it('shows the access code form when no remembered login exists and honors opting out', async () => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, accessCodeRequired: true }));
+    await boot();
+    expect(element('workspace').classList.contains('hidden')).toBe(true);
+    expect(element<HTMLInputElement>('remember-device').checked).toBe(true);
+    element<HTMLInputElement>('access-code').value = 'fixture-access-code';
+    element<HTMLInputElement>('remember-device').checked = false;
+    element('login-form').dispatchEvent(new Event('submit', { cancelable: true })); await flush();
+    expect(JSON.parse(String(requests('/api/session')[0]!.body))).toEqual({ accessCode: 'fixture-access-code', rememberDevice: false });
+    expect(element('workspace').classList.contains('hidden')).toBe(false);
+  });
+
+  it('starts a fresh session after expiry without retaining conversation or replaying paid work', async () => {
+    routes.set('/api/session/restore', async () => jsonResponse({ token: 'fresh', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false }));
+    await boot(); chooseLiveAndConsent(); element<HTMLTextAreaElement>('text').value = 'old private conversation';
+    await vi.advanceTimersByTimeAsync(900_000);
+    expect(element<HTMLTextAreaElement>('text').value).toBe('');
+    expect(element<HTMLInputElement>('consent').checked).toBe(false);
+    expect(element('workspace').classList.contains('hidden')).toBe(false);
+    expect(requests('/api/session/restore')).toHaveLength(1);
+    expect(requests('/api/research')).toHaveLength(0);
+    expect(devices.phone!.start).not.toHaveBeenCalled();
+  });
+
+  it('forgets device login on explicit end and does not restore it again', async () => {
+    await boot(); click('end'); await flush();
+    expect(requests('/api/session/forget')).toHaveLength(1);
+    expect(element('workspace').classList.contains('hidden')).toBe(true);
+    expect(element('login-status').textContent).toContain('ログインの記憶を削除');
+    await vi.advanceTimersByTimeAsync(900_000);
+    expect(requests('/api/session/restore')).toHaveLength(0);
+  });
+
+  it('ignores an old cancellation 401 received after fresh authentication', async () => {
+    const cancelled = deferred<Response>();
+    routes.set('/api/cancel', () => cancelled.promise);
+    routes.set('/api/session/restore', async () => jsonResponse({ token: 'fresh-token', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false }));
+    await boot(); element<HTMLTextAreaElement>('text').value = 'old input'; click('research'); await flush();
+    await vi.advanceTimersByTimeAsync(900_000);
+    expect(requests('/api/cancel')).toHaveLength(1);
+    cancelled.resolve(new Response('{}', { status: 401 })); await flush();
+    expect(element('workspace').classList.contains('hidden')).toBe(false);
+    element<HTMLTextAreaElement>('text').value = 'new input'; click('research'); await flush();
+    expect(new Headers(requests('/api/research').at(-1)!.headers).get('Authorization')).toBe('Bearer fresh-token');
+  });
+
+  it('clears private conversation on a current credential rejection before reauthentication', async () => {
+    routes.set('/api/research', async () => new Response('{}', { status: 401 }));
+    await boot(); chooseLiveAndConsent(); element<HTMLTextAreaElement>('text').value = 'old private input'; click('research'); await flush();
+    expect(element<HTMLTextAreaElement>('text').value).toBe('');
+    expect(element('trace').children).toHaveLength(0);
+    expect(element('workspace').classList.contains('hidden')).toBe(true);
+    expect(element<HTMLInputElement>('consent').checked).toBe(false);
+    element('login-form').dispatchEvent(new Event('submit', { cancelable: true })); await flush();
+    expect(element<HTMLTextAreaElement>('text').value).toBe('');
+  });
+
+  it('serializes remembered restore and manual login, then prevents double submit', async () => {
+    routes.set('/api/status', async () => jsonResponse({ liveEnabled: true, missing: [], sttEnabled: true, accessCodeRequired: true }));
+    const restoring = deferred<Response>(); const loggingIn = deferred<Response>();
+    routes.set('/api/session/restore', () => restoring.promise);
+    routes.set('/api/session', () => loggingIn.promise);
+    const pendingBoot = boot(); await vi.waitFor(() => expect(requests('/api/session/restore')).toHaveLength(1));
+    expect(element<HTMLButtonElement>('login-form').querySelector('button')!.disabled).toBe(true);
+    element('login-form').dispatchEvent(new Event('submit', { cancelable: true })); await flush();
+    expect(requests('/api/session')).toHaveLength(0);
+    restoring.resolve(new Response('{}', { status: 401 })); await pendingBoot;
+    element('login-form').dispatchEvent(new Event('submit', { cancelable: true }));
+    element('login-form').dispatchEvent(new Event('submit', { cancelable: true })); await flush();
+    expect(requests('/api/session')).toHaveLength(1);
+    loggingIn.resolve(jsonResponse({ token: 'new', revision: 0, expiresAt: Date.now() + 900_000, hasPrevious: false, interrupted: false })); await flush();
+    expect(element('workspace').classList.contains('hidden')).toBe(false);
   });
 
   it('normal explicit phone stop sends one WAV and displays the researched card without touching G2 audio', async () => {

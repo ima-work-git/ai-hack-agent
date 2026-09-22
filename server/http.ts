@@ -5,6 +5,7 @@ import { ResearchInputSchema } from '../src/shared/contracts.ts';
 import type { ResearchInput, ResearchResult, Target } from '../src/shared/contracts.ts';
 import type { AppConfig } from './config.ts';
 import { SessionStore } from './sessions.ts';
+import { DeviceLoginError, DeviceLoginStore } from './device-logins.ts';
 import { BudgetError, BudgetLedger } from './budget.ts';
 import { runAgent } from './agent.ts';
 import { createFixtureProvider } from './fixtures.ts';
@@ -14,6 +15,7 @@ import { ProviderError } from './provider-contract.ts';
 
 interface HttpDependencies {
   store?: SessionStore;
+  deviceLogins?: DeviceLoginStore;
   budget?: BudgetLedger;
   provider?: (input: ResearchInput) => ResearchProvider;
   liveProvider?: ResearchProvider;
@@ -60,6 +62,7 @@ async function jsonBody(req: IncomingMessage): Promise<unknown> {
 export function createApiHandler(config: AppConfig, dependencies: HttpDependencies = {}) {
   const now = dependencies.now ?? Date.now;
   const store = dependencies.store ?? new SessionStore(config.budget.directory, now);
+  const deviceLogins = dependencies.deviceLogins ?? new DeviceLoginStore(config.budget.directory, config.accessCode, now);
   const budget = dependencies.budget ?? (config.status.liveEnabled ? new BudgetLedger(config.budget) : undefined);
   const liveProvider = dependencies.liveProvider ?? createLiveProvider(config.providers);
   const research = dependencies.runAgent ?? runAgent;
@@ -70,11 +73,39 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   const active = new Map<string, { requestId: string; revision: number; controller: AbortController }>();
   const sweep = setInterval(() => {
     store.sweep();
+    // An unavailable credential file must never turn a timer error into a crash.
+    try { deviceLogins.sweep(); } catch { /* Authentication reads the store again and fails closed. */ }
     for (const [id] of active) if (!store.get(id)) active.delete(id);
     for (const [key, value] of attempts) if (value.until <= now()) attempts.delete(key);
   }, 10_000);
   sweep.unref();
   const cookie = (id: string, expiresAt?: number) => `sessionId=${id}; Path=/api; HttpOnly; SameSite=Strict${configuredOrigin.protocol === 'https:' ? '; Secure' : ''}; ${expiresAt ? `Expires=${new Date(expiresAt).toUTCString()}` : 'Max-Age=0'}`;
+  const rememberedCookie = (token: string, expiresAt?: number) => `rememberedDevice=${token}; Path=/api; HttpOnly; SameSite=Strict${configuredOrigin.protocol === 'https:' ? '; Secure' : ''}; ${expiresAt ? `Expires=${new Date(expiresAt).toUTCString()}` : 'Max-Age=0'}`;
+  const readCookie = (req: IncomingMessage, name: string, pattern: RegExp) => {
+    const values = (req.headers.cookie ?? '').split(';').map(part => part.trim()).filter(part => part.startsWith(`${name}=`)).map(part => part.slice(name.length + 1));
+    return values.length === 1 && pattern.test(values[0]!) ? values[0] : undefined;
+  };
+  const sessionCookie = (req: IncomingMessage) => readCookie(req, 'sessionId', /^[a-f0-9]{32}$/);
+  const deviceCookie = (req: IncomingMessage) => readCookie(req, 'rememberedDevice', /^[a-f0-9]{64}$/);
+  const sameOrigin = (req: IncomingMessage) => {
+    const origin = req.headers.origin;
+    if (!origin || !origins.has(origin) || new URL(origin).host.toLowerCase() !== req.headers.host?.toLowerCase()) throw new HttpError(403, '許可されていない接続元です。');
+  };
+  const rateLimit = (req: IncomingMessage, scope: 'code' | 'restore') => {
+    const address = `${scope}:${req.socket.remoteAddress ?? 'unknown'}`;
+    const rate = attempts.get(address);
+    const maximum = scope === 'code' ? 10 : 20;
+    if (rate && rate.until > now() && rate.count >= maximum) throw new HttpError(429, 'ログイン試行の上限です。1分後に再試行してください。');
+    attempts.set(address, { count: rate && rate.until > now() ? rate.count + 1 : 1, until: rate && rate.until > now() ? rate.until : now() + 60_000 });
+  };
+  const beginSession = (req: IncomingMessage) => {
+    const previousId = sessionCookie(req);
+    if (previousId && store.get(previousId)?.running) {
+      store.cancel(previousId); active.delete(previousId);
+      const previous = store.get(previousId); if (previous) { previous.interrupted = true; store.save(previous); }
+    }
+    return store.login(previousId);
+  };
   const validResult = (result: ResearchResult | undefined, revision: number) => {
     if (!result || result.subjectRevision !== revision) return null;
     if (result.cards.some(card => Date.parse(card.expiresAt) <= now())) return null;
@@ -95,18 +126,37 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       }
       if (req.method === 'GET' && path === '/api/status') { sendJson(res, 200, config.status); return true; }
       if (req.method === 'POST' && path === '/api/session') {
-        const address = req.socket.remoteAddress ?? 'unknown';
-        const rate = attempts.get(address);
-        if (rate && rate.until > now() && rate.count >= 10) throw new HttpError(429, 'ログイン試行の上限です。1分後に再試行してください。');
-        attempts.set(address, { count: rate && rate.until > now() ? rate.count + 1 : 1, until: rate && rate.until > now() ? rate.until : now() + 60_000 });
-        const body = z.object({ accessCode: z.string().max(512).default('') }).strict().parse(await jsonBody(req));
+        rateLimit(req, 'code');
+        const body = z.object({ accessCode: z.string().max(512).default(''), rememberDevice: z.boolean().default(false) }).strict().parse(await jsonBody(req));
         if (!safeEqual(body.accessCode, config.accessCode)) throw new HttpError(401, '利用コードが一致しません。');
-        const previousId = /(?:^|;\s*)sessionId=([a-f0-9]{32})(?:;|$)/.exec(req.headers.cookie ?? '')?.[1];
-        if (previousId && store.get(previousId)?.running) { store.cancel(previousId); const previous = store.get(previousId); if (previous) { previous.interrupted = true; store.save(previous); } }
-        const { session, token } = store.login(previousId);
+        const remembered = body.rememberDevice ? deviceLogins.issue(deviceCookie(req)) : undefined;
+        if (!body.rememberDevice) deviceLogins.revoke(deviceCookie(req));
+        const { session, token } = beginSession(req);
+        res.setHeader('Set-Cookie', [cookie(session.id, session.expiresAt), remembered ? rememberedCookie(remembered.token, remembered.expiresAt) : rememberedCookie('')]);
+        sendJson(res, 200, { token, expiresAt: session.expiresAt, revision: session.revision, hasPrevious: !!validResult(session.result, session.revision), interrupted: session.interrupted });
+        return true;
+      }
+      if (req.method === 'POST' && path === '/api/session/restore') {
+        sameOrigin(req); rateLimit(req, 'restore');
+        z.object({}).strict().parse(await jsonBody(req));
+        if (!deviceLogins.authenticate(deviceCookie(req))) {
+          res.setHeader('Set-Cookie', rememberedCookie(''));
+          throw new HttpError(401, '利用コードで開始してください。');
+        }
+        const { session, token } = beginSession(req);
         res.setHeader('Set-Cookie', cookie(session.id, session.expiresAt));
         sendJson(res, 200, { token, expiresAt: session.expiresAt, revision: session.revision, hasPrevious: !!validResult(session.result, session.revision), interrupted: session.interrupted });
         return true;
+      }
+      if (req.method === 'POST' && path === '/api/session/forget') {
+        sameOrigin(req);
+        z.object({}).strict().parse(await jsonBody(req));
+        deviceLogins.revoke(deviceCookie(req));
+        const authorization = req.headers.authorization;
+        const authenticated = authorization?.startsWith('Bearer ') ? store.authenticate(authorization.slice(7)) : null;
+        for (const id of new Set([sessionCookie(req), authenticated?.id])) if (id) { store.end(id); active.delete(id); }
+        res.setHeader('Set-Cookie', [cookie(''), rememberedCookie('')]);
+        sendJson(res, 200, { ended: true }); return true;
       }
       const authorization = req.headers.authorization;
       const session = authorization?.startsWith('Bearer ') ? store.authenticate(authorization.slice(7)) : null;
@@ -116,8 +166,9 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         sendJson(res, 200, { result: previous, input: previous ? session.lastInput : null, interrupted: session.interrupted }); return true;
       }
       if (req.method === 'DELETE' && path === '/api/session') {
+        deviceLogins.revoke(deviceCookie(req));
         store.end(session.id); active.delete(session.id);
-        res.setHeader('Set-Cookie', cookie('')); sendJson(res, 200, { ended: true }); return true;
+        res.setHeader('Set-Cookie', [cookie(''), rememberedCookie('')]); sendJson(res, 200, { ended: true }); return true;
       }
       if (req.method === 'POST' && path === '/api/cancel') {
         const body = CancelSchema.parse(await jsonBody(req));
@@ -219,8 +270,8 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       }
       throw new HttpError(404, 'このAPIはありません。');
     } catch (error) {
-      const status = error instanceof HttpError ? error.status : error instanceof z.ZodError || error instanceof ProviderError && error.code === 'INVALID_AUDIO' ? 400 : error instanceof BudgetError && error.code === 'BUDGET_EXHAUSTED' ? 429 : 500;
-      const message = error instanceof HttpError ? error.message : status === 400 ? '入力の形式を確認してください。' : '処理を完了できませんでした。';
+      const status = error instanceof HttpError ? error.status : error instanceof z.ZodError || error instanceof ProviderError && error.code === 'INVALID_AUDIO' || error instanceof DeviceLoginError && error.code === 'NOT_CONFIGURED' ? 400 : error instanceof BudgetError && error.code === 'BUDGET_EXHAUSTED' || error instanceof DeviceLoginError && error.code === 'CAPACITY' ? 429 : 500;
+      const message = error instanceof HttpError ? error.message : error instanceof DeviceLoginError && error.code === 'CAPACITY' ? '記憶できる端末数の上限です。端末の記憶を解除するか、記憶せず開始してください。' : status === 400 ? '入力の形式を確認してください。' : '処理を完了できませんでした。';
       if (res.headersSent) { if (!res.destroyed && !res.writableEnded) res.end(JSON.stringify({ type: 'error', message }) + '\n'); }
       else sendJson(res, status, { message });
       return true;
