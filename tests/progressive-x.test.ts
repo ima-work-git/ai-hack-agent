@@ -251,9 +251,9 @@ describe('specific historical questions', () => {
     return (await providerWith(api).assess(target, [source], signal())).value.cards;
   }
   it('adds historical context while preserving the concrete subject instead of injecting a generic question', async () => {
-    const [card] = await assessQuestion('試作機を木製にした理由は？', '木製を選んだ理由は？');
+    const [card] = await assessQuestion('試作機を木製にした理由は？', '木製を選んだ理由は何ですか？');
     expect(card?.suggestedQuestion).toBe('当時、試作機を木製にした理由は？');
-    expect(card?.displayQuestion).toBe('当時、木製を選んだ理由は？');
+    expect(card?.displayQuestion).toBe('当時、木製を選んだ理由は何ですか？');
     expect(card?.fact).toBe(body);
   });
   it('preserves a specific historical full question when a short display helper is absent', async () => {
@@ -266,5 +266,26 @@ describe('specific historical questions', () => {
     expect(short.length).toBeLessThanOrEqual(26);
     const [card] = await assessQuestion('当時、木製の試作機で最も工夫したことは？', short);
     expect(card?.suggestedQuestion).toContain('木製の試作機'); expect(card).not.toHaveProperty('displayQuestion');
+  });
+  it.each(['本当にご自身で作ったんですか？', 'その活動で工夫した点は何ですか？', 'すごいですね、成功の秘訣は？',
+    '最近の投稿で紹介した内容、どのように活用してほしいと思っていますか？',
+    '過去の投稿で特に印象に残った反応はありましたか？',
+    '取締役COOとしての役割で、特に大切にしていることは何ですか？'])(
+    'omits an unsuitable full question without inventing a fallback: %s', async question => {
+      expect(await assessQuestion(question)).toEqual([]);
+    });
+  it.each(['本当にご自身で作ったんですか？', '投稿のきっかけは？', 'どうでしたか？', 'その話題、特に興味深かった点は何ですか？', '木製を選んだ理由は？'])(
+    'discards only a bad display helper and preserves the respectful specific full question: %s', async short => {
+      const question = '当時、木製の試作機で特に工夫したところは何ですか？';
+      const [card] = await assessQuestion(question, short);
+      expect(card?.suggestedQuestion).toBe(question);
+      expect(card?.fact).toBe(body);
+      expect(card).not.toHaveProperty('displayQuestion');
+    });
+  it('keeps a specific and respectful full/short pair intact', async () => {
+    const question = '当時、木製の試作機で特に工夫したところは何ですか？';
+    const short = '当時、木製の試作機の工夫は何ですか？';
+    const [card] = await assessQuestion(question, short);
+    expect(card).toMatchObject({ suggestedQuestion: question, displayQuestion: short, fact: body });
   });
 });

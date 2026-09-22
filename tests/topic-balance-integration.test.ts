@@ -234,7 +234,7 @@ describe('OrcaRouter balanced assessment candidate boundaries', () => {
         const expected = original.xPost?.text ?? officialFact;
         const fact = entry.excerpts.flatMap(excerpt => excerpt.facts).find(fact => fact.text === expected)!;
         expect(fact).toBeDefined();
-        return { factId: fact.factId, suggestedQuestion: 'その活動で印象に残ったことは？' };
+        return { factId: fact.factId, suggestedQuestion: '技術紹介で印象に残った反応はありましたか？' };
       });
       expect(sent.find(source => source.sourceId === 'post-3')).toMatchObject({ topic: 'popular_x', post: { selectionScope: 'full_archive_sample', publishedAt: '2021-04-01T00:00:00Z' } });
       return completion(assessment(selections));
@@ -242,7 +242,7 @@ describe('OrcaRouter balanced assessment candidate boundaries', () => {
     const provider = createLiveProvider({ orcaApiKey: 'fixture-only', orcaModel: 'fixture-model', tavilyApiKey: 'fixture-only' }, { fetch: api });
     const result = await provider.assess(target, all, new AbortController().signal);
     expect(api).toHaveBeenCalledOnce(); expect(result.value.cards).toHaveLength(4);
-    expect(result.value.cards.find(card => card.sourceId === 'post-3')?.suggestedQuestion).toBe('当時、その活動で印象に残ったことは？');
+    expect(result.value.cards.find(card => card.sourceId === 'post-3')?.suggestedQuestion).toBe('当時、技術紹介で印象に残った反応はありましたか？');
     for (const card of result.value.cards) {
       const original = all.find(source => source.sourceId === card.sourceId)!;
       expect(original.text).toContain(card.excerpt); expect(card.excerpt).toContain(card.fact);

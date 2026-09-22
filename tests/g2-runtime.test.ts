@@ -405,12 +405,14 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     await runtime.connect()
     f.event({ textEvent: {} })
     await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
     f.event({ sysEvent: { eventType: OsEventTypeList.CLICK_EVENT } })
     await vi.advanceTimersByTimeAsync(500)
     f.event({ textEvent: { eventType: OsEventTypeList.SCROLL_TOP_EVENT } })
     f.event({ textEvent: { eventType: OsEventTypeList.SCROLL_BOTTOM_EVENT } })
+    await vi.advanceTimersByTimeAsync(500)
     f.event({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } })
-    expect(onAction.mock.calls.flat()).toEqual(['retry', 'retry', 'previous', 'next', 'lock'])
+    expect(onAction.mock.calls.flat()).toEqual(['primary', 'primary', 'previous', 'next', 'secondary'])
     await runtime.dispose()
   })
 
@@ -426,11 +428,11 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     await vi.advanceTimersByTimeAsync(499)
     expect(onAction).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(1)
-    expect(onAction).toHaveBeenCalledExactlyOnceWith('retry')
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('primary')
     await runtime.dispose()
   })
 
-  it('cancels a pending retry on double-tap, suppresses duplicate/trailing tap events, and keeps audio running', async () => {
+  it('cancels a pending primary on double-tap, suppresses duplicate/trailing tap events, and keeps audio running', async () => {
     const f = fakeBridge(); const onAction = vi.fn(); const onAudio = vi.fn()
     const runtime = new G2Runtime({ bridge: f.bridge, onAction, onAudio })
     await runtime.connect(); await runtime.startAudio({ continuous: true })
@@ -443,14 +445,48 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     f.event({ sysEvent: {} })
     f.event(pcm())
     await vi.advanceTimersByTimeAsync(500)
-    expect(onAction).toHaveBeenCalledExactlyOnceWith('lock')
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('secondary')
     expect(runtime.status.state).toBe('recording')
     expect(onAudio).toHaveBeenCalledOnce()
     expect(vi.mocked(f.bridge.audioControl).mock.calls.filter(([open]) => !open)).toHaveLength(0)
     // A later deliberate single tap remains usable after the suppression window.
     f.event({ sysEvent: {} })
     await vi.advanceTimersByTimeAsync(500)
-    expect(onAction.mock.calls.flat()).toEqual(['lock', 'retry'])
+    expect(onAction.mock.calls.flat()).toEqual(['secondary', 'primary'])
+    await runtime.dispose()
+  })
+
+  it.each(['sys-first', 'text-first'] as const)('suppresses a trailing sibling click and late double after an accepted primary (%s)', async order => {
+    const f = fakeBridge(); const onAction = vi.fn()
+    const runtime = new G2Runtime({ bridge: f.bridge, onAction })
+    await runtime.connect(); await runtime.startAudio({ continuous: true })
+    const first = order === 'sys-first' ? { sysEvent: {} } : { textEvent: {} }
+    const sibling = order === 'sys-first' ? { textEvent: { eventType: OsEventTypeList.CLICK_EVENT } } : { sysEvent: { eventType: OsEventTypeList.CLICK_EVENT } }
+    f.event(first); await vi.advanceTimersByTimeAsync(500)
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('primary')
+    // The UI may already have accepted a navigation confirmation. The same
+    // physical tap arriving through another envelope must not act on that page.
+    f.event(sibling); await vi.advanceTimersByTimeAsync(200)
+    f.event({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } })
+    await vi.advanceTimersByTimeAsync(299)
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('primary')
+    expect(runtime.status.state).toBe('recording')
+    expect(vi.mocked(f.bridge.audioControl).mock.calls.filter(([open]) => !open)).toHaveLength(0)
+    await vi.advanceTimersByTimeAsync(1)
+    f.event(first); await vi.advanceTimersByTimeAsync(500)
+    expect(onAction.mock.calls.flat()).toEqual(['primary', 'primary'])
+    await runtime.dispose()
+  })
+
+  it('keeps accepted-tap suppression across a synchronous subject/view invalidation', async () => {
+    const f = fakeBridge(); const onAction = vi.fn(() => runtime.invalidateViews('changed'))
+    const runtime = new G2Runtime({ bridge: f.bridge, onAction })
+    await runtime.connect(); f.event({ sysEvent: {} })
+    await vi.advanceTimersByTimeAsync(500)
+    f.event({ textEvent: {} })
+    f.event({ textEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('primary')
     await runtime.dispose()
   })
 
@@ -463,7 +499,7 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     const runtime = new G2Runtime({ bridge: f.bridge, onAction })
     await runtime.connect(); f.event(event)
     await vi.advanceTimersByTimeAsync(1000)
-    expect(onAction).toHaveBeenCalledExactlyOnceWith('lock')
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('secondary')
     expect(runtime.status.state).toBe('connected')
     await runtime.dispose()
   })
@@ -485,7 +521,7 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
       else if (transition === 'new-subject') runtime.invalidateViews('new-person')
       else if (transition === 'scroll') f.event({ textEvent: { eventType: OsEventTypeList.SCROLL_BOTTOM_EVENT } })
       await vi.advanceTimersByTimeAsync(1000)
-      expect(onAction.mock.calls.flat()).not.toContain('retry')
+      expect(onAction.mock.calls.flat()).not.toContain('primary')
       if (transition === 'system-exit' || transition === 'abnormal-exit') {
         expect(onAction).toHaveBeenCalledExactlyOnceWith('exit')
         expect(runtime.status.state).toBe('disconnected')
@@ -506,7 +542,7 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
     expect(onAction).not.toHaveBeenCalled()
     f.event({ sysEvent: {} })
     await vi.advanceTimersByTimeAsync(500)
-    expect(onAction).toHaveBeenCalledExactlyOnceWith('retry')
+    expect(onAction).toHaveBeenCalledExactlyOnceWith('primary')
     await runtime.dispose()
   })
 

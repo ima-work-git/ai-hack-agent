@@ -38,7 +38,7 @@ export class ProviderError extends Error {
 }
 
 export interface ProviderConfig {
-  orcaApiKey: string; orcaModel: string; tavilyApiKey: string; orcaSttModel?: string;
+  orcaApiKey: string; orcaModel: string; tavilyApiKey: string; orcaSttModel?: string; orcaAssessmentModel?: string;
   xBearerToken?: string; xEnabled?: boolean; xBalancedTopics?: boolean;
   sttApiKey?: string; sttBaseUrl?: string; sttModel?: string;
 }

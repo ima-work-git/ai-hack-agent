@@ -17,6 +17,18 @@ const liveEnv = (): NodeJS.ProcessEnv => ({
 });
 
 describe('live configuration gates (REQ-007, REQ-008, REQ-009)', () => {
+  it('supports an optional assessment model without rerouting planning, speech or name correction', () => {
+    const baseline = readConfig(liveEnv());
+    const overridden = readConfig({ ...liveEnv(), ORCAROUTER_ASSESSMENT_MODEL: '  fixture-assessment  ' });
+    expect(baseline.providers.orcaAssessmentModel).toBeUndefined();
+    expect(overridden.providers.orcaAssessmentModel).toBe('fixture-assessment');
+    expect(overridden.providers.orcaModel).toBe(baseline.providers.orcaModel);
+    expect(overridden.providers.orcaSttModel).toBe(baseline.providers.orcaSttModel);
+    expect(overridden.personCorrection).toEqual(baseline.personCorrection);
+    expect(overridden.status).toEqual(baseline.status);
+    expect(readConfig({ ...liveEnv(), ORCAROUTER_ASSESSMENT_MODEL: ' ' }).providers.orcaAssessmentModel).toBeUndefined();
+  });
+
   it('defaults to normal limits and accepts only an explicit bounded suspension with timezones', () => {
     const env = { ...liveEnv(), BUDGET_LIMITS_SUSPEND_FROM: '2026-09-22T00:00:00+09:00', BUDGET_LIMITS_SUSPEND_UNTIL: '2026-09-24T00:00:00+09:00' };
     expect(readConfig(liveEnv()).budget.limitSuspension).toBeUndefined();
