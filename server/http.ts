@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { ResearchInputSchema } from '../src/shared/contracts.ts';
 import type { ResearchInput, ResearchResult, Target } from '../src/shared/contracts.ts';
@@ -71,8 +71,13 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   const hosts = new Set([...origins].map(origin => new URL(origin).host));
   const attempts = new Map<string, { count: number; until: number }>();
   const active = new Map<string, { requestId: string; revision: number; controller: AbortController }>();
+  const qrTickets = new Map<string, { issuerSessionId: string; expiresAt: number }>();
+  const sweepQrTickets = () => {
+    for (const [hash, ticket] of qrTickets) if (ticket.expiresAt <= now() || !store.get(ticket.issuerSessionId)) qrTickets.delete(hash);
+  };
   const sweep = setInterval(() => {
     store.sweep();
+    sweepQrTickets();
     // An unavailable credential file must never turn a timer error into a crash.
     try { deviceLogins.sweep(); } catch { /* Authentication reads the store again and fails closed. */ }
     for (const [id] of active) if (!store.get(id)) active.delete(id);
@@ -148,6 +153,21 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         sendJson(res, 200, { token, expiresAt: session.expiresAt, revision: session.revision, hasPrevious: !!validResult(session.result, session.revision), interrupted: session.interrupted });
         return true;
       }
+      if (req.method === 'POST' && path === '/api/session/qr/redeem') {
+        sameOrigin(req); rateLimit(req, 'restore');
+        const body = z.object({ ticket: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(await jsonBody(req));
+        const hash = createHash('sha256').update(body.ticket).digest('hex');
+        const grant = qrTickets.get(hash);
+        // Consume synchronously before issuing any credential. Concurrent or
+        // retried requests cannot reuse a grant, including after later failures.
+        qrTickets.delete(hash);
+        if (!grant || grant.expiresAt <= now() || !store.get(grant.issuerSessionId)) throw new HttpError(401, 'QRコードが失効しました。新しいQRコードで開始してください。');
+        const remembered = deviceLogins.issue(deviceCookie(req));
+        const { session, token } = store.login();
+        res.setHeader('Set-Cookie', [cookie(session.id, session.expiresAt), rememberedCookie(remembered.token, remembered.expiresAt)]);
+        sendJson(res, 200, { token, expiresAt: session.expiresAt, revision: session.revision, hasPrevious: false, interrupted: false });
+        return true;
+      }
       if (req.method === 'POST' && path === '/api/session/forget') {
         sameOrigin(req);
         z.object({}).strict().parse(await jsonBody(req));
@@ -161,6 +181,18 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       const authorization = req.headers.authorization;
       const session = authorization?.startsWith('Bearer ') ? store.authenticate(authorization.slice(7)) : null;
       if (!session) throw new HttpError(401, '再ログインしてください。');
+      if (req.method === 'POST' && path === '/api/session/qr') {
+        sameOrigin(req);
+        z.object({}).strict().parse(await jsonBody(req));
+        // Body reading is asynchronous: the issuer may expire or log out meanwhile.
+        if (!store.authenticate(authorization!.slice(7))) throw new HttpError(401, '再ログインしてください。');
+        sweepQrTickets();
+        if (qrTickets.size >= 5) throw new HttpError(429, '発行済みQRコードの上限です。使用または失効後に再度お試しください。');
+        const ticket = randomBytes(32).toString('hex');
+        const expiresAt = Math.min(now() + 10 * 60_000, session.expiresAt);
+        qrTickets.set(createHash('sha256').update(ticket).digest('hex'), { issuerSessionId: session.id, expiresAt });
+        sendJson(res, 200, { ticket, expiresAt }); return true;
+      }
       if (req.method === 'POST' && path === '/api/session/resume') {
         const previous = validResult(session.result, session.revision);
         sendJson(res, 200, { result: previous, input: previous ? session.lastInput : null, interrupted: session.interrupted }); return true;
@@ -277,5 +309,5 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       return true;
     }
   }
-  return { handle, close() { clearInterval(sweep); for (const id of active.keys()) { const session = store.get(id); if (session) { session.interrupted = true; store.save(session); } } store.close(); active.clear(); } };
+  return { handle, close() { clearInterval(sweep); qrTickets.clear(); for (const id of active.keys()) { const session = store.get(id); if (session) { session.interrupted = true; store.save(session); } } store.close(); active.clear(); } };
 }

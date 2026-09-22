@@ -66,6 +66,88 @@ async function fixture(options: { config?: Partial<AppConfig>; provider?: (input
 }
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
 
+describe('single-use QR login', () => {
+  const issue = (f: Awaited<ReturnType<typeof fixture>>, token: string, headers: Record<string, string> = {}, body = '{}') =>
+    f.request('/api/session/qr', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...headers }, body });
+  const redeem = (f: Awaited<ReturnType<typeof fixture>>, ticket: string, headers: Record<string, string> = {}) =>
+    f.request('/api/session/qr/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ ticket }) });
+
+  it('creates a new remembered login without copying either issuer or browser conversation or executing work', async () => {
+    const provider = vi.fn(() => createFixtureProvider('normal'));
+    const liveProvider = { ...createFixtureProvider('normal'), transcribe: vi.fn(async () => ({ value: DEMO_TEXT })) };
+    const f = await fixture({ provider, liveProvider });
+    const issuer = await f.login(); await f.research(issuer.body.token);
+    const browser = await f.login(); await f.research(browser.body.token);
+    const issued = await issue(f, issuer.body.token); const grant = await issued.json();
+    expect(issued.status).toBe(200); expect(grant.ticket).toMatch(/^[a-f0-9]{64}$/);
+    expect(grant.expiresAt).toBe(issuer.body.expiresAt - 5 * 60_000);
+    const response = await redeem(f, grant.ticket, { Cookie: browser.cookie }); const body = await response.json();
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ revision: 0, hasPrevious: false, interrupted: false });
+    expect(body).not.toHaveProperty('result'); expect(body).not.toHaveProperty('input');
+    expect(body.token.split('.')[0]).not.toBe(issuer.body.token.split('.')[0]);
+    expect(body.token.split('.')[0]).not.toBe(browser.body.token.split('.')[0]);
+    expect(response.headers.getSetCookie()).toHaveLength(2);
+    expect(response.headers.getSetCookie().some(cookie => /^rememberedDevice=[a-f0-9]{64};/.test(cookie))).toBe(true);
+    expect(provider).toHaveBeenCalledTimes(2); expect(liveProvider.transcribe).not.toHaveBeenCalled();
+    expect(await readFile(join(f.directory, 'device-logins.json'), 'utf8')).not.toContain(grant.ticket);
+    expect((await readdir(f.directory)).some(name => /qr|ticket/.test(name))).toBe(false);
+    expect((await redeem(f, grant.ticket)).status).toBe(401);
+  });
+
+  it('allows exactly one simultaneous redemption and rejects altered tickets', async () => {
+    const f = await fixture(); const issuer = await f.login();
+    const grant = await (await issue(f, issuer.body.token)).json();
+    const altered = (grant.ticket[0] === 'a' ? 'b' : 'a') + grant.ticket.slice(1);
+    expect((await redeem(f, altered)).status).toBe(401);
+    const responses = await Promise.all([redeem(f, grant.ticket), redeem(f, grant.ticket)]);
+    expect(responses.map(response => response.status).sort()).toEqual([200, 401]);
+  });
+
+  it('requires bearer authorization to issue and same-origin strict JSON at both endpoints', async () => {
+    const f = await fixture(); const issuer = await f.login();
+    expect((await issue(f, 'invalid')).status).toBe(401);
+    const grant = await (await issue(f, issuer.body.token)).json();
+    for (const Origin of ['', 'https://attacker.invalid', 'http://127.0.0.1:4173']) {
+      expect((await issue(f, issuer.body.token, { Origin })).status).toBe(403);
+      expect((await redeem(f, grant.ticket, { Origin })).status).toBe(403);
+    }
+    expect((await issue(f, issuer.body.token, { 'Content-Type': 'text/plain' })).status).toBe(415);
+    expect((await issue(f, issuer.body.token, {}, '{"extra":true}')).status).toBe(400);
+    expect((await redeem(f, grant.ticket, { 'Content-Type': 'text/plain' })).status).toBe(415);
+    expect((await f.request('/api/session/qr/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticket: grant.ticket, extra: true }) })).status).toBe(400);
+    expect((await redeem(f, grant.ticket)).status).toBe(200);
+  });
+
+  it.each(['ticket-expiry', 'issuer-expiry', 'issuer-logout', 'restart'] as const)('invalidates an unused ticket after %s', async action => {
+    const f = await fixture(); const issuer = await f.login();
+    if (action === 'issuer-expiry') f.advance(14 * 60_000);
+    const grant = await (await issue(f, issuer.body.token)).json();
+    if (action === 'issuer-expiry') expect(grant.expiresAt).toBe(issuer.body.expiresAt);
+    if (action === 'ticket-expiry') f.advance(10 * 60_000);
+    if (action === 'issuer-expiry') f.advance(60_000);
+    if (action === 'issuer-logout') await f.request('/api/session', { method: 'DELETE', headers: { Authorization: `Bearer ${issuer.body.token}` } });
+    if (action === 'restart') f.restart();
+    expect((await redeem(f, grant.ticket)).status).toBe(401);
+  });
+
+  it('caps outstanding tickets at five and recovers capacity after expiry', async () => {
+    const f = await fixture(); const issuer = await f.login();
+    for (let i = 0; i < 5; i++) expect((await issue(f, issuer.body.token)).status).toBe(200);
+    expect((await issue(f, issuer.body.token)).status).toBe(429);
+    f.advance(10 * 60_000);
+    expect((await issue(f, issuer.body.token)).status).toBe(200);
+  });
+
+  it('shares the restore rate limit for unauthenticated redemption attempts', async () => {
+    const f = await fixture();
+    for (let i = 0; i < 20; i++) expect((await redeem(f, 'a'.repeat(64))).status).toBe(401);
+    expect((await redeem(f, 'a'.repeat(64))).status).toBe(429);
+    f.advance(60_000);
+    expect((await redeem(f, 'a'.repeat(64))).status).toBe(401);
+  });
+});
+
 describe('remembered-device HTTP authentication', () => {
   const post = (f: Awaited<ReturnType<typeof fixture>>, path: 'restore' | 'forget', cookie: string, headers: Record<string, string> = {}, body = '{}') =>
     f.request(`/api/session/${path}`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json', ...headers }, body });
