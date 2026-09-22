@@ -13,7 +13,9 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "check": "tsc --noEmit && node --input-type=module -e \"await import('./server/http.ts')\" && python3 scripts/check_preparation.py",
-    "pack:g2": "node scripts/pack-g2.mjs"
+    "pack:g2": "node scripts/pack-g2.mjs",
+    "serve:public": "node scripts/serve-public.mjs",
+    "install:public": "node scripts/install-public-service.mjs"
   },
   "dependencies": {
     "@evenrealities/even_hub_sdk": "0.0.12",
