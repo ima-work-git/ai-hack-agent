@@ -90,6 +90,26 @@ let windowEvents: MockInstance<typeof window.addEventListener>;
 function requests(path: string) {
   return fetchMock.mock.calls.filter(([url]) => String(url) === path).map(([, init]) => init!);
 }
+function openResearchStreams() {
+  const streams: Array<{ input: ResearchInput; signal: AbortSignal; body: ReadableStreamDefaultController<Uint8Array> }> = [];
+  routes.set('/api/research', async init => new Response(new ReadableStream<Uint8Array>({
+    start(body) { streams.push({ input: JSON.parse(String(init.body)) as ResearchInput, signal: init.signal as AbortSignal, body }); },
+  }), { headers: { 'Content-Type': 'application/x-ndjson' } }));
+  return streams;
+}
+function pushResearchEvent(body: ReadableStreamDefaultController<Uint8Array>, event: unknown) {
+  body.enqueue(new TextEncoder().encode(`${JSON.stringify(event)}\n`));
+}
+function fourCardResult(input: ResearchInput, prefix = '速報', reasonCode = 'PROGRESSIVE_QUICK'): ResearchResult {
+  const value = researchResult(input.requestId, input.subjectRevision);
+  value.reasonCode = reasonCode;
+  const original = value.cards[0]!; const source = value.sources[0]!;
+  value.cards = Array.from({ length: 4 }, (_, index) => ({ ...original,
+    cardId: `fixture-card-${index}`, sourceId: `fixture-source-${index}`, fact: `架空の${prefix}${index + 1}です。`, excerpt: `架空の${prefix}${index + 1}です。`,
+  }));
+  value.sources = value.cards.map(card => ({ ...source, sourceId: card.sourceId, text: card.fact }));
+  return value;
+}
 async function boot() { await import('../src/main.ts'); await flush(); }
 function chooseLiveAndConsent() {
   element<HTMLSelectElement>('mode').value = 'live';
@@ -152,6 +172,141 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
       if (type === 'pagehide') window.removeEventListener(type, listener, options);
     }
     vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals();
+  });
+
+  it('renders four verified updates on phone and G2 before the research stream closes, then replaces them with final cards', async () => {
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush();
+    element<HTMLTextAreaElement>('text').value = '架空検証社の架空の検証参加者'; click('research'); await flush();
+    const stream = streams[0]!;
+    pushResearchEvent(stream.body, { type: 'update', result: fourCardResult(stream.input) }); await flush();
+    expect(element('status').textContent).toContain('速報・追加調査中');
+    expect(element('card-board').querySelectorAll('.topic-card:not(.empty)')).toHaveLength(4);
+    expect(element('fact').textContent).toBe('架空の速報1です。');
+    expect(element<HTMLButtonElement>('research').disabled).toBe(true);
+    const quickView = devices.g2!.render.mock.calls.at(-1)![0] as GlassesView;
+    expect(quickView.header).toContain('速報・追加調査中'); expect(quickView.content).toContain('架空の速報4です。');
+    pushResearchEvent(stream.body, { type: 'result', result: fourCardResult(stream.input, '確定', 'EVIDENCE_VERIFIED') }); stream.body.close(); await flush();
+    expect(element('fact').textContent).toBe('架空の確定1です。');
+    expect(element('status').textContent).not.toContain('追加調査中');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).header).not.toContain('追加調査中');
+    expect(element<HTMLButtonElement>('research').disabled).toBe(false);
+  });
+
+  it('ignores update events for a different request or revision without closing the current stream', async () => {
+    const streams = openResearchStreams();
+    await boot(); click('connect'); await flush(); element<HTMLTextAreaElement>('text').value = '架空の検証参加者'; click('research'); await flush();
+    const stream = streams[0]!;
+    pushResearchEvent(stream.body, { type: 'update', result: fourCardResult({ ...stream.input, requestId: 'wrong-request-id' }, '旧ID') });
+    pushResearchEvent(stream.body, { type: 'update', result: fourCardResult({ ...stream.input, subjectRevision: stream.input.subjectRevision + 1 }, '旧版') }); await flush();
+    expect(element('fact').textContent).toBe('未確認');
+    expect(devices.g2!.render.mock.calls.some(([view]) => /旧ID|旧版/.test((view as GlassesView).content))).toBe(false);
+    pushResearchEvent(stream.body, { type: 'result', result: fourCardResult(stream.input) }); stream.body.close(); await flush();
+    expect(element('fact').textContent).toBe('架空の速報1です。');
+  });
+
+  it.each(['cancel', 'end', 'mode-change'] as const)('clears progressive cards after %s and discards late stream updates on phone and glasses', async action => {
+    const streams = openResearchStreams();
+    await boot(); click('connect'); await flush(); element<HTMLTextAreaElement>('text').value = '架空の検証参加者'; click('research'); await flush();
+    const stream = streams[0]!;
+    pushResearchEvent(stream.body, { type: 'update', result: fourCardResult(stream.input) }); await flush();
+    expect(element('fact').textContent).toBe('架空の速報1です。');
+    if (action === 'mode-change') chooseLiveAndConsent(); else click(action);
+    await flush(); devices.g2!.render.mockClear();
+    pushResearchEvent(stream.body, { type: 'update', result: fourCardResult(stream.input, '古い追加情報') }); stream.body.close(); await flush();
+    expect(element('fact').textContent).toBe('未確認'); expect(element('sources').textContent).toBe('');
+    expect(devices.g2!.render.mock.calls.some(([view]) => (view as GlassesView).content.includes('古い追加情報'))).toBe(false);
+  });
+
+  it.each(['disconnect', 'error-event', 'failed-result'] as const)('preserves verified cards when an open enrichment stream ends with %s', async outcome => {
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    devices.streaming!.options.onFinal('first', '架空の検証参加者'); await flush();
+    const stream = streams[0]!;
+    pushResearchEvent(stream.body, { type: 'update', result: fourCardResult(stream.input, '確かな話題', 'PROGRESSIVE_ENRICHING') }); await flush();
+    if (outcome === 'error-event') pushResearchEvent(stream.body, { type: 'error', code: 'PROVIDER_TIMEOUT', message: '追加調査が時間切れでした。' });
+    if (outcome === 'failed-result') {
+      const failed = researchResult(stream.input.requestId, stream.input.subjectRevision);
+      failed.status = 'failed'; failed.cards = []; failed.reasonCode = 'PROVIDER_TIMEOUT';
+      pushResearchEvent(stream.body, { type: 'result', result: failed });
+    }
+    stream.body.close(); await flush();
+    expect(element('fact').textContent).toBe('架空の確かな話題1です。');
+    expect(element('status').textContent).toContain('確認済みの話題を表示しています');
+    expect(element('status').textContent).not.toContain('追加調査中');
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain('架空の確かな話題4です。');
+    expect(devices.streaming!.cancel).not.toHaveBeenCalled(); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+  });
+
+  it('removes progressive cards and their source details when identity confirmation is later required', async () => {
+    const streams = openResearchStreams();
+    await boot(); click('connect'); await flush(); element<HTMLTextAreaElement>('text').value = '架空の検証参加者'; click('research'); await flush();
+    const stream = streams[0]!;
+    pushResearchEvent(stream.body, { type: 'update', result: fourCardResult(stream.input) }); await flush();
+    const ambiguous = researchResult(stream.input.requestId, stream.input.subjectRevision);
+    ambiguous.status = 'awaiting_confirmation'; ambiguous.cards = [];
+    ambiguous.candidates = [{ id: 'fixture-candidate', personName: '架空の検証参加者', companyName: '別の架空検証社', reason: '同姓同名', sourceIds: [] }];
+    pushResearchEvent(stream.body, { type: 'result', result: ambiguous }); stream.body.close(); await flush();
+    expect(element('fact').textContent).toBe('未確認'); expect(element('sources').textContent).toBe('');
+    expect(element('candidates').children).toHaveLength(1);
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).header).toContain('相手の確認');
+  });
+
+  it('identifies ordinary and same-person speech while enrichment stays open, without cancelling or hiding its cards', async () => {
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const voice = devices.streaming!; voice.options.onFinal('first', '架空の検証参加者'); await flush();
+    const stream = streams[0]!; pushResearchEvent(stream.body, { type: 'update', result: fourCardResult(stream.input) }); await flush();
+    voice.options.onFinal('same', '架空の検証参加者'); await flush();
+    routes.set('/api/conversation/identify', async () => jsonResponse({ text: '良い天気ですね', targets: [], hasPersonMention: false }));
+    voice.options.onFinal('ordinary', '良い天気ですね'); await flush();
+    expect(requests('/api/conversation/identify')).toHaveLength(3); expect(streams).toHaveLength(1);
+    expect(stream.signal.aborted).toBe(false); expect(element('fact').textContent).toBe('架空の速報1です。');
+    expect(element('status').textContent).toContain('速報・追加調査中'); expect(devices.g2!.stopAudio).not.toHaveBeenCalled();
+    pushResearchEvent(stream.body, { type: 'result', result: fourCardResult(stream.input, '最終', 'EVIDENCE_VERIFIED') }); stream.body.close(); await flush();
+    expect(element('fact').textContent).toBe('架空の最終1です。');
+  });
+
+  it('switches to a new spoken person before enrichment finishes and rejects old updates and the old final result', async () => {
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush(); click('conversation'); await flush();
+    const voice = devices.streaming!; voice.options.onFinal('first', '架空の検証参加者'); await flush();
+    const first = streams[0]!; pushResearchEvent(first.body, { type: 'update', result: fourCardResult(first.input) }); await flush();
+    routes.set('/api/conversation/identify', async () => jsonResponse({ text: '別の架空人物です', targets: [{ personName: '別の架空人物', companyName: '' }], hasPersonMention: true }));
+    voice.options.onFinal('new-person', '別の架空人物です'); await flush();
+    expect(streams).toHaveLength(2); expect(first.signal.aborted).toBe(true); expect(element('fact').textContent).toBe('未確認');
+    const next = streams[1]!;
+    expect(next.input.subjectRevision).toBeGreaterThan(first.input.subjectRevision);
+    expect(next.input.requestId).not.toBe(first.input.requestId);
+    pushResearchEvent(next.body, { type: 'update', result: fourCardResult(next.input, '次の人物') }); await flush();
+    devices.g2!.render.mockClear();
+    pushResearchEvent(first.body, { type: 'update', result: fourCardResult(first.input, '以前の人物') });
+    pushResearchEvent(first.body, { type: 'result', result: fourCardResult(first.input, '以前の人物', 'EVIDENCE_VERIFIED') }); first.body.close(); await flush();
+    expect(element('fact').textContent).toBe('架空の次の人物1です。');
+    expect(devices.g2!.render.mock.calls.some(([view]) => (view as GlassesView).content.includes('以前の人物'))).toBe(false);
+    pushResearchEvent(next.body, { type: 'result', result: fourCardResult(next.input, '次の人物', 'EVIDENCE_VERIFIED') }); next.body.close(); await flush();
+    expect(devices.streaming!.cancel).not.toHaveBeenCalled();
+  });
+
+  it.each(['instagram', 'facebook'] as const)('shows the %s source badge and the actual publication date on enriched cards', async platform => {
+    const streams = openResearchStreams();
+    await boot(); chooseLiveAndConsent(); click('connect'); await flush();
+    element<HTMLTextAreaElement>('text').value = '架空の検証参加者'; click('research'); await flush();
+    const stream = streams[0]!; pushResearchEvent(stream.body, { type: 'update', result: fourCardResult(stream.input) }); await flush();
+    const final = fourCardResult(stream.input, 'SNS資料', 'EVIDENCE_VERIFIED');
+    const source = final.sources[0]!;
+    source.kind = platform; source.topic = platform; final.cards[0]!.topic = platform;
+    source.url = `https://www.${platform}.com/${platform === 'instagram' ? 'p/fixture-post' : 'fixture-person/posts/123'}`;
+    source.socialPost = { platform, authorHandle: 'fixture-person', profileUrl: `https://www.${platform}.com/fixture-person`,
+      identitySourceUrl: 'https://example.invalid/verified-person', createdAt: '2025-06-26T07:51:26.000Z', text: final.cards[0]!.fact };
+    pushResearchEvent(stream.body, { type: 'result', result: final }); stream.body.close(); await flush();
+    const label = platform === 'instagram' ? 'Instagram' : 'Facebook';
+    expect(element('topic-0').querySelector('.topic-number')!.textContent).toContain(label);
+    expect(element('sources').querySelector('.source-topic')!.textContent).toContain(label);
+    expect(element('sources').querySelector('.source-post-date')!.textContent).toContain(new Date(source.socialPost.createdAt).toLocaleString('ja-JP'));
+    expect(element('sources').querySelector<HTMLAnchorElement>('a')!.href).toBe(source.url);
+    expect((devices.g2!.render.mock.calls.at(-1)![0] as GlassesView).content).toContain(label);
+    expect(element('status').textContent).not.toContain('追加調査中');
   });
 
   it('restores a remembered device without showing previous cards or starting work', async () => {

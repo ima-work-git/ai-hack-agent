@@ -73,6 +73,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     xEnabled: liveEnabled && !!providers.xEnabled,
     accessCodeRequired: accessCode.length > 0, version: '0.1.0',
   };
-  return { host, port, origin, accessCode, providers, budget, maximumCosts, sttMax, status, streamingApiKey, streamingModel, streamingAudioMaxPerMinute, personCorrection };
+  const social = { apiToken: env.APIFY_API_TOKEN || '', enabled: env.APIFY_ENABLED === 'true' };
+  return { host, port, origin, accessCode, providers, budget, maximumCosts, sttMax, status, streamingApiKey, streamingModel, streamingAudioMaxPerMinute, personCorrection, social };
 }
 export type AppConfig = ReturnType<typeof readConfig>;

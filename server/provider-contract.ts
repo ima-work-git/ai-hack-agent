@@ -15,6 +15,8 @@ export interface ResearchProvider {
   readonly mode: 'demo' | 'live';
   plan(input: ResearchInput, signal: AbortSignal): Promise<ProviderResult<PlanDecision>>;
   search(query: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>>;
+  searchRecent?(query: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>>;
+  searchArchive?(query: string, signal: AbortSignal): Promise<ProviderResult<SearchHit[]>>;
   fetchPage(hit: SearchHit, signal: AbortSignal): Promise<ProviderResult<EvidenceSource>>;
   assess(target: Target, sources: EvidenceSource[], signal: AbortSignal): Promise<ProviderResult<Assessment>>;
   transcribe?(bytes: Uint8Array, mimeType: string, signal: AbortSignal, context?: string): Promise<ProviderResult<string>>;

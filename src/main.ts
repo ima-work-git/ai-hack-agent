@@ -49,6 +49,8 @@ let cardIndex = 0;
 let lastInput: ResearchInput | null = null;
 let running = false;
 let controller: AbortController | null = null;
+let identifyController: AbortController | null = null;
+let identifyingRequest: { requestId: string; subjectRevision: number } | null = null;
 let expiresAt = 0;
 let connected = false;
 let recording = false;
@@ -108,8 +110,19 @@ function shortText(text: string, maximumWidth: number): string {
   return `${clipped}…`;
 }
 function topicLabel(card: Card): string {
-  const topic = card.topic ?? result?.sources.find(source => source.sourceId === card.sourceId)?.topic;
-  return topic === 'recent_x' ? '最近X' : topic === 'popular_x' ? '過去X' : topic === 'profile' ? '人物・会社' : '';
+  const source = result?.sources.find(source => source.sourceId === card.sourceId);
+  const topic: string | undefined = card.topic ?? source?.topic;
+  const kind: string | undefined = source?.kind;
+  return topic === 'instagram' || kind === 'instagram' ? 'Instagram'
+    : topic === 'facebook' || kind === 'facebook' ? 'Facebook'
+    : topic === 'recent_x' ? '最近X' : topic === 'popular_x' ? '過去X' : topic === 'profile' ? '人物・会社' : '';
+}
+function isProgressive(value: ResearchResult | null): boolean {
+  return value?.reasonCode === 'PROGRESSIVE_QUICK' || value?.reasonCode === 'PROGRESSIVE_ENRICHING';
+}
+function hasCurrentCards(): boolean {
+  return !!result && result.requestId === currentId && result.subjectRevision === revision &&
+    result.cards.some(card => card.requestId === currentId && card.subjectRevision === revision && Date.parse(card.expiresAt) > Date.now());
 }
 function renderBoard(cards: Card[]) {
   for (let index = 0; index < 4; index++) {
@@ -220,6 +233,10 @@ function renderCard() {
       scope.textContent = '過去の反響：全期間の検索候補から選定'; evidence.append(scope);
     }
   }
+  if (source.socialPost) {
+    const posted = document.createElement('p'); posted.className = 'source-post-date muted';
+    posted.textContent = `投稿：${new Date(source.socialPost.createdAt).toLocaleString('ja-JP')}`; evidence.append(posted);
+  }
   if (source.kind !== 'fixture' && /^https?:\/\//.test(source.url)) { const link = document.createElement('a'); link.href = source.url; link.textContent = '出典を開く ↗'; link.target = '_blank'; link.rel = 'noopener noreferrer'; evidence.append(link); }
   $('sources').append(evidence);
   const rows = Array.from({ length: 4 }, (_, index) => {
@@ -227,7 +244,7 @@ function renderCard() {
     const label = entry ? topicLabel(entry) : '';
     return entry ? `${index + 1}${label ? ` ${label}` : ''} 事:${(entry.displayFact || entry.fact).replace(/\s+/g, ' ')} 問:${(entry.displayQuestion || entry.suggestedQuestion).replace(/\s+/g, ' ')}` : `${index + 1} 事:未確認 問:—`;
   });
-  void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件`, rows.join('\n'), '事=事実 問=質問 / 原文はスマホ');
+  void sendView(`${result!.mode === 'demo' ? '[架空] ' : ''}${shortText(result!.target?.personName || '', 28)} ${cards.length}/4件${isProgressive(result) ? ' 速報・追加調査中' : ''}`, rows.join('\n'), '事=事実 問=質問 / 原文はスマホ');
 }
 function addTrace(event: TraceEvent) {
   if ($('trace').children.length >= 60) return;
@@ -237,8 +254,13 @@ function addTrace(event: TraceEvent) {
 }
 function showResult(value: ResearchResult) {
   const failure = value.status === 'failed' ? researchFailure({ code: value.reasonCode, message: value.message }) : undefined;
-  result = value; cardIndex = 0; status(failure ? `${failure.message} ${failure.action}` : value.message);
-  $('result-note').textContent = value.mode === 'demo' ? '架空の人物・固定資料によるデモです。表示の動作確認であり、実APIやG2実機の動作証明ではありません。' : failure ? `${failure.message} ${failure.action}` : value.message;
+  if (failure && hasCurrentCards() && !mustStopConversation({ code: value.reasonCode, message: value.message })) {
+    preserveCurrentCards({ code: value.reasonCode, message: value.message }); return;
+  }
+  clearResult(); result = value;
+  const message = isProgressive(value) ? `速報・追加調査中。${value.message}` : failure ? `${failure.message} ${failure.action}` : value.message;
+  status(message);
+  $('result-note').textContent = value.mode === 'demo' ? '架空の人物・固定資料によるデモです。表示の動作確認であり、実APIやG2実機の動作証明ではありません。' : message;
   $('metric-time').textContent = `${(value.usage.elapsedMs / 1000).toFixed(1)}秒`;
   $('metric-calls').textContent = `${value.usage.llm} / ${value.usage.searches} / ${value.usage.pages}`;
   $('metric-cost').textContent = value.mode === 'demo' ? '模擬' : value.usage.costKnown ? `$${value.usage.actualUsd?.toFixed(4)}` : `$${value.usage.reservedUsd.toFixed(3)}`;
@@ -257,11 +279,19 @@ function showResult(value: ResearchResult) {
   }
   renderCard();
 }
+function preserveCurrentCards(error: unknown): boolean {
+  if (!hasCurrentCards() || mustStopConversation(error)) return false;
+  const failure = researchFailure(error);
+  const message = `${failure.message} 確認済みの話題を表示しています。${conversationRunning ? '聞き取りは続いています。' : ''}`;
+  result = { ...result!, status: 'partial', reasonCode: 'PROGRESSIVE_ENRICHMENT_INTERRUPTED', message };
+  status(message); $('result-note').textContent = message; renderCard();
+  return true;
+}
 async function api(path: string, init: RequestInit = {}): Promise<Response> {
   const sentToken = token; const sentGeneration = authGeneration;
   const headers = new Headers(init.headers); if (sentToken) headers.set('Authorization', `Bearer ${sentToken}`);
   const response = await fetch(path, { ...init, headers, cache: 'no-store', credentials: 'same-origin' });
-  if (!response.ok) { const body = await response.json().catch(() => ({})); if (response.status === 401 && token === sentToken && authGeneration === sentGeneration) { token = ''; expiresAt = 0; controller?.abort(); controller = null; running = false; currentId = crypto.randomUUID(); newViewToken(); void stopRecording(false); clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = 'ログインの有効期限が切れました。再読み込みするか、利用コードで開始してください。'; } throw Object.assign(new Error(typeof body?.message === 'string' ? body.message : '処理できませんでした。接続・設定・入力を確認してください。'), { status: response.status, code: typeof body?.code === 'string' ? body.code : undefined }); }
+  if (!response.ok) { const body = await response.json().catch(() => ({})); if (response.status === 401 && token === sentToken && authGeneration === sentGeneration) { token = ''; expiresAt = 0; controller?.abort(); controller = null; identifyController?.abort(); identifyController = null; running = false; currentId = crypto.randomUUID(); newViewToken(); void stopRecording(false); clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = 'ログインの有効期限が切れました。再読み込みするか、利用コードで開始してください。'; } throw Object.assign(new Error(typeof body?.message === 'string' ? body.message : '処理できませんでした。接続・設定・入力を確認してください。'), { status: response.status, code: typeof body?.code === 'string' ? body.code : undefined }); }
   return response;
 }
 const json = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -342,29 +372,50 @@ async function research(selectedCandidateId?: string, preparedId?: string, activ
   if (running || recording && !activeConversationId || audioBusy || !token) return;
   $('resume-notice').classList.add('hidden');
   currentId = preparedId || crypto.randomUUID(); revision += 1; newViewToken(); clearResult();
+  if (activeConversationId) conversationRequestRevision = revision;
   $('trace').replaceChildren(); $('trace-empty').classList.remove('hidden');
   running = true; refreshControls(); controller = new AbortController(); const ownController = controller; const ownId = currentId;
-  const input: ResearchInput = { text, requestId: ownId, subjectRevision: revision, mode: $<HTMLSelectElement>('mode').value as 'demo' | 'live', scenario: $<HTMLSelectElement>('scenario').value as Scenario, ...(selectedCandidateId ? { selectedCandidateId } : {}), ...(activeConversationId ? { conversationId: activeConversationId } : {}) };
-  lastInput = input; status('公開情報を調べています…'); await sendView('これで誰でも雑談マスター', '公開情報を調査中…', '中止はスマートフォンから');
+  const ownRevision = revision; const ownView = viewToken;
+  const valid = () => currentId === ownId && revision === ownRevision && viewToken === ownView && !ownController.signal.aborted;
+  const input: ResearchInput = { text, requestId: ownId, subjectRevision: ownRevision, mode: $<HTMLSelectElement>('mode').value as 'demo' | 'live', scenario: $<HTMLSelectElement>('scenario').value as Scenario, ...(selectedCandidateId ? { selectedCandidateId } : {}), ...(activeConversationId ? { conversationId: activeConversationId } : {}) };
+  lastInput = input; status('公開情報を調べています…');
   let gotResult = false;
   try {
+    await sendView('これで誰でも雑談マスター', '公開情報を調査中…', '中止はスマートフォンから');
+    if (!valid()) return;
     const response = await api('/api/research', { ...json(input), signal: ownController.signal });
+    if (!valid()) { await response.body?.cancel(); return; }
     const reader = response.body!.getReader(); const decoder = new TextDecoder(); let buffered = ''; let bytes = 0;
     while (true) {
       const chunk = await reader.read(); if (chunk.done) break;
-      if (currentId !== ownId || ownController.signal.aborted) { await reader.cancel(); break; }
+      if (!valid()) { await reader.cancel(); break; }
       bytes += chunk.value.length; if (bytes > 1_000_000) { await reader.cancel(); throw new Error('応答のサイズが上限を超えました。'); }
       buffered += decoder.decode(chunk.value, { stream: true });
       const lines = buffered.split('\n'); buffered = lines.pop()!;
       for (const line of lines) {
+        if (!valid()) break;
         if (!line.trim()) continue; const message = JSON.parse(line);
         if (message.type === 'trace') addTrace(message.event);
-        else if (message.type === 'result') { const parsed = parseResearchResult(message.result); if (parsed.requestId === ownId && parsed.subjectRevision === revision) { gotResult = true; showResult(parsed); } }
+        else if (message.type === 'result' || message.type === 'update') {
+          const parsed = parseResearchResult(message.result);
+          if (parsed.requestId === ownId && parsed.subjectRevision === ownRevision && valid()) {
+            if (message.type === 'result') gotResult = true;
+            showResult(parsed);
+          }
+        }
         else if (message.type === 'error') throw Object.assign(new Error(message.message), { code: typeof message.code === 'string' ? message.code : undefined });
       }
     }
-    if (!gotResult && !ownController.signal.aborted) throw new Error('接続が中断されました。再調査してください。');
-  } catch (error) { if (currentId === ownId && !ownController.signal.aborted) { if (activeConversationId) { if (preparedId) throw error; if (mustStopConversation(error)) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話の調査を続けられませんでした。'); } else await waitForNextUtterance(error); return; } const failure = researchFailure(error); status(`${failure.message} ${failure.action}`, true); await sendView('これで誰でも雑談マスター', failure.message, failure.action); } }
+    if (!gotResult && valid()) throw new Error('接続が中断されました。再調査してください。');
+    if (activeConversationId && valid() && result?.requestId === ownId) {
+      if (result.status === 'awaiting_confirmation') {
+        conversationLastKey = ''; conversationLastAt = 0;
+        status('聞き取りを続けています。名前や所属を言い直すか、候補を選んでください。「聞き直す」で対象をリセットできます。');
+      }
+      if (mustStopConversation({ code: result.reasonCode, message: result.message })) throw Object.assign(new Error(result.message), { code: result.reasonCode });
+      if (result.status === 'failed') await waitForNextUtterance({ code: result.reasonCode, message: result.message });
+    }
+  } catch (error) { if (valid()) { if (preserveCurrentCards(error)) return; if (activeConversationId) { if (mustStopConversation(error)) { await stopRecording(false); reportVoiceError(error instanceof Error ? error.message : '会話の調査を続けられませんでした。'); } else await waitForNextUtterance(error); return; } const failure = researchFailure(error); status(`${failure.message} ${failure.action}`, true); await sendView('これで誰でも雑談マスター', failure.message, failure.action); } }
   finally { if (controller === ownController) { running = false; controller = null; refreshControls(); } }
 }
 async function cancel() {
@@ -392,13 +443,16 @@ const phone = new PhoneAudio({ onAudio: acceptAudio, onStopped: reason => { if (
 function abortConversation() {
   const wasActive = conversationRunning;
   const group = conversationId;
+  const activeRequest = running ? { requestId: currentId, subjectRevision: conversationRequestRevision || revision }
+    : identifyingRequest ?? { requestId: currentId, subjectRevision: conversationRequestRevision || Math.max(1, revision + 1) };
   conversationSubjectGeneration++; transcriptDrainId++; identifyingTranscript = false; resettingConversation = false; ignoredTranscriptItems.clear();
+  identifyController?.abort(); identifyController = null; identifyingRequest = null;
   keepaliveController?.abort(); keepaliveController = null;
   const stream = conversation; conversation = null; conversationRunning = false; conversationId = ''; pendingTranscript = null; partialTranscripts.clear(); completedTranscript = ''; stream?.cancel();
   if (wasActive) setVoicePhase('stopped');
   if (group && token) {
     controller?.abort(); controller = null; running = false;
-    void api('/api/cancel', json({ requestId: currentId, subjectRevision: conversationRequestRevision || Math.max(1, revision + 1), conversationId: group })).catch(() => {});
+    void api('/api/cancel', json({ ...activeRequest, conversationId: group })).catch(() => {});
   }
 }
 function mustStopConversation(error: unknown): boolean {
@@ -443,6 +497,7 @@ function researchFailure(error: unknown): { message: string; action: string } {
 async function waitForNextUtterance(error: unknown) {
   const failure = researchFailure(error);
   conversationLastKey = ''; conversationLastAt = 0;
+  if (preserveCurrentCards(error)) return;
   newViewToken(); clearResult();
   status(`${failure.message} 聞き取りは続いています。${failure.action}`);
   // The footer shows live microphone status during a conversation; keep the
@@ -451,12 +506,13 @@ async function waitForNextUtterance(error: unknown) {
 }
 async function processConversationTranscript(text: string, generation: number) {
   const subjectGeneration = conversationSubjectGeneration;
-  const valid = () => subjectGeneration === conversationSubjectGeneration && !resettingConversation && generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
+  const own = new AbortController();
+  const valid = () => !own.signal.aborted && subjectGeneration === conversationSubjectGeneration && !resettingConversation && generation === audioGeneration && conversationRunning && !!token && !document.hidden && $<HTMLInputElement>('consent').checked ;
   if (!valid()) return;
-  const id = crypto.randomUUID(); currentId = id; conversationRequestRevision = revision + 1;
-  const own = new AbortController(); controller = own; audioBusy = true; refreshControls();
+  const id = crypto.randomUUID(); const identifyRevision = revision + 1;
+  identifyController = own; identifyingRequest = { requestId: id, subjectRevision: identifyRevision }; audioBusy = true; refreshControls();
   try {
-    const response = await api('/api/conversation/identify', { ...json({ text, requestId: id, subjectRevision: conversationRequestRevision, conversationId }), signal: own.signal });
+    const response = await api('/api/conversation/identify', { ...json({ text, requestId: id, subjectRevision: identifyRevision, conversationId }), signal: own.signal });
     const data = await response.json(); if (!valid()) return;
     $<HTMLTextAreaElement>('text').value = typeof data.text === 'string' ? data.text : '';
     const parsed = TargetSchema.array().max(3).safeParse(data.targets);
@@ -471,29 +527,27 @@ async function processConversationTranscript(text: string, generation: number) {
     if (targets.length !== 1) {
       if (targets.length > 1 || data.hasPersonMention !== false || correctionNotice) {
         conversationLastKey = ''; conversationLastAt = 0;
+        controller?.abort(); controller = null; running = false;
+        currentId = id;
         newViewToken(); clearResult();
         await sendView('人物を確認', correctionNotice || (targets.length > 1 ? '複数の人物が出ています。' : '人物名や所属などを教えてください。'), '断定せず、言い直しを待っています');
+        if (!valid()) return;
       }
-      status(correctionNotice || (targets.length > 1 ? '複数の人物が出ています。調べたい人物を一人ずつ話してください。' : '聞き取り中です。人物名が出たら公開情報を調べます。'));
+      if (!isProgressive(result)) status(correctionNotice || (targets.length > 1 ? '複数の人物が出ています。調べたい人物を一人ずつ話してください。' : '聞き取り中です。人物名が出たら公開情報を調べます。'));
       return;
     }
     const target = verifiedAliasForTarget(targets[0]!)?.target ?? targets[0]!;
     const key = `${target.companyName}|${target.personName}`.normalize('NFKC').replace(/\s+/g, '').toLowerCase();
-    if (conversationLastKey === key && Date.now() - conversationLastAt < (result?.cards.length ? 120_000 : 30_000)) {
-      status(`${target.personName}さんの話題を表示しながら聞き取り中です。対象が変わると調べ直します。`); return;
+    if (conversationLastKey === key && (running || Date.now() - conversationLastAt < (result?.cards.length ? 120_000 : 30_000))) {
+      if (!isProgressive(result)) status(`${target.personName}さんの話題を表示しながら聞き取り中です。対象が変わると調べ直します。`); return;
     }
     conversationLastKey = key; conversationLastAt = Date.now();
     $<HTMLTextAreaElement>('text').value = `人物の候補：氏名「${target.personName}」${target.companyName ? `、会社名「${target.companyName}」` : '、所属は未指定'}。本人の公開プロフィールで確認してください。直近の発話：${data.text}`;
-    audioBusy = false; if (controller === own) controller = null;
-    await research(undefined, id, conversationId);
-    if (!valid()) return;
-    if (result?.status === 'awaiting_confirmation') {
-      conversationLastKey = ''; conversationLastAt = 0;
-      status('聞き取りを続けています。名前や所属を言い直すか、候補を選んでください。「聞き直す」で対象をリセットできます。');
-    }
-    if (result && mustStopConversation({ code: result.reasonCode, message: result.message })) throw Object.assign(new Error(result.message), { code: result.reasonCode });
-    if (result?.status === 'failed') await waitForNextUtterance({ code: result.reasonCode, message: result.message });
-  } finally { if (controller === own) controller = null; if (subjectGeneration === conversationSubjectGeneration && generation === audioGeneration) audioBusy = false; refreshControls(); }
+    controller?.abort(); controller = null; running = false; audioBusy = false;
+    // Recognition and identification continue while the current person's
+    // additional sources load. Only a different/ambiguous person invalidates it.
+    void research(undefined, id, conversationId);
+  } finally { if (identifyController === own) { identifyController = null; identifyingRequest = null; } if (subjectGeneration === conversationSubjectGeneration && generation === audioGeneration) audioBusy = false; refreshControls(); }
 }
 async function drainTranscripts(generation: number) {
   if (identifyingTranscript || resettingConversation) return;
@@ -536,6 +590,7 @@ async function retryConversation() {
   if (pendingTranscript) ignoredTranscriptItems.add(pendingTranscript.itemId);
   while (ignoredTranscriptItems.size > 64) ignoredTranscriptItems.delete(ignoredTranscriptItems.values().next().value!);
   pendingTranscript = null; partialTranscripts.clear(); completedTranscript = ''; voicePreview = '';
+  identifyController?.abort(); identifyController = null; identifyingRequest = null;
   controller?.abort(); controller = null; running = false; audioBusy = true;
   conversationLastKey = ''; conversationLastAt = 0; currentId = crypto.randomUUID(); revision++;
   newViewToken(); clearResult(); $('correction-hint').textContent = ''; $('correction-hint').classList.add('hidden'); lastInput = null; $<HTMLTextAreaElement>('text').value = '';

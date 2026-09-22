@@ -14,7 +14,7 @@ export const ResearchInputSchema = z.object({
   conversationId: z.string().uuid().optional(),
 }).strict();
 export type ResearchInput = z.infer<typeof ResearchInputSchema>;
-export const TopicSchema = z.enum(['recent_x', 'popular_x', 'profile']);
+export const TopicSchema = z.enum(['recent_x', 'popular_x', 'profile', 'instagram', 'facebook']);
 export type CardTopic = z.infer<typeof TopicSchema>;
 export const XPostSchema = z.object({
   id: z.string().regex(/^\d{1,25}$/), authorId: z.string().regex(/^\d{1,25}$/), username: z.string().regex(/^[A-Za-z0-9_]{1,15}$/),
@@ -23,13 +23,18 @@ export const XPostSchema = z.object({
   selectionScope: z.literal('full_archive_sample').optional(),
 }).strict();
 export type XPost = z.infer<typeof XPostSchema>;
+export const SocialPostSchema = z.object({
+  platform: z.enum(['instagram', 'facebook']), authorHandle: z.string().min(1).max(100),
+  profileUrl: z.url().max(2048), identitySourceUrl: z.url().max(2048),
+  createdAt: z.iso.datetime(), text: z.string().min(1).max(30000),
+}).strict();
 export const SearchHitSchema = z.object({ url: z.url().max(2048), title: z.string().max(400), snippet: z.string().max(3000).optional(), topic: TopicSchema.optional() }).strict();
 export type SearchHit = z.infer<typeof SearchHitSchema>;
 export const EvidenceSourceSchema = z.object({
   sourceId: z.string().min(1).max(100), url: z.url().max(2048), title: z.string().max(400),
   retrievedAt: z.iso.datetime(), text: z.string().max(40000),
-  kind: z.enum(['web', 'x', 'fixture']),
-  topic: TopicSchema.optional(), xPost: XPostSchema.optional(),
+  kind: z.enum(['web', 'x', 'fixture', 'instagram', 'facebook']),
+  topic: TopicSchema.optional(), xPost: XPostSchema.optional(), socialPost: SocialPostSchema.optional(),
 }).strict();
 export type EvidenceSource = z.infer<typeof EvidenceSourceSchema>;
 export const CandidateSchema = z.object({ id: z.string().min(1).max(80), personName: z.string().trim().min(1).max(100), companyName: z.string().trim().max(160), reason: z.string().max(400), sourceIds: z.array(z.string()).max(4) }).strict();
