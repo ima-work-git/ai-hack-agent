@@ -2,6 +2,7 @@ import './style.css';
 import { PersonHistory, type PersonHistoryEntry } from './person-history.ts';
 import { ResearchInputSchema, ResearchResultSchema, type Card, type EvidenceSource, type ResearchInput, type ResearchResult, type RuntimeStatus, type TraceEvent, type Scenario } from './shared/contracts.ts';
 import { G2Runtime, type G2Status, type GlassesView } from './integrations/g2-runtime.ts';
+import { GlassesViewQueue } from './integrations/glasses-view-queue.ts';
 import { GlassesMirrorPublisher } from './glasses-mirror.ts';
 import { PhoneAudio } from './phone-audio.ts';
 import { StreamingAudio } from './streaming-audio.ts';
@@ -39,7 +40,7 @@ app.innerHTML = `
 <div class="controls"><button id="conversation" disabled>会話モードを開始</button><button id="retry-listening" disabled>聞き直す</button><button id="lock-person" disabled>この人物で固定</button><button id="record" disabled>短く録音して調べる</button><span class="muted" id="audio-hint">音声入力は実APIの設定後に使えます</span></div>
 <p class="muted" id="person-state" role="status">G2：下スクロールで出典、質問の上スクロールで聞き直しを確認。1回で実行・2回で取消。質問の2回で人物一覧。固定はスマホで操作。</p><div class="controls"><button id="research" class="primary">調査を始める →</button><button id="cancel" disabled>中止</button><button id="end" class="danger">終了して削除</button></div><p class="muted">「終了して削除」で、この端末のログインの記憶も解除します。</p><p class="status" id="status" role="status" aria-live="polite">架空の会話を入力すると、調査の流れを体験できます。</p><section id="search-panel" class="search-panel hidden" aria-label="検索キーワード"><h3>検索キーワード</h3><p id="current-search" role="status"></p><p class="muted">別候補を選ぶと、今の調査を止めてその語で調べ直します。候補は本人確認済みという意味ではありません。</p><div id="search-choices" class="candidates"></div></section><p class="status hidden" id="correction-hint" role="status"></p><div id="candidates" class="candidates"></div>
 </section><section class="panel"><div class="section-head"><h2>エージェントの判断</h2><span class="section-number">02 / PROCESS</span></div><p id="trace-empty" class="empty-trace">調査中の判断と復旧の記録がここに表示されます。</p><ol id="trace" class="trace" aria-label="調査の処理履歴"></ol><details><summary>実APIの設定状況</summary><p class="muted" id="configuration"></p><p class="muted">APIキーと費用上限はサーバー側で設定します。</p></details></section></div>
-<div><section class="panel people-panel" id="people-panel" tabindex="-1" aria-label="認識した人物"><div class="section-head"><h2>認識した人物</h2><span id="people-count" class="section-number">0人</span></div><p class="muted">会話中はこの一覧に人物を順に追加します。選んだときだけ、その人の質問を開きます。未確認の候補は本人確認済みではありません。</p><p id="people-empty" class="muted">会話に人物が出てくると、ここに追加されます。</p><ol id="people-list" class="people-list"></ol><div class="controls"><button id="show-people">人物一覧へ戻る</button><button id="show-latest">最新の調査を表示</button></div><p class="muted">G2：質問で2回→人物一覧。上下で選択、1回で開く。</p></section><div class="section-head"><h2>調査結果と質問 · 4件一覧</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><section class="hud" aria-label="4件の調査結果と質問"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="topic-board" id="card-board">${BOARD_MARKUP}</div><div class="hud-foot"><span id="hud-source">各カードを押すと原文・出典を表示</span><span id="hud-expiry">0 / 4件確認</span></div></section><nav class="card-nav" aria-label="出典詳細の選択"><button id="previous" aria-label="前の出典" disabled>← 前の出典</button><span id="card-count">0 / 0</span><button id="next" aria-label="次の出典" disabled>次の出典 →</button></nav>
+<div><section class="panel people-panel" id="people-panel" tabindex="-1" aria-label="認識した人物"><div class="section-head"><h2>認識した人物</h2><span id="people-count" class="section-number">0人</span></div><p class="muted">会話中はこの一覧に人物を順に追加します。選んだときだけ、その人の質問を開きます。未確認の候補は本人確認済みではありません。</p><p id="people-empty" class="muted">会話に人物が出てくると、ここに追加されます。</p><ol id="people-list" class="people-list"></ol><div class="controls"><button id="show-people">人物一覧へ戻る</button><button id="show-latest">最新の調査を表示</button></div><p class="muted">G2：質問で2回→人物一覧。上下で選択、1回で開く。</p></section><div class="section-head"><h2>調査結果と質問 · 4件一覧</h2><span class="section-number">03 / INSIGHT</span></div><div class="device"><span class="dot" id="device-dot"></span><span id="device-status">Even G2 · 画面プレビュー</span></div><p id="mirror-status" class="muted" role="status">PC同期：グラスの接続待ち</p><section class="hud" aria-label="4件の調査結果と質問"><div class="hud-top"><span id="hud-mode">DEMO / FICTIONAL DATA</span><span id="hud-target">WAITING</span></div><div class="topic-board" id="card-board">${BOARD_MARKUP}</div><div class="hud-foot"><span id="hud-source">各カードを押すと原文・出典を表示</span><span id="hud-expiry">0 / 4件確認</span></div></section><nav class="card-nav" aria-label="出典詳細の選択"><button id="previous" aria-label="前の出典" disabled>← 前の出典</button><span id="card-count">0 / 0</span><button id="next" aria-label="次の出典" disabled>次の出典 →</button></nav>
 <div class="notice" id="result-note">体験デモでは外部APIに通信せず、架空の人物・会社の固定資料を使います。</div><div class="metrics"><div class="metric"><strong id="metric-time">—</strong><span>調査にかかった時間</span></div><div class="metric"><strong id="metric-calls">—</strong><span>AI / 検索 / 本文</span></div><div class="metric"><strong id="metric-cost">—</strong><span id="cost-label">実費は未計測</span></div></div><section class="panel evidence-panel" id="evidence-panel" tabindex="-1"><div class="section-head"><h2>情報の根拠</h2><span class="section-number">04 / EVIDENCE</span></div><p class="muted" id="source-empty">本文の引用・出典・取得時刻を、カードごとに確認できます。</p><div id="sources"></div></section></div></div></main>
 <footer class="footer"><span>AI HACK 2026 · 業務を自律化するAIエージェント</span><span>人の確認が必要なときは、立ち止まる。</span></footer>`;
 
@@ -112,6 +113,8 @@ let conversationRequestRevision = 0;
 let conversationLastKey = '';
 let conversationLastAt = 0;
 let g2: G2Runtime;
+const glassesViewQueue = new GlassesViewQueue((view, currentToken) => g2.render(view, currentToken),
+  currentToken => currentToken === viewToken && connected && !document.hidden && !pageLeaving);
 type VoicePhase = 'off' | 'connecting' | 'listening' | 'paused' | 'stopped' | 'error';
 let voicePhase: VoicePhase = 'off';
 let voicePreview = '';
@@ -121,6 +124,7 @@ const G2_REOPEN_HELP = 'Evenアプリでこの画面を閉じ、同じQRコー�
 let voiceDisplayTimer: ReturnType<typeof setTimeout> | undefined;
 const emptyGlassesView = (): GlassesView => ({ header: 'これで誰でも雑談マスター', content: '会話を待っています', footer: 'マイクは停止中' });
 let glassesView = emptyGlassesView();
+let queuedGlassesBody = '';
 
 const status = (text: string, error = false) => { $('status').textContent = text; $('status').classList.toggle('error', error); };
 function refreshControls() {
@@ -153,7 +157,7 @@ function newViewToken() {
     if (pendingNavigation) pendingNavigation.view = viewToken;
     if (pendingAudioAction) pendingAudioAction.view = viewToken;
   }
-  pendingSearchChoice = null; g2?.invalidateViews(viewToken);
+  pendingSearchChoice = null; queuedGlassesBody = ''; glassesViewQueue.invalidate(); g2?.invalidateViews(viewToken);
 }
 // Count wide characters conservatively and preserve complete Unicode characters.
 function shortText(text: string, maximumWidth: number): string {
@@ -442,7 +446,14 @@ async function renderGlassesView() {
   if (pendingAudioAction) footer = `${pendingAudioAction.action === 'retry' ? '人物を聞き直す' : '音声を再開する'}？ 1回=実行 2回=そのまま`;
   else if (pendingNavigation) footer = `${pendingNavigation.page === -1 ? '質問に戻る' : '出典へ進む'}？ 1回=進む 2回=そのまま`;
   else if (pendingSearchChoice) footer = '候補を選ぶ？ 1回=選ぶ 2回=そのまま';
-  await g2.render({ ...glassesView, footer }, viewToken);
+  const body = JSON.stringify([glassesView.header, glassesView.content, glassesView.textSize]);
+  if (queuedGlassesBody && queuedGlassesBody !== body) {
+    // Navigation/evidence changes cancel old content immediately; ASR-only
+    // footer changes wait for the current acknowledged native display.
+    glassesViewQueue.invalidate(); g2.invalidateViews(viewToken);
+  }
+  queuedGlassesBody = body;
+  await glassesViewQueue.enqueue({ ...glassesView, footer }, viewToken);
 }
 function queueVoiceDisplay(immediate = false) {
   if (immediate) { clearTimeout(voiceDisplayTimer); voiceDisplayTimer = undefined; void renderGlassesView(); return; }
@@ -823,7 +834,8 @@ function acceptAudio(chunk: Uint8Array) {
   if (!recording || audioBytes + chunk.length > 960_000) return;
   audioChunks.push(chunk.slice()); audioBytes += chunk.length;
 }
-const glassesMirror = new GlassesMirrorPublisher(() => token);
+const glassesMirror = new GlassesMirrorPublisher(() => token, fetch,
+  message => { $('mirror-status').textContent = message; });
 g2 = new G2Runtime({ enableImageText: true, onStatus: g2Status, onAudio: acceptAudio, onDisplay: view => glassesMirror.display(view), onAction: action => {
   if (action === 'next') navigateGlassesSource(1);
   else if (action === 'previous') navigateGlassesSource(-1);
@@ -1272,7 +1284,7 @@ document.addEventListener('visibilitychange', () => {
   }
   else if (!token && qrLoginTicket && runtimeStatus && !authBusy && !pageLeaving) { void redeemQrLogin(); }
 });
-window.addEventListener('pagehide', () => { pageLeaving = true; qrLoginTicket = ''; abortConversation(); clearTimeout(voiceDisplayTimer); voiceDisplayTimer = undefined; voicePreview = ''; authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
+window.addEventListener('pagehide', () => { pageLeaving = true; glassesViewQueue.invalidate(); qrLoginTicket = ''; abortConversation(); clearTimeout(voiceDisplayTimer); voiceDisplayTimer = undefined; voicePreview = ''; authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
 setInterval(() => { void keepConversationAlive(); }, 60_000);
 setInterval(() => { if (result?.cards.some(card => Date.parse(card.expiresAt) <= Date.now())) renderCard(); if (token && expiresAt > 0 && expiresAt <= Date.now()) void expireSession(); }, 15_000);
 try {

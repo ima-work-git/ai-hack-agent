@@ -3,6 +3,29 @@ import { GlassesMirrorPublisher } from '../src/glasses-mirror';
 
 afterEach(() => { vi.useRealTimers(); });
 describe('glasses mirror publisher', () => {
+  it('reports phone connectivity before the first acknowledged display', async () => {
+    vi.useFakeTimers();
+    const notify = vi.fn();
+    const send = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}'));
+    const publisher = new GlassesMirrorPublisher(() => 'session', send, notify);
+    publisher.updateStatus({ state: 'connected' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(JSON.parse(send.mock.calls[0]![1]!.body as string)).toEqual({ view: null, state: 'connected' });
+    expect(notify).toHaveBeenLastCalledWith('PC同期：接続済み・グラスの表示受付を待っています');
+    publisher.dispose();
+  });
+  it('surfaces a rejected upload and recovers on the heartbeat', async () => {
+    vi.useFakeTimers();
+    const notify = vi.fn();
+    const send = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response('{}', { status: 401 })).mockResolvedValue(new Response('{}'));
+    const publisher = new GlassesMirrorPublisher(() => 'session', send, notify);
+    publisher.display({ header: 'header', content: 'content', footer: 'footer' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(notify.mock.lastCall?.[0]).toContain('認証が切れました');
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(notify).toHaveBeenLastCalledWith('PC同期：グラスの画面を送信済み');
+    publisher.dispose();
+  });
   it('coalesces queued frames and never includes audio or a previous login frame', async () => {
     vi.useFakeTimers();
     let token = 'first-session';
