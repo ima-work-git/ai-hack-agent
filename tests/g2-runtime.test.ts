@@ -31,6 +31,19 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
   beforeEach(() => { vi.useFakeTimers() })
   afterEach(() => { vi.useRealTimers() })
 
+  it('mirrors only fully acknowledged views and isolates a failing mirror callback', async () => {
+    const { bridge } = fakeBridge()
+    const onDisplay = vi.fn(() => { throw new Error('mirror offline') })
+    const runtime = new G2Runtime({ bridge, onDisplay })
+    await runtime.connect()
+    expect(await runtime.render(view('confirmed'))).toBe(true)
+    expect(onDisplay).toHaveBeenCalledWith({ ...view('confirmed'), textSize: undefined })
+    vi.mocked(bridge.textContainerUpgrade).mockResolvedValueOnce(false)
+    expect(await runtime.render(view('rejected'))).toBe(false)
+    expect(onDisplay).toHaveBeenCalledTimes(1)
+    await runtime.dispose()
+  })
+
   it('does not call the bridge in an ordinary browser or start recording during connection', async () => {
     const getBridge = vi.fn()
     const unavailable = new G2Runtime({ getBridge, isHostAvailable: () => false })

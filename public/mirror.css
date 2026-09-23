@@ -1,0 +1,28 @@
+:root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; color: #eaf0ee; background: #0d1312; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 300px; }
+main { width: min(1184px, 100%); margin: 0 auto; padding: 42px 28px 32px; }
+.eyebrow { color: #8ba79c; font-size: 12px; letter-spacing: .13em; margin: 0 0 12px; }
+h1 { font-size: clamp(25px, 3vw, 34px); font-weight: 650; letter-spacing: -.025em; margin: 0 0 10px; }
+.description { color: #aabbb3; margin: 0 0 28px; font-size: 15px; }
+.viewer { background: #000; border: 1px solid #2a3b33; border-radius: 18px; overflow: hidden; box-shadow: 0 20px 70px #0005; }
+.toolbar, .viewer-bottom { min-height: 54px; padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; background: #141e19; font-size: 13px; color: #9db5a8; }
+.toolbar { border-bottom: 1px solid #263c30; }
+.viewer-bottom { border-top: 1px solid #263c30; }
+.status { color: #c4d3cb; display: flex; align-items: center; gap: 9px; }
+.status::before { content: ""; width: 8px; height: 8px; border-radius: 100%; background: #7c9488; flex: none; }
+.status.live { color: #a9f0b7; }
+.status.live::before { background: #82e998; box-shadow: 0 0 12px #82e99866; }
+.status.warning { color: #f5cc8c; }
+.status.warning::before { background: #f5cc8c; }
+.viewport { margin: 26px auto; width: calc(100% - 48px); aspect-ratio: 2 / 1; position: relative; overflow: hidden; }
+.screen { width: 576px; height: 288px; position: absolute; left: 0; top: 0; transform-origin: top left; color: #a5ff9c; background: #000; font-size: 20px; line-height: 24px; }
+.glass-header, .glass-content, .glass-footer { position: absolute; width: 576px; padding: 6px; white-space: pre-wrap; overflow-wrap: anywhere; overflow: hidden; margin: 0; }
+.glass-header { top: 0; height: 48px; border: 1px solid #263b22; border-radius: 4px; }
+.glass-content { top: 52px; height: 184px; border: 1px solid #263b22; border-radius: 4px; }
+.glass-footer { top: 240px; height: 48px; }
+#small-content { position: absolute; top: 66px; left: 0; width: 576px; height: 144px; }
+[hidden] { display: none !important; }
+.hint { color: #b4c5bb; font-size: 14px; line-height: 1.7; margin: 22px 2px 9px; }
+.disclaimer { color: #7f9689; font-size: 12px; line-height: 1.8; margin: 0 2px; }
+@media (max-width: 600px) { main { padding: 25px 14px; } .viewport { margin: 16px auto; width: calc(100% - 24px); } .toolbar, .viewer-bottom { padding: 12px; font-size: 11px; } }
