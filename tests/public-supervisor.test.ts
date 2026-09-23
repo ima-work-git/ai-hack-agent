@@ -7,7 +7,7 @@ import { PassThrough } from 'node:stream';
 import type { RequestOptions } from 'node:https';
 import type { IncomingHttpHeaders } from 'node:http';
 // @ts-expect-error Standalone Node supervisor intentionally has no build step.
-import { acquireLock, atomicPrivateWrite, bindLoopback, endpointRecord, extractTunnelOrigin, healthProbe, networkAvailable, PORTS, publishEndpoint, recoveryAction, replaceEnvOrigin, restartDelay, runGh, spawnOwned, stopOwnedChild, supervise, SupervisorError, updateEnvOrigin, validOrigin } from '../scripts/serve-public.mjs';
+import { acquireLock, atomicPrivateWrite, bindLoopback, endpointRecord, extractTunnelOrigin, healthProbe, networkAvailable, PORTS, publishEndpoint, recoveryAction, replaceEnvOrigin, resolveProbeIpv4, restartDelay, runGh, spawnOwned, stopOwnedChild, supervise, SupervisorError, updateEnvOrigin, validOrigin } from '../scripts/serve-public.mjs';
 
 const ORIGIN = 'https://fixture-chat-master.trycloudflare.com';
 const NEXT_ORIGIN = 'https://fixture-restarted.trycloudflare.com';
@@ -115,6 +115,96 @@ describe('health and recovery gates', () => {
     const pending = healthProbe(`${ORIGIN}/api/status`, { statusJson: true, fetchRequest });
     await vi.advanceTimersByTimeAsync(10_000);
     expect(await pending).toBe(false);
+  });
+});
+
+describe('bounded independent DNS after reconnect without network calls', () => {
+  const hostname = new URL(ORIGIN).hostname;
+  const resolver = () => ({ resolve4: vi.fn(), setServers: vi.fn(), cancel: vi.fn() });
+
+  it('keeps the configured DNS on success without querying public resolvers', async () => {
+    const primary = resolver(); primary.resolve4.mockResolvedValue(['104.16.230.132']);
+    const createResolver = vi.fn().mockReturnValue(primary);
+    expect(await resolveProbeIpv4(hostname, new AbortController().signal, { createResolver })).toEqual(['104.16.230.132']);
+    expect(createResolver).toHaveBeenCalledExactlyOnceWith({ timeout: 2000, tries: 2 });
+    expect(primary.resolve4).toHaveBeenCalledExactlyOnceWith(hostname);
+    expect(primary.setServers).not.toHaveBeenCalled(); expect(primary.cancel).not.toHaveBeenCalled();
+  });
+
+  it.each(['ENOTFOUND', 'EAI_AGAIN'])('uses one bounded independent lookup after configured DNS returns %s', async code => {
+    const primary = resolver(); const fallback = resolver();
+    primary.resolve4.mockRejectedValue(Object.assign(new Error('DNS failed'), { code }));
+    fallback.resolve4.mockResolvedValue(['104.16.230.132']);
+    const createResolver = vi.fn().mockReturnValueOnce(primary).mockReturnValueOnce(fallback);
+    const transport = probeTransport();
+    expect(await healthProbe(`${ORIGIN}/api/status`, {
+      statusJson: true, fetchRequest: async () => { throw dnsFailure(); }, request: transport.request,
+      resolve4: (name: string, signal: AbortSignal) => resolveProbeIpv4(name, signal, { createResolver }),
+    })).toBe(true);
+    expect(createResolver.mock.calls).toEqual([[{ timeout: 2000, tries: 2 }], [{ timeout: 1000, tries: 1 }]]);
+    expect(primary.setServers).not.toHaveBeenCalled();
+    expect(fallback.setServers).toHaveBeenCalledExactlyOnceWith(['1.1.1.1', '8.8.8.8']);
+    expect(fallback.resolve4).toHaveBeenCalledExactlyOnceWith(hostname);
+    expect(primary.cancel).not.toHaveBeenCalled(); expect(fallback.cancel).not.toHaveBeenCalled();
+    expect(transport.request.mock.calls[0]![0].hostname).toBe(hostname);
+  });
+
+  it.each(['ETIMEOUT', 'ESERVFAIL', 'ENODATA', 'ECONNREFUSED'])('does not fall back for configured DNS error %s', async code => {
+    const primary = resolver(); const failure = Object.assign(new Error('DNS failed'), { code });
+    primary.resolve4.mockRejectedValue(failure); const createResolver = vi.fn().mockReturnValue(primary);
+    await expect(resolveProbeIpv4(hostname, new AbortController().signal, { createResolver })).rejects.toBe(failure);
+    expect(createResolver).toHaveBeenCalledOnce();
+  });
+
+  it('cancels only the active lookup and never starts a fallback after cancellation', async () => {
+    const controller = new AbortController(); const primary = resolver();
+    primary.resolve4.mockImplementation(() => new Promise((_resolve, reject) => {
+      primary.cancel.mockImplementation(() => reject(Object.assign(new Error('cancelled'), { code: 'ENOTFOUND' })));
+    }));
+    const createResolver = vi.fn().mockReturnValue(primary);
+    const pending = resolveProbeIpv4(hostname, controller.signal, { createResolver });
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    controller.abort(); await rejected;
+    expect(primary.cancel).toHaveBeenCalledOnce(); expect(createResolver).toHaveBeenCalledOnce();
+    const preAborted = vi.fn();
+    await expect(resolveProbeIpv4(hostname, controller.signal, { createResolver: preAborted })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(preAborted).not.toHaveBeenCalled();
+  });
+
+  it('cancels a stalled independent lookup at the original ten-second probe deadline', async () => {
+    vi.useFakeTimers(); const primary = resolver(); const fallback = resolver();
+    primary.resolve4.mockRejectedValue(Object.assign(new Error('DNS failed'), { code: 'ENOTFOUND' }));
+    fallback.resolve4.mockImplementation(() => new Promise((_resolve, reject) => {
+      fallback.cancel.mockImplementation(() => reject(Object.assign(new Error('cancelled'), { code: 'ECANCELLED' })));
+    }));
+    const createResolver = vi.fn().mockReturnValueOnce(primary).mockReturnValueOnce(fallback);
+    const request = vi.fn(); let settled = false;
+    const pending = healthProbe(`${ORIGIN}/api/status`, {
+      statusJson: true, request,
+      fetchRequest: () => new Promise((_resolve, reject) => setTimeout(() => reject(dnsFailure()), 6000)),
+      resolve4: (name: string, signal: AbortSignal) => resolveProbeIpv4(name, signal, { createResolver }),
+    }).then((value: boolean) => { settled = true; return value; });
+    await vi.advanceTimersByTimeAsync(9999);
+    expect(settled).toBe(false); expect(fallback.resolve4).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await pending).toBe(false); expect(primary.cancel).not.toHaveBeenCalled();
+    expect(fallback.cancel).toHaveBeenCalledOnce(); expect(createResolver).toHaveBeenCalledTimes(2);
+    expect(request).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not retry an independent lookup failure or accept private answers through healthProbe', async () => {
+    for (const answer of [new Error('independent DNS failed'), ['127.0.0.1']]) {
+      const primary = resolver(); const fallback = resolver();
+      primary.resolve4.mockRejectedValue(Object.assign(new Error('DNS failed'), { code: 'EAI_AGAIN' }));
+      if (answer instanceof Error) fallback.resolve4.mockRejectedValue(answer);
+      else fallback.resolve4.mockResolvedValue(answer);
+      const createResolver = vi.fn().mockReturnValueOnce(primary).mockReturnValueOnce(fallback); const request = vi.fn();
+      expect(await healthProbe(`${ORIGIN}/api/status`, {
+        statusJson: true, fetchRequest: async () => { throw dnsFailure(); }, request,
+        resolve4: (name: string, signal: AbortSignal) => resolveProbeIpv4(name, signal, { createResolver }),
+      })).toBe(false);
+      expect(createResolver).toHaveBeenCalledTimes(2); expect(request).not.toHaveBeenCalled();
+    }
   });
 });
 
