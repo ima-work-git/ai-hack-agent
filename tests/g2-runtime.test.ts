@@ -31,6 +31,22 @@ describe('G2Runtime — REQ-001/005/008, T-01/02/06/10 (injected bridge, not har
   beforeEach(() => { vi.useFakeTimers() })
   afterEach(() => { vi.useRealTimers() })
 
+  it('allows slow initial bridge startup without lengthening microphone/control deadlines', async () => {
+    const { bridge } = fakeBridge()
+    vi.mocked(bridge.createStartUpPageContainer).mockImplementationOnce(async () => {
+      await new Promise(resolve => setTimeout(resolve, 3000)); return 0
+    })
+    const runtime = new G2Runtime({ bridge, connectionTimeoutMs: 10_000, timeoutMs: 2000 })
+    const connecting = runtime.connect()
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(await connecting).toBe(true)
+    vi.mocked(bridge.audioControl).mockImplementationOnce(() => new Promise(() => {}))
+    const recording = runtime.startAudio()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(await recording).toBe(false)
+    await runtime.dispose()
+  })
+
   it('mirrors only fully acknowledged views and isolates a failing mirror callback', async () => {
     const { bridge } = fakeBridge()
     const onDisplay = vi.fn(() => { throw new Error('mirror offline') })

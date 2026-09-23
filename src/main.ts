@@ -837,7 +837,7 @@ function acceptAudio(chunk: Uint8Array) {
 }
 const glassesMirror = new GlassesMirrorPublisher(() => token, fetch,
   message => { $('mirror-status').textContent = message; });
-g2 = new G2Runtime({ enableImageText: true, onStatus: g2Status, onAudio: acceptAudio, onDisplay: view => glassesMirror.display(view), onAction: action => {
+g2 = new G2Runtime({ enableImageText: true, connectionTimeoutMs: 10_000, onStatus: g2Status, onAudio: acceptAudio, onDisplay: view => glassesMirror.display(view), onAction: action => {
   if (action === 'next') navigateGlassesSource(1);
   else if (action === 'previous') navigateGlassesSource(-1);
   else if (action === 'primary') {

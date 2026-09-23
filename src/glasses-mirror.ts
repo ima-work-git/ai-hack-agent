@@ -46,6 +46,8 @@ export class GlassesMirrorPublisher {
     const timeout = setTimeout(() => controller.abort(), 6_000);
     const current = () => this.credential() === token && this.owner === token && this.frame !== null;
     const hasView = this.frame.view !== null;
+    const state = this.frame.state;
+    const reason = this.frame.reason;
     const report = (message: string) => { if (current()) { try { this.notify(message); } catch { /* UI diagnostics are best effort. */ } } };
     try {
       // Native WebView fetch must receive Window, never this publisher object.
@@ -55,7 +57,12 @@ export class GlassesMirrorPublisher {
       if (!response.ok) {
         report(response.status === 401 ? 'PC同期：認証が切れました。Even Appを閉じてQRを読み直してください。'
           : `PC同期：送信できませんでした（${response.status}）。自動で再試行します。`);
-      } else report(hasView ? 'PC同期：グラスの画面を送信済み' : 'PC同期：接続済み・グラスの表示受付を待っています');
+      } else report(hasView ? 'PC同期：グラスの画面を送信済み'
+        : reason === 'connect_timeout' ? 'PC同期：通信OK・G2接続が時間切れです。アプリ画面を閉じてQRを読み直してください。'
+        : ['error', 'disconnected', 'unavailable'].includes(state) ? 'PC同期：通信OK・G2の接続を確認してください'
+        : state === 'connecting' ? 'PC同期：通信OK・G2へ接続中'
+        : ['background', 'disposed'].includes(state) ? 'PC同期：通信OK・グラスの表示は停止中'
+        : 'PC同期：接続済み・グラスの表示受付を待っています');
     } catch { report('PC同期：通信待ち・自動で再試行します。音声認識は継続します。'); }
     finally {
       clearTimeout(timeout); this.sending = false;
