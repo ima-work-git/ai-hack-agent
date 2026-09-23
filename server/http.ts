@@ -19,6 +19,7 @@ import { resolvePersonTarget } from './person-resolver.ts';
 import { buildSearchCandidates, type SearchCandidate } from '../src/shared/search-candidates.ts';
 import { isTargetGroundedInTranscript } from '../src/shared/identity-aliases.ts';
 import { createSocialProvider, type SocialProvider } from './social-provider.ts';
+import { GlassesMirrorSchema, GlassesMirrorStore, isLocalMirrorReader } from './glasses-mirror.ts';
 
 interface ConversationWindow { revision: number; transcribed: boolean; researchStarted: boolean; target?: Target; query?: string }
 interface Conversation { id: string; expiresAt: number; dataExpiresAt: number; dataGeneration: number; companyClue: string; transcriptContext: string; finalTexts: string[]; searchCandidates: SearchCandidate[]; requests: Map<string, ConversationWindow> }
@@ -74,6 +75,7 @@ async function jsonBody(req: IncomingMessage): Promise<unknown> {
 export function createApiHandler(config: AppConfig, dependencies: HttpDependencies = {}) {
   const now = dependencies.now ?? Date.now;
   const store = dependencies.store ?? new SessionStore(config.budget.directory, now);
+  const glassesMirror = new GlassesMirrorStore(id => !!store.get(id), now);
   const deviceLogins = dependencies.deviceLogins ?? new DeviceLoginStore(config.budget.directory, config.accessCode, now);
   const reusableQr = new ReusableQrStore(config.budget.directory, config.accessCode, now);
   const budget = dependencies.budget ?? (config.status.liveEnabled ? new BudgetLedger(config.budget) : undefined);
@@ -122,6 +124,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   };
   const sweep = setInterval(() => {
     store.sweep();
+    glassesMirror.sweep();
     sweepQrTickets();
     for (const group of conversations.values()) pruneConversationData(group);
     for (const [sessionId, conversation] of conversations) if (conversation.expiresAt <= now() || !store.get(sessionId)) {
@@ -171,6 +174,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
   };
   const beginSession = (req: IncomingMessage) => {
     const previousId = sessionCookie(req);
+    if (previousId) glassesMirror.delete(previousId);
     if (previousId) dropConversation(previousId);
     if (previousId && store.get(previousId)?.running) {
       store.cancel(previousId); active.delete(previousId);
@@ -190,10 +194,15 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     try {
+      if (path === '/api/glasses-mirror' && req.method === 'GET') {
+        if (!isLocalMirrorReader(req, config.port)) throw new HttpError(403, 'PCのローカル画面から開いてください。');
+        sendJson(res, 200, { frame: glassesMirror.latest() }); return true;
+      }
       const origin = req.headers.origin;
       if (!req.headers.host || !hosts.has(req.headers.host.toLowerCase()) || origin && !origins.has(origin)) throw new HttpError(403, '許可されていない接続元です。');
-      if (origin) { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); res.setHeader('Access-Control-Allow-Credentials', 'true'); }
+      if (origin && path !== '/api/glasses-mirror') { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); res.setHeader('Access-Control-Allow-Credentials', 'true'); }
       if (req.method === 'OPTIONS') {
+        if (path === '/api/glasses-mirror') throw new HttpError(403, '許可されていない接続元です。');
         res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Request-Id, X-Subject-Revision, X-Conversation-Id' }); res.end(); return true;
       }
       if (req.method === 'GET' && path === '/api/status') { sendJson(res, 200, config.status); return true; }
@@ -247,13 +256,21 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
         deviceLogins.revoke(deviceCookie(req));
         const authorization = req.headers.authorization;
         const authenticated = authorization?.startsWith('Bearer ') ? store.authenticate(authorization.slice(7)) : null;
-        for (const id of new Set([sessionCookie(req), authenticated?.id])) if (id) { store.end(id); active.delete(id); dropConversation(id); }
+        for (const id of new Set([sessionCookie(req), authenticated?.id])) if (id) { store.end(id); active.delete(id); dropConversation(id); glassesMirror.delete(id); }
         res.setHeader('Set-Cookie', [cookie(''), rememberedCookie('')]);
         sendJson(res, 200, { ended: true }); return true;
       }
       const authorization = req.headers.authorization;
       const session = authorization?.startsWith('Bearer ') ? store.authenticate(authorization.slice(7)) : null;
       if (!session) throw new HttpError(401, '再ログインしてください。');
+      if (path === '/api/glasses-mirror' && req.method === 'POST') {
+        sameOrigin(req);
+        if (req.headers['sec-fetch-site'] === 'cross-site') throw new HttpError(403, '許可されていない接続元です。');
+        const frame = GlassesMirrorSchema.parse(await jsonBody(req));
+        if (!store.authenticate(authorization!.slice(7))) throw new HttpError(401, '再ログインしてください。');
+        glassesMirror.publish(session.id, frame);
+        sendJson(res, 200, { published: true }); return true;
+      }
       if (path === '/api/session/qr/reusable' && req.method === 'POST') {
         sameOrigin(req); rateLimit(req, 'code');
         const body = z.object({ expiresAt: z.iso.datetime(), accessCode: z.string().max(512).default('') }).strict().parse(await jsonBody(req));
@@ -405,7 +422,7 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       }
       if (req.method === 'DELETE' && path === '/api/session') {
         deviceLogins.revoke(deviceCookie(req));
-        store.end(session.id); active.delete(session.id); dropConversation(session.id);
+        store.end(session.id); active.delete(session.id); dropConversation(session.id); glassesMirror.delete(session.id);
         res.setHeader('Set-Cookie', [cookie(''), rememberedCookie('')]); sendJson(res, 200, { ended: true }); return true;
       }
       if (req.method === 'POST' && path === '/api/cancel') {
@@ -551,5 +568,5 @@ export function createApiHandler(config: AppConfig, dependencies: HttpDependenci
       return true;
     }
   }
-  return { handle, upgrade: relay.upgrade, close() { relay.close(); streamTickets.clear(); clearInterval(sweep); qrTickets.clear(); conversations.clear(); for (const work of identifying.values()) work.controller.abort(); identifying.clear(); for (const id of active.keys()) { const session = store.get(id); if (session) { session.interrupted = true; store.save(session); } } store.close(); active.clear(); } };
+  return { handle, upgrade: relay.upgrade, close() { relay.close(); glassesMirror.clear(); streamTickets.clear(); clearInterval(sweep); qrTickets.clear(); conversations.clear(); for (const work of identifying.values()) work.controller.abort(); identifying.clear(); for (const id of active.keys()) { const session = store.get(id); if (session) { session.interrupted = true; store.save(session); } } store.close(); active.clear(); } };
 }

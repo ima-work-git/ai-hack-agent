@@ -50,6 +50,8 @@ export interface G2RuntimeOptions {
   onStatus?: (status: G2Status) => void
   onAudio?: (chunk: Uint8Array) => void
   onAction?: (action: G2Action) => void
+  /** Latest fully acknowledged app view, not an optical screen capture. */
+  onDisplay?: (view: GlassesView) => void
   timeoutMs?: number
   /** Image transfer/layout only; microphone, text and connection keep timeoutMs. */
   imageTimeoutMs?: number
@@ -464,7 +466,12 @@ export class G2Runtime {
             break
           }
         }
-        job.resolve(success && this.current(job))
+        const accepted = success && this.current(job)
+        if (accepted) {
+          try { this.options.onDisplay?.({ ...job.view, textSize: this.imageMode ? 'small' : undefined }) }
+          catch { /* A mirror failure must never interrupt glasses or audio. */ }
+        }
+        job.resolve(accepted)
       }
     } finally {
       this.flushing = false

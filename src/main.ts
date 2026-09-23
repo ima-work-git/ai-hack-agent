@@ -2,6 +2,7 @@ import './style.css';
 import { PersonHistory, type PersonHistoryEntry } from './person-history.ts';
 import { ResearchInputSchema, ResearchResultSchema, type Card, type EvidenceSource, type ResearchInput, type ResearchResult, type RuntimeStatus, type TraceEvent, type Scenario } from './shared/contracts.ts';
 import { G2Runtime, type G2Status, type GlassesView } from './integrations/g2-runtime.ts';
+import { GlassesMirrorPublisher } from './glasses-mirror.ts';
 import { PhoneAudio } from './phone-audio.ts';
 import { StreamingAudio } from './streaming-audio.ts';
 import { verifiedAliasForTarget } from './shared/identity-aliases.ts';
@@ -776,6 +777,7 @@ async function cancel() {
   status('停止しました。遅れて届いた結果は表示しません。'); await sendView('これで誰でも雑談マスター', '調査を停止しました。', '入力待ち'); refreshControls();
 }
 function g2Status(state: G2Status) {
+  glassesMirror.updateStatus(state);
   if (state.recovery === 'reopen') g2NeedsReopen = true;
   connected = state.state === 'connected' || state.state === 'recording';
   const labels: Record<string, string> = { idle: '画面プレビュー', connecting: 'G2へ接続中', connected: 'G2接続受付済み', recording: 'G2で録音中', background: 'バックグラウンド・停止', disconnected: 'G2切断', unavailable: 'Evenアプリ内で接続してください', error: 'G2接続を確認してください', disposed: 'G2接続終了' };
@@ -821,7 +823,8 @@ function acceptAudio(chunk: Uint8Array) {
   if (!recording || audioBytes + chunk.length > 960_000) return;
   audioChunks.push(chunk.slice()); audioBytes += chunk.length;
 }
-g2 = new G2Runtime({ enableImageText: true, onStatus: g2Status, onAudio: acceptAudio, onAction: action => {
+const glassesMirror = new GlassesMirrorPublisher(() => token);
+g2 = new G2Runtime({ enableImageText: true, onStatus: g2Status, onAudio: acceptAudio, onDisplay: view => glassesMirror.display(view), onAction: action => {
   if (action === 'next') navigateGlassesSource(1);
   else if (action === 'previous') navigateGlassesSource(-1);
   else if (action === 'primary') {

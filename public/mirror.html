@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>グラスのライブ画面 | これで誰でも雑談マスター</title>
+    <link rel="stylesheet" href="/mirror.css">
+    <script src="/mirror.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header class="page-heading">
+        <p class="eyebrow">これで誰でも雑談マスター / EVEN G2</p>
+        <h1>グラスのライブ画面</h1>
+        <p class="description">グラスへ送信済みの画面を、ここに表示します。</p>
+      </header>
+      <section class="viewer" aria-label="グラス表示のプレビュー">
+        <div class="toolbar">
+          <span id="status" class="status" role="status">接続を確認しています</span>
+          <span id="updated">まだ受信していません</span>
+        </div>
+        <div id="viewport" class="viewport">
+          <div id="screen" class="screen">
+            <div id="glass-header" class="glass-header">グラスを待っています</div>
+            <div id="glass-content" class="glass-content">スマホからいつものQRで接続してください。
+グラスの表示がここにも届きます。</div>
+            <canvas id="small-content" width="576" height="144" hidden aria-hidden="true"></canvas>
+            <div id="glass-footer" class="glass-footer">この画面から音声認識は開始しません</div>
+          </div>
+        </div>
+        <div class="viewer-bottom">
+          <span id="device">スマホ・グラスからの受信待ち</span>
+          <span>約0.5秒ごとに更新</span>
+        </div>
+      </section>
+      <p id="hint" class="hint">スマホ側は会話モードを開いたままにしてください。</p>
+      <p class="disclaimer">実際の視界の映像ではありません。グラスへ送信した文字を再現しています。フォントやスクロール位置は実機と異なる場合があります。</p>
+    </main>
+  </body>
+</html>
