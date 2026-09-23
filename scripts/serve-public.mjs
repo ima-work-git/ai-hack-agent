@@ -165,15 +165,28 @@ function isDnsFailure(error) {
   return false;
 }
 
-async function resolveProbeIpv4(hostname, signal) {
-  signal.throwIfAborted();
-  // An independent resolver bypasses the OS getaddrinfo cache. Cancelling it
-  // cannot cancel another caller's DNS requests.
-  const resolver = new Resolver({ timeout: 2000, tries: 2 });
-  const onAbort = () => resolver.cancel();
-  signal.addEventListener('abort', onAbort, { once: true });
-  try { return await resolver.resolve4(hostname); }
-  finally { signal.removeEventListener('abort', onAbort); }
+export async function resolveProbeIpv4(hostname, signal, { createResolver = options => new Resolver(options) } = {}) {
+  const lookup = async servers => {
+    signal.throwIfAborted();
+    const resolver = createResolver(servers ? { timeout: 1000, tries: 1 } : { timeout: 2000, tries: 2 });
+    if (servers) resolver.setServers(servers);
+    const onAbort = () => resolver.cancel();
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      const addresses = await resolver.resolve4(hostname);
+      signal.throwIfAborted();
+      return addresses;
+    } finally { signal.removeEventListener('abort', onAbort); }
+  };
+  try { return await lookup(); }
+  catch (error) {
+    // A newly issued host may still be negatively cached by the network's DNS.
+    // Only DNS absence/temporary failures get an independent public query;
+    // endpoint validation, shared deadline and TLS remain in healthProbe.
+    signal.throwIfAborted();
+    if (!isDnsFailure(error)) throw error;
+    return lookup(['1.1.1.1', '8.8.8.8']);
+  }
 }
 
 const validStatusBody = body => body !== null && typeof body === 'object' &&
