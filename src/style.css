@@ -12,3 +12,5 @@
 .people-panel{margin-bottom:22px}.people-list{list-style:none;padding:0;margin:12px 0;max-height:330px;overflow:auto}.people-list li{margin:0 0 8px}.people-list button{display:block;width:100%;text-align:left;font-size:13px;line-height:1.7;overflow-wrap:anywhere}.people-list button.selected{background:#e6efdf;border-color:#547b56}.people-panel .controls{margin-top:10px}
 
 .topic-question-row{display:block}.topic-question-row .topic-caption{display:inline;font-size:inherit;font-weight:700;color:#e5f2bc;white-space:normal}.topic-question-row .topic-question{display:inline}.source-question{font-weight:600;color:#254f42}
+
+.connection-notice{border:2px solid #b44b32;background:#fff1e9;color:#743424}.connection-notice p{margin-top:6px}
