@@ -732,6 +732,55 @@ describe('main UI lifecycle regressions — DOM actions and outgoing requests, m
     expect(requests('/api/conversation')).toHaveLength(1);
   });
 
+  it.each(['g2', 'phone'] as const)('keeps the reason after %s input loses G2 until explicit restart', async source => {
+    await boot(); chooseLive(); click('connect'); await flush();
+    element<HTMLSelectElement>('microphone').value = source;
+    click('conversation'); await flush();
+    const stream = devices.streaming!; const sessions = requests('/api/conversation').length;
+    devices.g2!.options.onStatus?.({ state: 'disconnected', reason: 'device_disconnected' }); await flush();
+    expect(stream.cancel).toHaveBeenCalledOnce();
+    expect(element('connection-notice').classList.contains('hidden')).toBe(false);
+    expect(element('connection-notice-message').textContent).toContain('G2の接続が切れた');
+    expect(element('connection-notice-help').textContent).toContain('会話モードを再開');
+    devices.g2!.options.onStatus?.({ state: 'connected', reason: 'resume_required' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(element('connection-notice').classList.contains('hidden')).toBe(false);
+    expect(requests('/api/conversation')).toHaveLength(sessions);
+    click('conversation'); await flush();
+    expect(requests('/api/conversation')).toHaveLength(sessions + 1);
+    expect(element('connection-notice').classList.contains('hidden')).toBe(true);
+  });
+
+  it('retains the background reason when browser visibility changes before the SDK event', async () => {
+    await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
+    const stream = devices.streaming!;
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    document.dispatchEvent(new Event('visibilitychange'));
+    devices.g2!.options.onStatus?.({ state: 'background', reason: 'background' }); await flush();
+    expect(element('connection-notice-message').textContent).toContain('画面がバックグラウンド');
+    expect(element('connection-notice').classList.contains('hidden')).toBe(false);
+    expect(stream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it('requires reopening after an unresolved display timeout', async () => {
+    await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
+    const sessions = requests('/api/conversation').length;
+    const connects = devices.g2!.connect.mock.calls.length;
+    devices.g2!.options.onStatus?.({ state: 'error', reason: 'display_timeout', recovery: 'reopen' }); await flush();
+    expect(devices.streaming!.cancel).toHaveBeenCalledOnce();
+    expect(element('connection-notice-message').textContent).toContain('G2の表示更新の応答');
+    expect(element('connection-notice-help').textContent).toContain('同じQRコードを読み直して');
+    expect(element('connection-notice-help').textContent).not.toContain('会話モードを再開');
+    expect(element<HTMLButtonElement>('conversation').disabled).toBe(true);
+    expect(element<HTMLButtonElement>('connect').disabled).toBe(true);
+    click('conversation'); click('connect'); await flush();
+    expect(requests('/api/conversation')).toHaveLength(sessions);
+    expect(devices.g2!.connect).toHaveBeenCalledTimes(connects);
+    devices.g2!.options.onStatus?.({ state: 'connected', reason: 'stopped' }); await flush();
+    expect(element('connection-notice').classList.contains('hidden')).toBe(false);
+    expect(element<HTMLButtonElement>('conversation').disabled).toBe(true);
+  });
+
   it('does not repaint an active microphone with the idle connection screen', async () => {
     await boot(); chooseLive(); click('connect'); await flush(); click('conversation'); await flush();
     const count = devices.g2!.connect.mock.calls.length;

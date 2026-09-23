@@ -24,7 +24,7 @@ export interface GlassesView {
 export type G2Action = 'primary' | 'secondary' | 'previous' | 'next' | 'exit'
 export type G2State = 'idle' | 'connecting' | 'connected' | 'recording' | 'background'
   | 'disconnected' | 'unavailable' | 'error' | 'disposed'
-export interface G2Status { state: G2State; reason?: string }
+export interface G2Status { state: G2State; reason?: string; recovery?: 'reopen' }
 
 export interface G2Event {
   audioEvent?: { audioPcm: Uint8Array; source?: string }
@@ -51,6 +51,8 @@ export interface G2RuntimeOptions {
   onAudio?: (chunk: Uint8Array) => void
   onAction?: (action: G2Action) => void
   timeoutMs?: number
+  /** Image transfer/layout only; microphone, text and connection keep timeoutMs. */
+  imageTimeoutMs?: number
   /** For ordinary capture: can shorten its window, never extend it beyond 30 seconds. */
   maxAudioMs?: number
   /** Test injection; production uses a local Canvas, never an external image API. */
@@ -105,6 +107,7 @@ export class G2Runtime {
   private unsubscribe: Array<() => void> = []
   private currentStatus: G2Status = { state: 'idle' }
   private readonly timeoutMs: number
+  private readonly imageTimeoutMs: number
   private readonly maxAudioMs: number
   private audioVersion = 0
   private audioStarting = false
@@ -130,6 +133,8 @@ export class G2Runtime {
   constructor(private readonly options: G2RuntimeOptions = {}) {
     this.timeoutMs = Number.isFinite(options.timeoutMs)
       ? Math.max(1, Math.min(options.timeoutMs!, 10_000)) : 2_000
+    this.imageTimeoutMs = Number.isFinite(options.imageTimeoutMs)
+      ? Math.max(1, Math.min(options.imageTimeoutMs!, 10_000)) : 8_000
     this.maxAudioMs = Number.isFinite(options.maxAudioMs)
       ? Math.max(1, Math.min(options.maxAudioMs!, 30_000)) : 30_000
   }
@@ -416,7 +421,7 @@ export class G2Runtime {
                 if (!this.currentImage(job)) { accepted = false; break }
                 const result = await this.deadline(invoke(() => this.bridge!.updateImageRawData!(new ImageRawDataUpdate({
                   containerID: index + 4, containerName: `small-text-${index}`, imageData,
-                }))))
+                }))), this.imageTimeoutMs)
                 if (!ImageRawDataUpdateResult.isSuccess(result)) { accepted = false; break }
               }
               if (accepted && this.currentImage(job)) this.lastImageContent = job.view.content
@@ -492,9 +497,9 @@ export class G2Runtime {
     finally { this.audioStopping -= 1 }
   }
 
-  private deadline<T>(operation: Promise<T>): Promise<T> {
+  private deadline<T>(operation: Promise<T>, timeoutMs = this.timeoutMs): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new BridgeTimeout()), this.timeoutMs)
+      const timer = setTimeout(() => reject(new BridgeTimeout()), timeoutMs)
       operation.then(value => { clearTimeout(timer); resolve(value) }, error => { clearTimeout(timer); reject(error) })
     })
   }
@@ -506,7 +511,7 @@ export class G2Runtime {
   }
 
   private notify(state: G2State, reason?: string): void {
-    this.currentStatus = reason ? { state, reason } : { state }
+    this.currentStatus = { state, ...(reason ? { reason } : {}), ...(this.fatal ? { recovery: 'reopen' as const } : {}) }
     try { this.options.onStatus?.({ ...this.currentStatus }) } catch { /* A UI callback cannot block cleanup. */ }
   }
 
@@ -529,7 +534,7 @@ export class G2Runtime {
     page.textObject!.find(container => container.containerName === 'footer')!.content = this.acceptingAudio ? '音声認識中' : '音声状態を確認'
     const accepted = await this.deadline(invoke(() => this.bridge!.rebuildPageContainer!(new RebuildPageContainer({
       containerTotalNum: page.containerTotalNum, textObject: page.textObject, ...(page.imageObject ? { imageObject: page.imageObject } : {}),
-    }))))
+    }))), this.imageTimeoutMs)
     if (!accepted) throw new Error('layout_change_failed')
     this.imageMode = enabled; this.layoutUncertain = false
   }

@@ -27,6 +27,7 @@ app.innerHTML = `
 <header class="masthead"><div class="wordmark"><span class="mark" aria-hidden="true">◌</span><div><div class="eyebrow">AI HACK · EVEN G2</div><h1>これで誰でも雑談マスター</h1></div></div><span class="pill" id="connection">スマートフォン表示</span></header>
 <section class="panel login hidden" id="login"><div class="eyebrow">WELCOME BACK</div><h2>セッションを始める</h2><p class="muted">会話データは15分保持し、その後削除します。終了・バックグラウンドでは録音を停止します。再開時もマイクは自動で起動しません。</p><form id="login-form"><label for="access-code">利用コード</label><input type="password" id="access-code" autocomplete="current-password" minlength="16"><label class="check"><input id="remember-device" type="checkbox" checked><span>この端末では12時間、利用コードの入力を省略する</span></label><div class="controls"><button class="primary" type="submit">開始する</button></div><p class="status" id="login-status" role="status"></p></form></section>
 <main class="workspace hidden" id="workspace"><div class="intro"><div><div class="eyebrow">LESS SEARCHING, MORE CONVERSATION</div><h1>目の前の会話に、次のきっかけを。</h1><p>公開情報の調査と根拠の確認を、エージェントに任せる。</p></div><span class="mode-badge" id="mode-badge">体験デモ · 架空の人物・固定データ</span></div>
+<aside class="notice connection-notice hidden" id="connection-notice" role="alert"><strong>直近の会話停止</strong><p id="connection-notice-message"></p><p id="connection-notice-help"></p><p class="muted" id="connection-notice-time"></p></aside>
 <div class="notice hidden" id="resume-notice">前のセッションがあります。内容を表示するには、再開してください。<div class="controls"><button id="resume">前の内容を再開</button></div></div>
 <div class="grid"><div><section class="panel"><div class="section-head"><h2>会話から調べる</h2><span class="section-number">01 / INPUT</span></div><p class="muted">氏名と会社名を手がかりに、公開情報を確認します。</p>
 <div class="field-row"><div><label for="mode">利用モード</label><select id="mode"><option value="demo">体験デモ</option><option value="live" id="live-option" disabled>実APIで調査</option></select></div><div id="scenario-field"><label for="scenario">確認する場面</label><select id="scenario"><option value="normal">通常・自律的な追加調査</option><option value="ambiguous">同姓同名・候補を確認</option><option value="failure">検索障害・一部の根拠を表示</option><option value="no_evidence">根拠なし・推測せず終了</option></select></div></div>
@@ -114,6 +115,8 @@ type VoicePhase = 'off' | 'connecting' | 'listening' | 'paused' | 'stopped' | 'e
 let voicePhase: VoicePhase = 'off';
 let voicePreview = '';
 let voiceErrorLabel = '音声接続エラー・再開してください';
+let g2NeedsReopen = false;
+const G2_REOPEN_HELP = 'Evenアプリでこの画面を閉じ、同じQRコードを読み直してください。';
 let voiceDisplayTimer: ReturnType<typeof setTimeout> | undefined;
 const emptyGlassesView = (): GlassesView => ({ header: 'これで誰でも雑談マスター', content: '会話を待っています', footer: 'マイクは停止中' });
 let glassesView = emptyGlassesView();
@@ -126,13 +129,14 @@ function refreshControls() {
   $('mode').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
   $('scenario').toggleAttribute('disabled', running || recording || audioBusy || conversationRunning);
   $('record').toggleAttribute('disabled', !recording && (microphoneConnecting || audioBusy || running || !runtimeStatus?.sttEnabled || ($<HTMLSelectElement>('mode').value !== 'live')));
-  $('conversation').toggleAttribute('disabled', microphoneConnecting || recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live'));
+  $('conversation').toggleAttribute('disabled', g2NeedsReopen || microphoneConnecting || recording || audioBusy || running || conversationRunning || !runtimeStatus?.streamingEnabled || ($<HTMLSelectElement>('mode').value !== 'live'));
   $('retry-listening').toggleAttribute('disabled', !conversationRunning || !conversationId || resettingConversation);
   $('lock-person').toggleAttribute('disabled', !conversationRunning || resettingConversation || !hasCurrentCards() || !result?.target || !displayingActivePerson());
   $('lock-person').textContent = lockedPerson ? '固定を解除して聞き直す' : 'この人物で固定';
   $('person-state').textContent = lockedPerson ? `${lockedPerson.personName}さんを固定中。聞き取りは継続。質問で上スクロール→1回で解除・聞き直し。` : 'G2：下スクロールで出典、質問の上スクロールで聞き直しを確認。1回で実行・2回で取消。質問の2回で人物一覧。固定はスマホで操作。';
   renderSearchCandidates();
-  $('conversation').textContent = voicePhase === 'error' ? '会話モードを再開' : '会話モードを開始';
+  $('conversation').textContent = g2NeedsReopen ? 'QRから開き直してください' : voicePhase === 'error' ? '会話モードを再開' : '会話モードを開始';
+  $('connect').toggleAttribute('disabled', g2NeedsReopen);
   $('record').textContent = recording ? conversationRunning ? '会話モードを終了' : '録音を止めて調べる' : '音声で入力';
   if (voicePhase !== 'off') queueVoiceDisplay();
 }
@@ -450,8 +454,18 @@ function setVoicePhase(phase: VoicePhase) {
   if (phase !== 'listening') voicePreview = '';
   queueVoiceDisplay(true);
 }
+function showConnectionNotice(message: string, help: string) {
+  // Page-memory only; transient status changes never erase the stop reason.
+  $('connection-notice-message').textContent = message;
+  $('connection-notice-help').textContent = help;
+  $('connection-notice-time').textContent = `停止を確認した時刻：${new Date().toLocaleTimeString('ja-JP')}`;
+  $('connection-notice').classList.remove('hidden');
+}
 function reportVoiceError(message: string) {
-  voiceErrorLabel = /費用|予算/.test(message) ? '費用上限で停止・再開してください'
+  voiceErrorLabel = g2NeedsReopen ? 'G2接続停止・同じQRで開き直す'
+    : /G2.*接続が切れ/.test(message) ? 'G2切断・スマホで再開'
+    : /G2.*表示/.test(message) ? 'G2表示エラー・スマホで確認'
+    : /費用|予算/.test(message) ? '費用上限で停止・再開してください'
     : /認証|ログイン|期限/.test(message) ? '利用期限・QRを読み直してください'
     : /マイク|許可/.test(message) ? 'マイク未接続・G2接続を確認'
     : /準備|タイムアウト|時間内/.test(message) ? '音声の接続待ち切れ・再開してください'
@@ -462,8 +476,13 @@ function reportVoiceError(message: string) {
     : /応答.*検証|応答.*確認/.test(message) ? '音声API応答エラー・再開してください'
     : /サービス|音声認識/.test(message) ? '音声API接続失敗・再開してください'
     : '音声接続切れ・再開してください';
-  setVoicePhase('error'); status(`${message} G2は上スクロールで再開確認→1回タップ、スマホは「会話モードを再開」で再開できます。`, true);
-  void sendView('音声を再開できます', 'G2は上スクロール→1回タップで再開\nスマホは「会話モードを再開」', voiceErrorLabel); refreshControls();
+  const help = g2NeedsReopen ? G2_REOPEN_HELP : connected
+    ? 'G2は上スクロールで再開確認→1回タップ、スマホは「会話モードを再開」で再開できます。'
+    : 'Evenアプリでグラスの接続を確認し、スマホの「会話モードを再開」を押してください。';
+  showConnectionNotice(message, help);
+  setVoicePhase('error'); status(`${message} ${help}`, true);
+  void sendView(g2NeedsReopen ? 'QRから開き直してください' : '音声を再開できます',
+    g2NeedsReopen ? G2_REOPEN_HELP : 'G2は上スクロール→1回タップで再開\nスマホは「会話モードを再開」', voiceErrorLabel); refreshControls();
 }
 function renderResultSummary(value: ResearchResult, message = value.message) {
   $('result-note').textContent = value.mode === 'demo' ? '架空の人物・固定資料によるデモです。表示の動作確認であり、実APIやG2実機の動作証明ではありません。' : message;
@@ -757,12 +776,13 @@ async function cancel() {
   status('停止しました。遅れて届いた結果は表示しません。'); await sendView('これで誰でも雑談マスター', '調査を停止しました。', '入力待ち'); refreshControls();
 }
 function g2Status(state: G2Status) {
+  if (state.recovery === 'reopen') g2NeedsReopen = true;
   connected = state.state === 'connected' || state.state === 'recording';
   const labels: Record<string, string> = { idle: '画面プレビュー', connecting: 'G2へ接続中', connected: 'G2接続受付済み', recording: 'G2で録音中', background: 'バックグラウンド・停止', disconnected: 'G2切断', unavailable: 'Evenアプリ内で接続してください', error: 'G2接続を確認してください', disposed: 'G2接続終了' };
   $('device-status').textContent = `Even G2 · ${labels[state.state] || state.state}`; $('connection').textContent = connected ? 'G2接続受付済み' : 'スマートフォン表示'; $('device-dot').classList.toggle('on', connected);
   const awaitingGlassesMicrophone = conversationRunning && voicePhase === 'connecting' && state.state === 'connected';
-  const failedConversationAudio = (recording && conversationRunning && audioSource === 'g2' || microphoneConnecting)
-    && ['error', 'disconnected'].includes(state.state);
+  const failedConversationAudio = (recording && conversationRunning || microphoneConnecting || state.recovery === 'reopen')
+    && ['error', 'disconnected', 'background'].includes(state.state);
   if (['background', 'disconnected', 'error', 'disposed'].includes(state.state)) {
     const wasConversation = conversationRunning;
     const oldId = currentId; const oldRevision = revision;
@@ -784,7 +804,11 @@ function g2Status(state: G2Status) {
     if (conversationRunning) void cancel(); else void stopRecording(state.state === 'connected');
   }
   if (failedConversationAudio) {
-    const reason = state.reason === 'audio_start_timeout' ? 'G2マイクの開始確認が時間内に届きませんでした。'
+    const reason = state.reason === 'display_timeout' ? 'G2の表示更新の応答が時間内に届かなかったため、会話を停止しました。'
+      : state.reason === 'display_failed' ? 'G2の表示更新を完了できなかったため、会話を停止しました。'
+      : state.reason === 'connect_timeout' ? 'G2の接続確認が時間内に届きませんでした。'
+      : state.state === 'background' ? 'Evenアプリがバックグラウンドになったため、音声認識を停止しました。'
+      : state.reason === 'audio_start_timeout' ? 'G2マイクの開始確認が時間内に届きませんでした。'
       : state.reason === 'audio_start_failed' ? 'G2のマイクを開始できませんでした。接続と許可を確認してください。'
       : state.reason === 'audio_stop_failed' ? 'G2マイクの停止を確認できません。Evenアプリで接続し直してください。'
       : state.state === 'disconnected' ? 'G2の接続が切れたため、音声認識を停止しました。'
@@ -1059,6 +1083,7 @@ async function startQrConversation() {
   await startConversation();
 }
 async function startConversation() {
+  if (g2NeedsReopen) { status(G2_REOPEN_HELP, true); return; }
   if (!token || document.hidden || pageLeaving) return;
   if (stoppingAudio) {
     const generation = audioGeneration;
@@ -1119,6 +1144,7 @@ async function startConversation() {
       if (!valid()) return;
       if (!microphoneReady) throw new Error('G2のマイクを開始できませんでした。接続と許可を確認してください。');
     }
+    $('connection-notice').classList.add('hidden');
     setVoicePhase('listening'); refreshControls();
     status('ストリーミング認識中です。話している途中から文字が表示され、人物名を見つけたら公開情報を調べます。');
     await sendView('会話モード', '音声をストリーミング認識中', '終了はスマートフォンから');
@@ -1181,6 +1207,7 @@ $('sample').onclick = () => { $<HTMLTextAreaElement>('text').value = DEMO_TEXT; 
 $('research').onclick = () => { void research(); }; $('cancel').onclick = () => { void cancel(); };
 $('previous').onclick = () => { cardIndex--; renderCard(); }; $('next').onclick = () => { cardIndex++; renderCard(); };
 async function connectGlasses() {
+  if (g2NeedsReopen) { status(G2_REOPEN_HELP, true); return false; }
   if (glassesConnecting) return glassesConnecting;
   // A second connect must not repaint the listening screen with an idle view.
   if (connected) return true;
@@ -1234,7 +1261,12 @@ $('resume').onclick = async () => {
 };
 $('end').onclick = async () => { if (authBusy) return; setAuthBusy(true); authGeneration++; await cancel(); try { await api('/api/session/forget', json({})); token = ''; expiresAt = 0; clearConversation(); $('workspace').classList.add('hidden'); $('login').classList.remove('hidden'); $('login-status').textContent = '会話データと、この端末のログインの記憶を削除しました。'; } catch (e) { status(e instanceof Error ? e.message : '削除を確認できませんでした。'); } finally { setAuthBusy(false); } };
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { void cancel(); }
+  if (document.hidden) {
+    const wasConversation = conversationRunning;
+    void cancel();
+    if (wasConversation) showConnectionNotice('画面がバックグラウンドになったため、音声認識を停止しました。',
+      'Evenアプリに戻り、「会話モードを再開」を押してください。');
+  }
   else if (!token && qrLoginTicket && runtimeStatus && !authBusy && !pageLeaving) { void redeemQrLogin(); }
 });
 window.addEventListener('pagehide', () => { pageLeaving = true; qrLoginTicket = ''; abortConversation(); clearTimeout(voiceDisplayTimer); voiceDisplayTimer = undefined; voicePreview = ''; authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
