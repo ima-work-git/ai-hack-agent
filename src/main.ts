@@ -2,6 +2,7 @@ import './style.css';
 import { PersonHistory, type PersonHistoryEntry } from './person-history.ts';
 import { ResearchInputSchema, ResearchResultSchema, type Card, type EvidenceSource, type ResearchInput, type ResearchResult, type RuntimeStatus, type TraceEvent, type Scenario } from './shared/contracts.ts';
 import { G2Runtime, type G2Status, type GlassesView } from './integrations/g2-runtime.ts';
+import { GlassesViewQueue } from './integrations/glasses-view-queue.ts';
 import { GlassesMirrorPublisher } from './glasses-mirror.ts';
 import { PhoneAudio } from './phone-audio.ts';
 import { StreamingAudio } from './streaming-audio.ts';
@@ -28,6 +29,7 @@ app.innerHTML = `
 <header class="masthead"><div class="wordmark"><span class="mark" aria-hidden="true">◌</span><div><div class="eyebrow">AI HACK · EVEN G2</div><h1>これで誰でも雑談マスター</h1></div></div><span class="pill" id="connection">スマートフォン表示</span></header>
 <section class="panel login hidden" id="login"><div class="eyebrow">WELCOME BACK</div><h2>セッションを始める</h2><p class="muted">会話データは15分保持し、その後削除します。終了・バックグラウンドでは録音を停止します。再開時もマイクは自動で起動しません。</p><form id="login-form"><label for="access-code">利用コード</label><input type="password" id="access-code" autocomplete="current-password" minlength="16"><label class="check"><input id="remember-device" type="checkbox" checked><span>この端末では12時間、利用コードの入力を省略する</span></label><div class="controls"><button class="primary" type="submit">開始する</button></div><p class="status" id="login-status" role="status"></p></form></section>
 <main class="workspace hidden" id="workspace"><div class="intro"><div><div class="eyebrow">LESS SEARCHING, MORE CONVERSATION</div><h1>目の前の会話に、次のきっかけを。</h1><p>公開情報の調査と根拠の確認を、エージェントに任せる。</p></div><span class="mode-badge" id="mode-badge">体験デモ · 架空の人物・固定データ</span></div>
+<p id="mirror-status" class="muted" role="status">PC同期：グラスの接続待ち</p>
 <aside class="notice connection-notice hidden" id="connection-notice" role="alert"><strong>直近の会話停止</strong><p id="connection-notice-message"></p><p id="connection-notice-help"></p><p class="muted" id="connection-notice-time"></p></aside>
 <div class="notice hidden" id="resume-notice">前のセッションがあります。内容を表示するには、再開してください。<div class="controls"><button id="resume">前の内容を再開</button></div></div>
 <div class="grid"><div><section class="panel"><div class="section-head"><h2>会話から調べる</h2><span class="section-number">01 / INPUT</span></div><p class="muted">氏名と会社名を手がかりに、公開情報を確認します。</p>
@@ -112,6 +114,8 @@ let conversationRequestRevision = 0;
 let conversationLastKey = '';
 let conversationLastAt = 0;
 let g2: G2Runtime;
+const glassesViewQueue = new GlassesViewQueue((view, currentToken) => g2.render(view, currentToken),
+  currentToken => currentToken === viewToken && connected && !document.hidden && !pageLeaving);
 type VoicePhase = 'off' | 'connecting' | 'listening' | 'paused' | 'stopped' | 'error';
 let voicePhase: VoicePhase = 'off';
 let voicePreview = '';
@@ -121,6 +125,7 @@ const G2_REOPEN_HELP = 'Evenアプリでこの画面を閉じ、同じQRコー�
 let voiceDisplayTimer: ReturnType<typeof setTimeout> | undefined;
 const emptyGlassesView = (): GlassesView => ({ header: 'これで誰でも雑談マスター', content: '会話を待っています', footer: 'マイクは停止中' });
 let glassesView = emptyGlassesView();
+let queuedGlassesBody = '';
 
 const status = (text: string, error = false) => { $('status').textContent = text; $('status').classList.toggle('error', error); };
 function refreshControls() {
@@ -153,7 +158,7 @@ function newViewToken() {
     if (pendingNavigation) pendingNavigation.view = viewToken;
     if (pendingAudioAction) pendingAudioAction.view = viewToken;
   }
-  pendingSearchChoice = null; g2?.invalidateViews(viewToken);
+  pendingSearchChoice = null; queuedGlassesBody = ''; glassesViewQueue.invalidate(); g2?.invalidateViews(viewToken);
 }
 // Count wide characters conservatively and preserve complete Unicode characters.
 function shortText(text: string, maximumWidth: number): string {
@@ -442,7 +447,14 @@ async function renderGlassesView() {
   if (pendingAudioAction) footer = `${pendingAudioAction.action === 'retry' ? '人物を聞き直す' : '音声を再開する'}？ 1回=実行 2回=そのまま`;
   else if (pendingNavigation) footer = `${pendingNavigation.page === -1 ? '質問に戻る' : '出典へ進む'}？ 1回=進む 2回=そのまま`;
   else if (pendingSearchChoice) footer = '候補を選ぶ？ 1回=選ぶ 2回=そのまま';
-  await g2.render({ ...glassesView, footer }, viewToken);
+  const body = JSON.stringify([glassesView.header, glassesView.content, glassesView.textSize]);
+  if (queuedGlassesBody && queuedGlassesBody !== body) {
+    // Navigation/evidence changes cancel old content immediately; ASR-only
+    // footer changes wait for the current acknowledged native display.
+    glassesViewQueue.invalidate(); g2.invalidateViews(viewToken);
+  }
+  queuedGlassesBody = body;
+  await glassesViewQueue.enqueue({ ...glassesView, footer }, viewToken);
 }
 function queueVoiceDisplay(immediate = false) {
   if (immediate) { clearTimeout(voiceDisplayTimer); voiceDisplayTimer = undefined; void renderGlassesView(); return; }
@@ -823,8 +835,9 @@ function acceptAudio(chunk: Uint8Array) {
   if (!recording || audioBytes + chunk.length > 960_000) return;
   audioChunks.push(chunk.slice()); audioBytes += chunk.length;
 }
-const glassesMirror = new GlassesMirrorPublisher(() => token);
-g2 = new G2Runtime({ enableImageText: true, onStatus: g2Status, onAudio: acceptAudio, onDisplay: view => glassesMirror.display(view), onAction: action => {
+const glassesMirror = new GlassesMirrorPublisher(() => token, fetch,
+  message => { $('mirror-status').textContent = message; });
+g2 = new G2Runtime({ enableImageText: true, connectionTimeoutMs: 10_000, onStatus: g2Status, onAudio: acceptAudio, onDisplay: view => glassesMirror.display(view), onAction: action => {
   if (action === 'next') navigateGlassesSource(1);
   else if (action === 'previous') navigateGlassesSource(-1);
   else if (action === 'primary') {
@@ -1272,7 +1285,7 @@ document.addEventListener('visibilitychange', () => {
   }
   else if (!token && qrLoginTicket && runtimeStatus && !authBusy && !pageLeaving) { void redeemQrLogin(); }
 });
-window.addEventListener('pagehide', () => { pageLeaving = true; qrLoginTicket = ''; abortConversation(); clearTimeout(voiceDisplayTimer); voiceDisplayTimer = undefined; voicePreview = ''; authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
+window.addEventListener('pagehide', () => { pageLeaving = true; glassesViewQueue.invalidate(); qrLoginTicket = ''; abortConversation(); clearTimeout(voiceDisplayTimer); voiceDisplayTimer = undefined; voicePreview = ''; authGeneration++; audioGeneration++; recording = false; audioBusy = false; clearTimeout(audioTimer); audioChunks = []; controller?.abort(); void phone.stop(); void g2.dispose(); });
 setInterval(() => { void keepConversationAlive(); }, 60_000);
 setInterval(() => { if (result?.cards.some(card => Date.parse(card.expiresAt) <= Date.now())) renderCard(); if (token && expiresAt > 0 && expiresAt <= Date.now()) void expireSession(); }, 15_000);
 try {

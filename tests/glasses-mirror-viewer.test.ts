@@ -59,3 +59,11 @@ it('clears the prior display when there is no retained frame', async () => {
   expect(text('glass-header')).not.toContain('架空の人物')
   expect(browser.document.getElementById('glass-content')!.hasAttribute('aria-label')).toBe(false)
 })
+
+it('distinguishes a connected phone still awaiting the first glasses display', async () => {
+  await vi.advanceTimersByTimeAsync(0)
+  frame = { view: null, state: 'connected', updatedAt: now }
+  await vi.advanceTimersByTimeAsync(500)
+  expect(text('status')).toBe('スマホ接続済み・画面待ち')
+  expect(text('glass-content')).toBe('')
+})

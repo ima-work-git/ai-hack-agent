@@ -53,6 +53,8 @@ export interface G2RuntimeOptions {
   /** Latest fully acknowledged app view, not an optical screen capture. */
   onDisplay?: (view: GlassesView) => void
   timeoutMs?: number
+  /** QR/WebView startup may need longer than an already connected control. */
+  connectionTimeoutMs?: number
   /** Image transfer/layout only; microphone, text and connection keep timeoutMs. */
   imageTimeoutMs?: number
   /** For ordinary capture: can shorten its window, never extend it beyond 30 seconds. */
@@ -109,6 +111,7 @@ export class G2Runtime {
   private unsubscribe: Array<() => void> = []
   private currentStatus: G2Status = { state: 'idle' }
   private readonly timeoutMs: number
+  private readonly connectionTimeoutMs: number
   private readonly imageTimeoutMs: number
   private readonly maxAudioMs: number
   private audioVersion = 0
@@ -135,6 +138,8 @@ export class G2Runtime {
   constructor(private readonly options: G2RuntimeOptions = {}) {
     this.timeoutMs = Number.isFinite(options.timeoutMs)
       ? Math.max(1, Math.min(options.timeoutMs!, 10_000)) : 2_000
+    this.connectionTimeoutMs = Number.isFinite(options.connectionTimeoutMs)
+      ? Math.max(1, Math.min(options.connectionTimeoutMs!, 15_000)) : this.timeoutMs
     this.imageTimeoutMs = Number.isFinite(options.imageTimeoutMs)
       ? Math.max(1, Math.min(options.imageTimeoutMs!, 10_000)) : 8_000
     this.maxAudioMs = Number.isFinite(options.maxAudioMs)
@@ -272,14 +277,14 @@ export class G2Runtime {
     this.notify('connecting')
     try {
       const bridge = await this.deadline(this.options.bridge ? Promise.resolve(this.options.bridge)
-        : invoke(this.options.getBridge ?? waitForEvenAppBridge))
+        : invoke(this.options.getBridge ?? waitForEvenAppBridge), this.connectionTimeoutMs)
       if (this.disposed || version !== this.connectionVersion) return false
       this.bridge = bridge
       this.imageAvailable = Boolean(this.options.enableImageText && bridge.updateImageRawData && bridge.rebuildPageContainer)
       this.imageMode = false
       this.layoutUncertain = false
       // Never put a person's details in an uncancellable startup operation.
-      const result = await this.deadline(invoke(() => bridge.createStartUpPageContainer(this.startupPage())))
+      const result = await this.deadline(invoke(() => bridge.createStartUpPageContainer(this.startupPage())), this.connectionTimeoutMs)
       if (this.disposed || version !== this.connectionVersion) return false
       if (result !== 0) {
         this.notify('error', 'startup_rejected')

@@ -103,13 +103,13 @@
           lastUpdatedAt = Math.min(timestamp, Date.now());
           clearTimeout(retentionTimer);
           retentionTimer = setTimeout(expireView, Math.max(0, 120000 - (Date.now() - lastUpdatedAt)));
-        } else clearView();
+        } else clearView(['connected', 'recording'].includes(frame.state) ? 'スマホに接続済み・グラス画面を待っています' : undefined);
         const stale = !Number.isFinite(timestamp) || Date.now() - timestamp > 10000;
         const connected = ['connected', 'recording'].includes(frame.state);
-        setStatus(stale ? '受信が止まっています' : connected ? 'ライブ表示中' : 'グラスの状態を確認', stale || !connected ? 'warning' : 'live');
-        byId('device').textContent = states[frame.state] || 'グラスの状態を確認';
+        setStatus(stale ? '受信が止まっています' : connected && validView(frame.view) ? 'ライブ表示中' : connected ? 'スマホ接続済み・画面待ち' : 'グラスの状態を確認', stale || !connected || !validView(frame.view) ? 'warning' : 'live');
+        byId('device').textContent = frame.reason === 'connect_timeout' ? 'G2の接続確認が時間切れになりました。Even Appでグラスの接続を確認してください。' : states[frame.state] || 'グラスの状態を確認';
         byId('updated').textContent = Number.isFinite(timestamp) ? `最終受信 ${new Date(timestamp).toLocaleTimeString('ja-JP', { hour12: false })}` : '最終受信時刻を確認できません';
-        byId('hint').textContent = stale ? '最後に受信した画面です。スマホの画面と接続状態を確認してください。' : 'グラスの操作や音声状態に合わせて、この画面も自動で更新します。';
+        byId('hint').textContent = stale ? '最後に受信した画面です。スマホの画面と接続状態を確認してください。' : !validView(frame.view) ? 'スマホから接続状態を受信しています。グラスの表示受付が完了すると画面が届きます。' : 'グラスの操作や音声状態に合わせて、この画面も自動で更新します。';
       }
     } catch {
       if (!stopped) {
