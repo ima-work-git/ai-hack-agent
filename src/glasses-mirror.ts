@@ -48,7 +48,8 @@ export class GlassesMirrorPublisher {
     const hasView = this.frame.view !== null;
     const report = (message: string) => { if (current()) { try { this.notify(message); } catch { /* UI diagnostics are best effort. */ } } };
     try {
-      const response = await this.send('/api/glasses-mirror', { method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      // Native WebView fetch must receive Window, never this publisher object.
+      const response = await this.send.call(globalThis, '/api/glasses-mirror', { method: 'POST', credentials: 'same-origin', cache: 'no-store',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(this.frame), signal: controller.signal });
       if (!response.ok) {

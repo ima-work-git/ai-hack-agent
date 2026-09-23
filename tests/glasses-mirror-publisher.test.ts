@@ -3,6 +3,19 @@ import { GlassesMirrorPublisher } from '../src/glasses-mirror';
 
 afterEach(() => { vi.useRealTimers(); });
 describe('glasses mirror publisher', () => {
+  it('preserves the global receiver required by native WebView fetch', async () => {
+    vi.useFakeTimers();
+    const send = vi.fn(function (this: unknown) {
+      if (this !== globalThis) throw new TypeError('Illegal invocation');
+      return Promise.resolve(new Response('{}'));
+    });
+    const notify = vi.fn();
+    const publisher = new GlassesMirrorPublisher(() => 'session', send, notify);
+    publisher.updateStatus({ state: 'connected' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(notify).toHaveBeenLastCalledWith('PC同期：接続済み・グラスの表示受付を待っています');
+    publisher.dispose();
+  });
   it('reports phone connectivity before the first acknowledged display', async () => {
     vi.useFakeTimers();
     const notify = vi.fn();
